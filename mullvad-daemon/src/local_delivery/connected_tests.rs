@@ -3,7 +3,10 @@
 use super::*;
 use crate::local_network::ConnectContinuation;
 use crate::local_network::TunnelPhase;
-use std::os::fd::{BorrowedFd, OwnedFd};
+use std::{
+    os::fd::{AsRawFd, BorrowedFd, OwnedFd},
+    path::PathBuf,
+};
 use talpid_tunnel::android_frontend::{
     CaptureConfig, FrontendOwner, FrontendPlatform, FrontendState,
 };
@@ -18,6 +21,7 @@ struct PacketPlatform {
     expected: Mutex<Option<CaptureExpectation>>,
     opened: Mutex<Vec<talpid_tunnel::tun_provider::TunConfig>>,
     peer: Mutex<Option<std::os::unix::net::UnixDatagram>>,
+    descriptors: Mutex<Vec<DescriptorEpoch>>,
     starts: AtomicUsize,
     releases: AtomicUsize,
     completed_releases: Mutex<Vec<i64>>,
@@ -27,6 +31,53 @@ struct PacketPlatform {
     authority: Mutex<Option<Arc<DeliveryAuthority>>>,
     generation: std::sync::atomic::AtomicI64,
     physical: (SocketAddr, SocketAddr),
+}
+
+struct DescriptorEpoch {
+    generation: i64,
+    descriptor: PathBuf,
+    identity: PathBuf,
+    peer: PathBuf,
+}
+
+impl PacketPlatform {
+    fn descriptor_closed(&self, generation: i64) -> bool {
+        let descriptors = self.descriptors.lock().unwrap();
+        let Some(epoch) = descriptors
+            .iter()
+            .find(|epoch| epoch.generation == generation)
+        else {
+            // A pre-establish failure can owe platform release without having
+            // returned a descriptor at all.
+            return true;
+        };
+        match std::fs::read_link(&epoch.descriptor) {
+            Ok(identity) => identity != epoch.identity,
+            Err(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+                true
+            }
+        }
+    }
+
+    // A Unix datagram peer's send error need not coincide with descriptor close.
+    // Match this peer to the actual owned fd and its exact release record.
+    fn peer_closed(&self, peer: &std::os::unix::net::UnixDatagram) -> bool {
+        let identity = std::fs::read_link(format!("/proc/self/fd/{}", peer.as_raw_fd())).unwrap();
+        let generation = self
+            .descriptors
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|epoch| epoch.peer == identity)
+            .expect("peer belongs to an issued descriptor epoch")
+            .generation;
+        self.completed_releases
+            .lock()
+            .unwrap()
+            .contains(&generation)
+            && self.descriptor_closed(generation)
+    }
 }
 
 impl FrontendPlatform for PacketPlatform {
@@ -60,6 +111,13 @@ impl FrontendPlatform for PacketPlatform {
         let (capture, peer) = std::os::unix::net::UnixDatagram::pair()?;
         capture.set_nonblocking(true)?;
         peer.set_nonblocking(true)?;
+        let descriptor = PathBuf::from(format!("/proc/self/fd/{}", capture.as_raw_fd()));
+        self.descriptors.lock().unwrap().push(DescriptorEpoch {
+            generation,
+            identity: std::fs::read_link(&descriptor)?,
+            descriptor,
+            peer: std::fs::read_link(format!("/proc/self/fd/{}", peer.as_raw_fd()))?,
+        });
         *self.peer.lock().unwrap() = Some(peer);
         self.generation.store(generation, SeqCst);
         self.starts.fetch_add(1, SeqCst);
@@ -122,6 +180,10 @@ impl FrontendPlatform for PacketPlatform {
         ))
     }
     fn closed(&self, generation: i64) -> io::Result<()> {
+        assert!(
+            self.descriptor_closed(generation),
+            "platform release preceded exact descriptor closure for epoch {generation}"
+        );
         self.releases.fetch_add(1, SeqCst);
         let result = if self.fail_release.load(SeqCst) {
             Err(io::Error::other("test platform retains capture"))
@@ -283,6 +345,7 @@ async fn daemon_route_handover_retains_the_partial_grant_and_same_physical_tcp_s
         expected: Mutex::new(None),
         opened: Mutex::new(Vec::new()),
         peer: Mutex::new(None),
+        descriptors: Mutex::new(Vec::new()),
         starts: AtomicUsize::new(0),
         releases: AtomicUsize::new(0),
         completed_releases: Mutex::new(Vec::new()),
@@ -486,6 +549,7 @@ async fn managed_capture_delivers_local_nonces_and_never_relays_denied_local() {
         expected: Mutex::new(None),
         opened: Mutex::new(Vec::new()),
         peer: Mutex::new(None),
+        descriptors: Mutex::new(Vec::new()),
         starts: AtomicUsize::new(0),
         releases: AtomicUsize::new(0),
         completed_releases: Mutex::new(Vec::new()),
@@ -667,6 +731,7 @@ async fn assigned_config_replacement_and_shutdown_retain_release_and_revoke_old_
         expected: Mutex::new(None),
         opened: Mutex::new(Vec::new()),
         peer: Mutex::new(None),
+        descriptors: Mutex::new(Vec::new()),
         starts: AtomicUsize::new(0),
         releases: AtomicUsize::new(0),
         completed_releases: Mutex::new(Vec::new()),
@@ -808,6 +873,7 @@ fn release_fixture() -> (
         expected: Mutex::new(None),
         opened: Mutex::new(Vec::new()),
         peer: Mutex::new(None),
+        descriptors: Mutex::new(Vec::new()),
         starts: AtomicUsize::new(0),
         releases: AtomicUsize::new(0),
         completed_releases: Mutex::new(Vec::new()),
@@ -873,8 +939,8 @@ async fn pending_successor_defers_actual_fd_release_before_daemon_ready() {
     assert!(delivery.has_owner());
     delivery.transport_joined();
     bounded(delivery.stop()).await.unwrap();
-    assert!(old_peer.send(b"old-closed").is_err());
-    assert!(peer.send(b"new-closed").is_err());
+    assert!(platform.peer_closed(&old_peer));
+    assert!(platform.peer_closed(&peer));
     assert_eq!(platform.releases.load(SeqCst), 2);
 }
 
@@ -920,8 +986,8 @@ async fn applied_successor_acknowledges_retained_predecessor_before_stop() {
     delivery.transport_joined();
     bounded(delivery.stop()).await.unwrap();
     assert!(first_pending.release_ready());
-    assert!(old_peer.send(b"old-closed").is_err());
-    assert!(peer.send(b"new-closed").is_err());
+    assert!(platform.peer_closed(&old_peer));
+    assert!(platform.peer_closed(&peer));
     assert_eq!(platform.releases.load(SeqCst), 2);
 }
 
@@ -1411,6 +1477,7 @@ impl Handover {
             expected: Mutex::new(None),
             opened: Mutex::new(Vec::new()),
             peer: Mutex::new(None),
+            descriptors: Mutex::new(Vec::new()),
             starts: AtomicUsize::new(0),
             releases: AtomicUsize::new(0),
             completed_releases: Mutex::new(Vec::new()),
@@ -1727,6 +1794,26 @@ async fn coalesced_handover_keeps_reconnect_until_join_unless_user_disconnects()
 
 #[tokio::test]
 async fn managed_teardown_revokes_now_but_releases_only_after_transport_join() {
+    // The fixture must reject a platform callback while its actual descriptor
+    // remains owned, not infer closure from a Unix peer's eventual send error.
+    {
+        let (_delivery, platform, _broker) = release_fixture();
+        let capture = platform
+            .open(
+                1,
+                &CaptureConfig::Partial(vec!["10.0.2.2/32".into()].into()),
+            )
+            .unwrap();
+        let peer = platform.peer.lock().unwrap().take().unwrap();
+        assert!(!platform.peer_closed(&peer));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| platform.closed(1))).is_err()
+        );
+        assert_eq!(platform.releases.load(SeqCst), 0);
+        drop(capture);
+        platform.closed(1).unwrap();
+        assert!(platform.peer_closed(&peer));
+    }
     for trigger in ["disconnect", "rules-off", "routes", "shutdown"] {
         for fail_release in [false, true] {
             let mut h = Handover::new(policy());
@@ -1848,7 +1935,7 @@ async fn managed_teardown_revokes_now_but_releases_only_after_transport_join() {
                 first.unwrap();
             }
             assert!(
-                peer.send(b"closed-capture").is_err(),
+                h.platform.peer_closed(&peer),
                 "descriptor survived acknowledged release"
             );
             assert!(!h.runtime.has_owner());
@@ -2001,7 +2088,7 @@ async fn verify_live_router_change(mut h: Handover, trigger: &str, fail_release:
     h.runtime.owner_changed(&h.policy, h.target, h.phase);
     assert_eq!(broker.snapshot().session_generation, session);
     assert!(
-        old_peer.send(b"old-closed").is_err(),
+        h.platform.peer_closed(&old_peer),
         "{trigger}, failure={fail_release}: predecessor survived exact configuration/release acknowledgements"
     );
     if trigger == "disconnect" {
