@@ -285,6 +285,21 @@ Tunnel targets translate to their own assigned addresses; Local uses protected,
 physical-network-bound sockets. Private networks can still collide with this
 fixed pair; private-use addressing does not guarantee collision-free routing.
 
+Capture admission and classification select Local, a tunnel target or Drop.
+Tunnel targets translate each received packet or fragment immediately, using
+address checksum deltas; they do not reassemble, remember fragment identities
+or normalize atomic IPv6 headers. A fitting packet keeps its fragment layout.
+An oversized IPv4 DF=0 packet can be split further, preserving its original
+ID/offset/MF and copied options; DF=1 gets fragmentation-needed feedback.
+Oversized IPv6 packets, including source and atomic fragments, get Packet Too
+Big feedback, never router fragmentation. Feedback quotes the current invocation
+and retains the exact target attempt through the final writer. The assigned
+source filter and separate private-control path remain unchanged.
+
+Local is a receiver, not tunnel transit. It terminates connections using its
+stack and protected, physical-network-bound sockets. Its current pre-stack
+parser rejects IPv4/IPv6 fragments; large Local UDP is not supported yet.
+
 ### iOS
 
 ### CLI

@@ -38,10 +38,8 @@ pub enum TranslationError {
     Family,
     UnsupportedTranslation,
     BackendRefused,
-    Fragment,
     Full,
     Stale,
-    RejectedFragment,
     PacketTooBig,
     FeedbackFull,
     RateLimited,
@@ -63,7 +61,7 @@ impl From<RelayFlowError> for TranslationError {
 #[derive(Clone, Debug, Default)]
 pub struct TranslationSummary {
     pub translated: u64,
-    refusals: [u64; 15],
+    refusals: [u64; 13],
 }
 
 impl TranslationSummary {
@@ -243,11 +241,8 @@ pub(crate) struct Header {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FragmentHeader {
-    pub boundary: usize,
-    pub next_field: usize,
     pub offset: usize,
     pub more: bool,
-    pub id: u32,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -256,8 +251,6 @@ pub(crate) enum ParseContext {
     Received,
     /// A legal prefix of an invoking packet inside a complete ICMP message.
     Quotation,
-    /// The legacy ledger owns layout validation and needs the Fragment boundary.
-    FragmentLayout,
 }
 
 impl Header {
@@ -266,14 +259,9 @@ impl Header {
         self.non_initial || (self.fragmented && self.fragment.is_none_or(|fragment| fragment.more))
     }
 
-    pub(crate) fn parse_fragment(bytes: &[u8]) -> Result<Self, TranslationError> {
-        Self::parse(bytes, ParseContext::FragmentLayout)
-    }
-
     /// Quotes may end before the original datagram; never pad absent bytes.
     pub(crate) fn parse(bytes: &[u8], context: ParseContext) -> Result<Self, TranslationError> {
         let quoted = context == ParseContext::Quotation;
-        let stop_fragment = context == ParseContext::FragmentLayout;
         let malformed = TranslationError::Malformed;
         if bytes.len() > MAX_RELAY_PACKET_SIZE {
             return Err(malformed);
@@ -339,14 +327,13 @@ impl Header {
         if !header.ipv4 {
             let end = bytes.len().min(header.declared);
             let mut extensions = 0;
-            let mut next_field = 6;
             while matches!(header.protocol, 0 | 43 | 44 | 60) {
                 extensions += 1;
                 if extensions > 8 {
                     return Err(malformed);
                 }
                 if header.transport + 8 > header.declared {
-                    return Err(if header.partial() && !quoted && !stop_fragment {
+                    return Err(if header.partial() && !quoted {
                         TranslationError::ShortHeader
                     } else {
                         malformed
@@ -370,7 +357,7 @@ impl Header {
                     return Err(malformed);
                 }
                 if offset + length > header.declared {
-                    return Err(if header.partial() && !quoted && !stop_fragment {
+                    return Err(if header.partial() && !quoted {
                         TranslationError::ShortHeader
                     } else {
                         malformed
@@ -398,13 +385,8 @@ impl Header {
                         header.fragmented = true;
                         if present == 8 {
                             header.fragment = Some(FragmentHeader {
-                                boundary: offset,
-                                next_field,
                                 offset: usize::from(word(bytes, offset + 2) & 0xfff8),
                                 more: bytes[offset + 3] & 1 != 0,
-                                id: u32::from_be_bytes(
-                                    bytes[offset + 4..offset + 8].try_into().unwrap(),
-                                ),
                             });
                             if context == ParseContext::Received {
                                 let fragment = header.fragment.unwrap();
@@ -428,8 +410,7 @@ impl Header {
                 }
                 header.protocol = bytes[offset];
                 header.transport += length;
-                next_field = offset;
-                if header.non_initial || (protocol == 44 && stop_fragment) {
+                if header.non_initial {
                     break;
                 }
             }

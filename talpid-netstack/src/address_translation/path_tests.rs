@@ -12,8 +12,8 @@ use talpid_types::relay_flow::{RelayAttemptOwner, RelayCaptureOwner, RelayWriteO
 #[path = "feedback_tests.rs"]
 mod feedback_tests;
 
-#[path = "completion_tests.rs"]
-mod completion_tests;
+#[path = "transit_tests.rs"]
+mod transit_tests;
 
 fn path() -> (
     TargetPacketPath,
@@ -163,76 +163,30 @@ fn out_of_order_split_transport_fragments_reach_independent_receiver_in_both_dir
             } else {
                 (remote(v4), address(ASSIGNED, v4))
             };
-            let original = packet(source, destination, 6, &segment(6));
-            let pieces = source_fragments(&original, 8, 40);
-            let mut final_packet = None;
+            let mut body = segment(6);
+            body.extend_from_slice(&[0x53; 64]);
+            let original = packet(source, destination, 6, &body);
+            let pieces = source_fragments(&original, 24, 40);
+            let mut output = Vec::new();
             for piece in pieces.iter().rev() {
                 let result = path.process(piece, direction, 1280, now).unwrap();
-                match result {
-                    TranslationOutcome::Packets(output) => final_packet = Some(receive(output)),
-                    TranslationOutcome::PendingFragments => (),
-                    _ => panic!("no feedback"),
-                }
+                let received = receive(packets(result));
+                assert_eq!(received.len(), 1);
+                output.extend(received);
             }
-            let output = final_packet.unwrap();
-            assert_eq!(output.len(), 1);
+            let joined = rejoin(&output, 40);
             let offset = if v4 { 20 } else { 40 };
-            assert_eq!(wire_checksum(&output[0], offset, 6), 0);
-            assert_eq!(
-                &output[0][offset..offset + 16],
-                &original[offset..offset + 16]
-            );
-            assert_eq!(&output[0][offset + 18..], &original[offset + 18..]);
+            assert_eq!(wire_checksum(&joined, offset, 6), 0);
+            assert_eq!(&joined[offset..offset + 16], &original[offset..offset + 16]);
+            assert_eq!(&joined[offset + 18..], &original[offset + 18..]);
             let expected = if direction == Direction::Outbound {
-                packet(address(ASSIGNED, v4), remote(v4), 6, &segment(6))
+                packet(address(ASSIGNED, v4), remote(v4), 6, &body)
             } else {
-                packet(remote(v4), address(FIXED, v4), 6, &segment(6))
+                packet(remote(v4), address(FIXED, v4), 6, &body)
             };
-            assert_eq!(&output[0][offset..], &expected[offset..]);
+            assert_eq!(&joined[offset..], &expected[offset..]);
         }
     }
-}
-
-#[test]
-fn overlap_conflict_tombstones_expire_at_original_deadline_and_do_not_extend() {
-    let (mut path, _capture, _attempt, _) = path();
-    let now = Instant::now();
-    let original = large(true, address(FIXED, true), remote(true), false);
-    let pieces = source_fragments(&original, 512, 40);
-    assert!(matches!(
-        path.process(&pieces[0], Direction::Outbound, 1280, now),
-        Ok(TranslationOutcome::PendingFragments)
-    ));
-    let deadline = path.deadline().unwrap();
-    assert!(matches!(
-        path.process(
-            &pieces[0],
-            Direction::Outbound,
-            1280,
-            now + Duration::from_secs(10)
-        ),
-        Err(TranslationError::RejectedFragment)
-    ));
-    assert_eq!(path.deadline(), Some(deadline));
-    assert!(matches!(
-        path.process(
-            &pieces[1],
-            Direction::Outbound,
-            1280,
-            deadline - Duration::from_nanos(1)
-        ),
-        Err(TranslationError::RejectedFragment)
-    ));
-    path.maintain(deadline);
-    assert_eq!(path.deadline(), None);
-    let mut last = None;
-    for piece in &pieces {
-        last = Some(
-            path.process(piece, Direction::Outbound, 1280, deadline)
-                .unwrap(),
-        );
-    }
-    assert!(matches!(last, Some(TranslationOutcome::Packets(_))));
 }
 
 #[test]
@@ -306,122 +260,6 @@ fn output_mtu_is_directional_and_ptb_quotes_the_sender_view() {
 }
 
 #[test]
-fn completed_fragment_ids_release_slots_without_evicting_rejection_tombstones() {
-    fn identify(pieces: &[Vec<u8>], v4: bool, id: u16) -> Vec<Vec<u8>> {
-        pieces
-            .iter()
-            .map(|piece| {
-                let mut piece = piece.clone();
-                if v4 {
-                    piece[4..6].copy_from_slice(&id.to_be_bytes());
-                    piece[10..12].fill(0);
-                    let sum = oracle(&piece[..20]);
-                    piece[10..12].copy_from_slice(&sum.to_be_bytes());
-                } else {
-                    piece[44..48].copy_from_slice(&u32::from(id).to_be_bytes());
-                }
-                piece
-            })
-            .collect()
-    }
-    for v4 in [true, false] {
-        for direction in [Direction::Outbound, Direction::Inbound] {
-            let (mut path, _capture, _attempt, budget) = path();
-            let now = Instant::now();
-            let before = budget.used();
-            let (source, destination) = if direction == Direction::Outbound {
-                (address(FIXED, v4), remote(v4))
-            } else {
-                (remote(v4), address(ASSIGNED, v4))
-            };
-            let original = packet(source, destination, 6, &segment(6));
-            let pieces = source_fragments(&original, 8, 40);
-            let rejected = identify(&pieces, v4, u16::MAX);
-            assert!(matches!(
-                path.process(&rejected[0], direction, 1280, now),
-                Ok(TranslationOutcome::PendingFragments)
-            ));
-            assert!(matches!(
-                path.process(&rejected[0], direction, 1280, now),
-                Err(TranslationError::RejectedFragment)
-            ));
-            let deadline = now + Duration::from_secs(15);
-            for id in 0..70 {
-                let mut delivered = Vec::new();
-                for piece in identify(&pieces, v4, id) {
-                    match path.process(&piece, direction, 1280, now).unwrap() {
-                        TranslationOutcome::PendingFragments => (),
-                        TranslationOutcome::Packets(output) => delivered.extend(receive(output)),
-                        _ => panic!("unexpected feedback"),
-                    }
-                }
-                assert_eq!(
-                    delivered.len(),
-                    1,
-                    "completed datagram did not reach consumer"
-                );
-                let header = Header::parse(&delivered[0], ParseContext::Received).unwrap();
-                assert_eq!(
-                    header.source,
-                    if direction == Direction::Outbound {
-                        address(ASSIGNED, v4)
-                    } else {
-                        source
-                    }
-                );
-                assert_eq!(
-                    header.destination,
-                    if direction == Direction::Inbound {
-                        address(FIXED, v4)
-                    } else {
-                        destination
-                    }
-                );
-                assert_eq!(wire_checksum(&delivered[0], if v4 { 20 } else { 40 }, 6), 0);
-                assert_eq!(budget.used(), before);
-                assert_eq!(path.deadline(), Some(deadline));
-            }
-            // Saturate the admission ledger with genuine rejections. Successful
-            // traffic above must not have shortened this first rejected ID's life.
-            for id in 100..163 {
-                let first = &identify(&pieces, v4, id)[0];
-                assert!(matches!(
-                    path.process(first, direction, 1280, now),
-                    Ok(TranslationOutcome::PendingFragments)
-                ));
-                assert!(matches!(
-                    path.process(first, direction, 1280, now),
-                    Err(TranslationError::RejectedFragment)
-                ));
-            }
-            let new = identify(&pieces, v4, 999);
-            assert!(matches!(
-                path.process(&new[0], direction, 1280, now),
-                Err(TranslationError::Full)
-            ));
-            assert!(matches!(
-                path.process(
-                    &rejected[1],
-                    direction,
-                    1280,
-                    deadline - Duration::from_nanos(1)
-                ),
-                Err(TranslationError::RejectedFragment)
-            ));
-            assert_eq!(path.deadline(), Some(deadline));
-            for (index, piece) in rejected.iter().enumerate() {
-                let outcome = path.process(piece, direction, 1280, deadline).unwrap();
-                if index == rejected.len() - 1 {
-                    assert_eq!(receive(packets(outcome)).len(), 1);
-                } else {
-                    assert!(matches!(outcome, TranslationOutcome::PendingFragments));
-                }
-            }
-        }
-    }
-}
-
-#[test]
 fn ipv4_fragments_and_ipv6_source_fragment_boundaries_survive_mtu_sizing() {
     let (mut path, _capture, _attempt, _) = path();
     let now = Instant::now();
@@ -444,8 +282,7 @@ fn ipv4_fragments_and_ipv6_source_fragment_boundaries_survive_mtu_sizing() {
             let mut emitted = Vec::new();
             for piece in inputs.iter().rev() {
                 match path.process(piece, Direction::Outbound, 1280, now).unwrap() {
-                    TranslationOutcome::Packets(packets) => emitted = receive(packets),
-                    TranslationOutcome::PendingFragments => (),
+                    TranslationOutcome::Packets(packets) => emitted.extend(receive(packets)),
                     _ => panic!("source fragments must survive"),
                 }
             }
@@ -568,50 +405,6 @@ fn feedback_suppresses_errors_and_ipv4_multicast_but_keeps_ipv6_multicast_ptb_ex
 }
 
 #[test]
-fn reassembly_limit_refuses_without_eviction_and_expiry_drop_refunds_the_region() {
-    let (mut path, _capture, _attempt, budget) = path();
-    let now = Instant::now();
-    let before = budget.used();
-    let bytes = large(true, address(FIXED, true), remote(true), false);
-    let mut piece = source_fragments(&bytes, 512, 40).remove(0);
-    let mut admitted = 0;
-    for id in 0u16..64 {
-        piece[4..6].copy_from_slice(&id.to_be_bytes());
-        piece[10..12].fill(0);
-        let value = oracle(&piece[..20]);
-        piece[10..12].copy_from_slice(&value.to_be_bytes());
-        match path.process(&piece, Direction::Outbound, 1280, now) {
-            Ok(TranslationOutcome::PendingFragments) => admitted += 1,
-            Err(TranslationError::Full) => (),
-            _ => panic!("capacity must refuse precisely"),
-        }
-        assert_eq!(budget.used(), before);
-    }
-    assert!(admitted > 0 && admitted < 64);
-    let small = packet(address(FIXED, true), remote(true), 17, &segment(17));
-    assert_eq!(
-        receive(packets(
-            path.process(&small, Direction::Outbound, 1280, now)
-                .unwrap()
-        ))
-        .len(),
-        1
-    );
-    assert_eq!(path.deadline(), Some(now + Duration::from_secs(15)));
-    path.maintain(now + Duration::from_secs(15));
-    assert_eq!(path.deadline(), None);
-    assert!(matches!(
-        path.process(
-            &piece,
-            Direction::Outbound,
-            1280,
-            now + Duration::from_secs(15)
-        ),
-        Ok(TranslationOutcome::PendingFragments)
-    ));
-}
-
-#[test]
 fn reserved_feedback_progress_survives_exhausted_application_credit() {
     let (mut path, _capture, _attempt, budget) = path();
     let now = Instant::now();
@@ -643,19 +436,26 @@ fn fragment_attempt_retirement_and_conflicting_headers_cannot_mix_with_successor
     let now = Instant::now();
     let original = large(false, address(FIXED, false), remote(false), false);
     let pieces = source_fragments(&original, 512, 40);
-    assert!(matches!(
-        path.process(&pieces[0], Direction::Outbound, 1280, now),
-        Ok(TranslationOutcome::PendingFragments)
-    ));
+    let mut queued = packets(
+        path.process(&pieces[0], Direction::Outbound, 1280, now)
+            .unwrap(),
+    )
+    .pop()
+    .unwrap();
     let mut conflicting = pieces[1].clone();
     conflicting[40] = 6;
-    assert!(matches!(
-        path.process(&conflicting, Direction::Outbound, 1280, now),
-        Err(TranslationError::RejectedFragment)
+    let opaque = receive(packets(
+        path.process(&conflicting, Direction::Outbound, 1280, now)
+            .unwrap(),
     ));
+    assert_eq!(&opaque[0][40..], &conflicting[40..]);
     attempt.retire();
     let successor = capture.open_attempt(&budget).unwrap();
     successor.activate().unwrap();
+    assert!(matches!(
+        queued.write(|_| panic!("old fragment entered successor")),
+        RelayWriteOutcome::Stale
+    ));
     let mut next = TargetPacketPath::new(
         path.config(),
         successor.capability(),
@@ -669,7 +469,7 @@ fn fragment_attempt_retirement_and_conflicting_headers_cannot_mix_with_successor
     for piece in pieces.iter().skip(1) {
         assert!(matches!(
             next.process(piece, Direction::Outbound, 1280, now),
-            Ok(TranslationOutcome::PendingFragments)
+            Ok(TranslationOutcome::Packets(_))
         ));
     }
     assert!(matches!(
@@ -719,30 +519,9 @@ fn atomic_ipv6_fragment_does_not_grant_router_fragment_permission() {
             .unwrap(),
     ));
     assert_eq!(output.len(), 1);
-    assert_eq!(output[0][6], 6);
-    assert_eq!(wire_checksum(&output[0], 40, 6), 0);
-}
-
-#[test]
-fn overflow_fragment_is_tombstoned_before_later_valid_pieces_can_restart_it() {
-    let (mut path, _capture, _attempt, _) = path();
-    let now = Instant::now();
-    let original = large(true, address(FIXED, true), remote(true), false);
-    let pieces = source_fragments(&original, 512, 40);
-    let mut overflow = pieces[0].clone();
-    overflow[6..8].copy_from_slice(&0x3fffu16.to_be_bytes());
-    overflow[10..12].fill(0);
-    let sum = oracle(&overflow[..20]);
-    overflow[10..12].copy_from_slice(&sum.to_be_bytes());
-    assert!(matches!(
-        path.process(&overflow, Direction::Outbound, 1280, now),
-        Err(TranslationError::Malformed)
-    ));
-    assert!(matches!(
-        path.process(&pieces[0], Direction::Outbound, 1280, now),
-        Err(TranslationError::RejectedFragment)
-    ));
-    assert_eq!(path.deadline(), Some(now + Duration::from_secs(15)));
+    assert_eq!(output[0][6], 44);
+    assert_eq!(&output[0][40..48], &atomic[40..48]);
+    assert_eq!(wire_checksum(&output[0], 48, 6), 0);
 }
 
 #[test]

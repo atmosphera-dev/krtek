@@ -286,6 +286,8 @@ async fn feedback_and_fresh_private_probes_progress_with_continuously_ready_ordi
         ))
         .unwrap();
     let mut held = client.gate.held_after(0).await;
+    assert!(client.owner.path.lock().unwrap().deadline().is_none());
+    let feedback_started = Instant::now();
     inject(&input, &oversize(&config, true, 0x82)).await;
     // Hold a real generated object, then put it back by generating a second
     // packet: the first remains charged and the second competes at the merge.
@@ -293,7 +295,9 @@ async fn feedback_and_fresh_private_probes_progress_with_continuously_ready_ordi
     inject(&input, &oversize(&config, true, 0x83)).await;
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if client.owner.path.lock().unwrap().deadline().is_some() {
+            if let Some(deadline) = client.owner.path.lock().unwrap().deadline() {
+                assert!(deadline >= feedback_started);
+                assert!(deadline <= Instant::now() + Duration::from_millis(125));
                 break;
             }
             tokio::task::yield_now().await;

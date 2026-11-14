@@ -1415,6 +1415,131 @@ class LocalNetworkDeliveryInstrumentedTest {
         }
 
     @Test
+    fun mullvadLargeUdpFragments() =
+        withConsumer(null, testTimeout = 3.minutes) { consumer, repository, connection ->
+            // Instrumentation replaces the app process/TUN. Attach only after
+            // this invocation has acknowledged its own final Connected capture.
+            runBlocking {
+                val state = withTimeout(30_000) { connection.tunnelState.first() }
+                assertTrue(state is TunnelState.Connected)
+            }
+            val policy = checkNotNull(repository.settingsUpdates.value).localNetworkAccess
+            val forwarding =
+                if (policy.enabled && policy.rules.any { it.enabled && it.cidrs.isNotEmpty() })
+                    ForwardingAvailability.Active
+                else ForwardingAvailability.Off
+            awaitState(repository, connection, forwarding, null, "Connected")
+            val capture = appliedConfiguration(policy, forwarding, "Connected")
+            probeExit(consumer, "mullvad")
+            val token = checkNotNull(args.getString("krtek_capture_token"))
+            check(token.matches(Regex("[a-z0-9-]{1,64}")))
+            captureBarrier(token, "start", capture)
+            try {
+                // Both small controls precede either large echo. Failure is a
+                // real observation, never silently retried with another peer.
+                listOf(32, 3072).forEach { size ->
+                    listOf(4, 6).forEach { family ->
+                        consumer.identity()
+                        val result =
+                            consumer.request(
+                                Bundle().apply {
+                                    putString("transport", "gateway-echo")
+                                    putInt("family", family)
+                                    putInt("payload_size", size)
+                                }
+                            )
+                        val raw = checkNotNull(result.getString("echo_report"))
+                        saveLargeProbe("echo_report_${family}_$size", raw)
+                        val decoded = JSONObject(raw)
+                        assertEquals(family, decoded.getInt("family"))
+                        assertEquals(result.getInt("uid"), decoded.getInt("uid"))
+                        assertEquals("gateway-echo", result.getString("outcome"), raw)
+                        assertTrue(decoded.getBoolean("validated"))
+                        assertEquals(size + 8, decoded.getInt("sent"))
+                        assertEquals(size + 8, decoded.getInt("received"))
+                        assertEquals(size * 2, decoded.getString("payload_hex").length)
+                        assertTrue(decoded.getBoolean("option_set"))
+                    }
+                }
+                listOf(4, 6).forEach { family ->
+                    consumer.identity()
+                    val result =
+                        consumer.request(
+                            Bundle().apply {
+                                putString("transport", "fragmented-udp")
+                                putInt("family", family)
+                            }
+                        )
+                    val raw = checkNotNull(result.getString("fragment_report"))
+                    saveLargeProbe("fragment_report_$family", raw)
+                    val decoded = JSONObject(raw)
+                    assertEquals(family, decoded.getInt("family"))
+                    assertEquals(result.getInt("uid"), decoded.getInt("uid"))
+                    // DNS is informational: retain the complete success or failure
+                    // receipt and independent outgoing-fragment audit either way.
+                    report("dns_outcome_$family", checkNotNull(result.getString("outcome")))
+                    if (result.getString("outcome") == "fragmented-udp") {
+                        assertTrue(decoded.getBoolean("validated"))
+                        assertEquals(4096, decoded.getInt("sent"))
+                        assertEquals(8192, decoded.getString("query_hex").length)
+                        assertEquals(0, decoded.getInt("option_value"))
+                        assertTrue(decoded.getBoolean("option_set"))
+                    }
+                    runBlocking {
+                        val state = withTimeout(30_000) { connection.tunnelState.first() }
+                        assertTrue(state is TunnelState.Connected)
+                    }
+                }
+                probeExit(consumer, "mullvad")
+            } finally {
+                val finalCapture = appliedConfiguration(policy, forwarding, "Connected")
+                assertEquals(capture, finalCapture, "Capture epoch changed during probes")
+                captureBarrier(token, "finish", finalCapture)
+            }
+        }
+
+    private fun saveLargeProbe(name: String, raw: String) {
+        val folder =
+            File(target.filesDir, "krtek-probes").apply {
+                check(isDirectory || mkdir())
+            }
+        val file = File(folder, "$name-${UUID.randomUUID()}.json")
+        file.writeText(raw)
+        report(name, file.absolutePath)
+    }
+
+    private fun captureBarrier(token: String, phase: String, capture: AppliedCapture) =
+        runBlocking {
+            val folder = File(target.filesDir, "krtek-probes")
+            val ready = File(folder, "$token-$phase.json")
+            val ack = File(folder, "$token-$phase.ack")
+            check(!ready.exists() && !ack.exists())
+            val raw =
+                JSONObject()
+                    .apply {
+                        put("token", token)
+                        put("phase", phase)
+                        put("pid", Process.myPid())
+                        put("generation", capture.generation)
+                        put("handle", capture.handle)
+                        put("interface", capture.interfaceName)
+                        put("net_id", capture.netId)
+                        put(
+                            "ifindex",
+                            java.net.NetworkInterface.getByName(capture.interfaceName).index,
+                        )
+                        put("ready_ns", SystemClock.elapsedRealtimeNanos())
+                    }
+                    .toString()
+            ready.writeText(raw)
+            report("capture_barrier_$phase", ready.absolutePath)
+            withTimeout(45_000) {
+                while (!ack.isFile) delay(100)
+            }
+            assertEquals(raw, ack.readText(), "Observer must acknowledge this exact epoch")
+        }
+
+    @Test
     fun consumerProbe() {
         val transport = args.getString("krtek_probe_transport")
         val expect = args.getString("krtek_probe_expect")

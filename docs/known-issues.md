@@ -50,6 +50,14 @@ Each issue in this document should provide, at least, the following:
   to send in that moment. The same UDP socket can send again afterward.
 * Changing the list of excluded apps also rebuilds the interface. Android closes
   connections that are open at that moment; new connections work right away.
+* Local rules currently drop fragmented IPv4 and IPv6 before their receiving
+  stack. TCP and normal-sized UDP work, but large UDP messages to local devices
+  can be silently lost. Standard receiver reassembly remains separate work.
+  Tunnel transit instead translates and forwards fragments independently; this
+  does not add fragment reception to Local or promise public-network delivery.
+  The capture uses `172.27.1.1/32` and `fdf0:ce4a:801d::172:27:1:1/128`
+  independently of Mullvad's assignment. These private addresses can still
+  collide with a real private network.
 
 ### Potential leaks just after macOS boot
 

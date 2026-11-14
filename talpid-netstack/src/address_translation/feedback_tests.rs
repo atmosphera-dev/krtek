@@ -81,7 +81,9 @@ fn feedback(path: &mut TargetPacketPath, original: &[u8], direction: Direction, 
     );
     assert_eq!(
         outer.destination,
-        Header::parse_fragment(original).unwrap().source
+        Header::parse(original, ParseContext::Received)
+            .unwrap()
+            .source
     );
 }
 
@@ -147,7 +149,11 @@ fn fragment_packet(datagram: &[u8], protocol: u8) -> (Vec<u8>, Vec<u8>) {
     extension[1] = 154;
     prefix.extend_from_slice(&extension);
     let mut fragments = Vec::new();
-    for (offset, body, more) in [(0, &datagram[40..48], true), (8, &datagram[48..], false)] {
+    let split = if protocol == 58 { 72 } else { 8 };
+    for (offset, body, more) in [
+        (0, &datagram[40..40 + split], true),
+        (split, &datagram[40 + split..], false),
+    ] {
         let mut fragment = prefix.clone();
         fragment.extend_from_slice(&[protocol, 0]);
         fragment.extend_from_slice(&((offset as u16) | u16::from(more)).to_be_bytes());
@@ -172,8 +178,9 @@ fn source_fragment_pmtu_feedback_keeps_the_original_first_fragment_view() {
         let now = Instant::now();
         assert!(matches!(
             path.process(&last, direction, 1280, now),
-            Ok(TranslationOutcome::PendingFragments)
+            Ok(TranslationOutcome::FeedbackQueued(_))
         ));
+        feedback(&mut path, &last, direction, 1280);
         assert!(matches!(
             path.process(&first, direction, 1280, now),
             Ok(TranslationOutcome::FeedbackQueued(_))
@@ -183,38 +190,11 @@ fn source_fragment_pmtu_feedback_keeps_the_original_first_fragment_view() {
 }
 
 #[test]
-fn retained_first_fragment_prefix_is_bounded_and_keeps_its_region_charged() {
-    use crate::fragment_state::{Datagram, FragmentState};
-    let budget = BufferBudget::new(22 * 1024 * 1024);
-    let mut fragments = FragmentState::new(&budget).unwrap();
-    let (first, last) = source_fragments(Direction::Inbound);
-    let now = Instant::now();
-    assert!(
-        fragments
-            .ingest(&first, Direction::Inbound, now)
-            .unwrap()
-            .is_none()
-    );
-    let Datagram {
-        bytes, invoking, ..
-    } = fragments
-        .ingest(&last, Direction::Inbound, now)
-        .unwrap()
-        .unwrap();
-    assert_eq!(invoking.len(), 1280);
-    assert_eq!(&invoking[..], &first[..1280]);
-    drop(fragments);
-    assert_eq!(budget.used(), 4 * 1024 * 1024);
-    drop(bytes);
-    assert_eq!(budget.used(), 4 * 1024 * 1024);
-    drop(invoking);
-    assert_eq!(budget.used(), 0);
-}
-
-#[test]
 fn truncated_original_fragment_prefix_does_not_hide_error_suppression() {
     let (mut path, _capture, _attempt, _) = path(1380);
-    let quote = packet(address(ASSIGNED, false), remote(false), 6, &segment(6));
+    let mut payload = segment(6);
+    payload.extend_from_slice(&[0x53; 32]);
+    let quote = packet(address(ASSIGNED, false), remote(false), 6, &payload);
     let mut body = vec![2, 0, 0, 0, 0, 0, 5, 0];
     body.extend_from_slice(&quote);
     let error = packet(remote(false), address(ASSIGNED, false), 58, &body);
@@ -222,8 +202,9 @@ fn truncated_original_fragment_prefix_does_not_hide_error_suppression() {
     let now = Instant::now();
     assert!(matches!(
         path.process(&last, Direction::Inbound, 1280, now),
-        Ok(TranslationOutcome::PendingFragments)
+        Ok(TranslationOutcome::FeedbackQueued(_))
     ));
+    feedback(&mut path, &last, Direction::Inbound, 1280);
     assert!(matches!(
         path.process(&first, Direction::Inbound, 1280, now),
         Err(TranslationError::Suppressed)

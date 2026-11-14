@@ -1,21 +1,16 @@
 use super::*;
-use crate::{
-    fragment_state::FragmentState,
-    packet_sizing::{self, Emission, Feedback, FeedbackQueue, FeedbackSide},
-};
+use crate::packet_sizing::{self, Emission, Feedback, FeedbackQueue, FeedbackSide};
 use std::time::Instant;
 
 pub enum TranslationOutcome {
     Packets(Emission),
-    PendingFragments,
     FeedbackQueued(FeedbackSide),
 }
 
-/// The complete production boundary: reassemble, translate, size, then retain
+/// The production boundary: validate this packet, translate, size, then retain
 /// packets/feedback with this exact attempt through the consumer's final write.
 pub struct TargetPacketPath {
     mapper: AddressTranslator,
-    fragments: FragmentState,
     feedback: FeedbackQueue,
 }
 
@@ -26,13 +21,8 @@ impl TargetPacketPath {
         buffers: Arc<dyn RelayBufferAllocator>,
     ) -> Result<Self, TranslationError> {
         let mapper = AddressTranslator::new(config, attempt, buffers.clone())?;
-        let fragments = FragmentState::new(buffers.as_ref())?;
         let feedback = FeedbackQueue::new(buffers.as_ref())?;
-        Ok(Self {
-            mapper,
-            fragments,
-            feedback,
-        })
+        Ok(Self { mapper, feedback })
     }
     pub fn config(&self) -> TargetConfig {
         self.mapper.config()
@@ -61,18 +51,12 @@ impl TargetPacketPath {
         self.feedback.pop()
     }
     pub fn deadline(&self) -> Option<Instant> {
-        self.fragments
-            .deadline()
-            .into_iter()
-            .chain(self.feedback.deadline())
-            .min()
+        self.feedback.deadline()
     }
     pub fn maintain(&mut self, now: Instant) {
         if !self.mapper.attempt.current() {
-            self.fragments.clear();
             self.feedback.clear();
         } else {
-            self.fragments.maintain(now);
             self.feedback.maintain(now);
         }
     }
@@ -110,12 +94,7 @@ impl TargetPacketPath {
         if sink_mtu < 68 {
             return Err(TranslationError::Malformed);
         }
-        let header = Header::parse_fragment(bytes)?;
-        self.mapper.endpoints(&header, direction)?;
-        let Some(datagram) = self.fragments.ingest(bytes, direction, now)? else {
-            return Ok(TranslationOutcome::PendingFragments);
-        };
-        let header = self.mapper.validate_packet(&datagram.bytes, direction)?;
+        let header = self.mapper.validate_packet(bytes, direction)?;
         let output_mtu = if direction == Direction::Outbound {
             self.mapper.config.mtu
         } else {
@@ -123,23 +102,15 @@ impl TargetPacketPath {
         };
         // Decide impossibility from the validated input before spending ordinary
         // data credit. Reserved feedback must progress when data credit is full.
-        let needs_feedback = datagram.bytes.len() > usize::from(output_mtu)
-            && if header.ipv4 {
-                word(&datagram.bytes, 6) & 0x4000 != 0
-                    || usize::from(output_mtu) < header.transport + 8
-            } else {
-                datagram
-                    .fragmentation
-                    .is_none_or(|fragment| usize::from(output_mtu) < fragment.boundary + 16)
-            };
+        let needs_feedback = packet_sizing::needs_feedback(bytes, &header, output_mtu);
         let emitted = if needs_feedback {
             Err(TranslationError::PacketTooBig)
         } else {
-            let translated = self.mapper.translate_buffer(&datagram.bytes, direction)?;
+            let translated = self.mapper.translate_buffer(bytes, direction)?;
             packet_sizing::emit(
-                &translated,
+                translated,
+                &header,
                 output_mtu,
-                datagram.fragmentation,
                 &self.mapper.attempt,
                 self.mapper.buffers.as_ref(),
             )
@@ -147,7 +118,6 @@ impl TargetPacketPath {
         match emitted {
             Ok(packets) => Ok(TranslationOutcome::Packets(packets)),
             Err(TranslationError::PacketTooBig) => {
-                let header = Header::parse(&datagram.bytes, ParseContext::Received)?;
                 let sources = if direction == Direction::Outbound {
                     self.mapper.config.fixed
                 } else {
@@ -186,8 +156,8 @@ impl TargetPacketPath {
                     self.mapper.config.mtu
                 };
                 self.feedback.generate(
-                    &datagram.invoking,
-                    &datagram.bytes,
+                    bytes,
+                    &header,
                     packet_sizing::FeedbackRoute {
                         source,
                         mtu: output_mtu,

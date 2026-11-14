@@ -194,6 +194,39 @@ public final class LocalNetworkConsumerService extends Service {
       return result;
     }
     if ("lookup".equals(transport)) return lookup(command);
+    if ("gateway-echo".equals(transport)) {
+      int family = command.getInt("family");
+      int size = command.getInt("payload_size");
+      if (command.size() != 4 || !command.containsKey("request_id")
+          || !(family == 4 || family == 6) || !(size == 32 || size == 3072)) {
+        return outcome("invalid");
+      }
+      ProbeResources resources = new ProbeResources();
+      ownedResources.set(resources);
+      activeProbe = resources;
+      try {
+        if (Thread.currentThread().isInterrupted()) return outcome("deadline");
+        return LargeEchoProbe.run(family, size, resources::icmpSocket);
+      } finally {
+        resources.close();
+        activeProbe = null;
+      }
+    }
+    if ("fragmented-udp".equals(transport)) {
+      int family = command.getInt("family");
+      if (command.size() != 3 || !command.containsKey("request_id")
+          || !(family == 4 || family == 6)) return outcome("invalid");
+      ProbeResources resources = new ProbeResources();
+      ownedResources.set(resources);
+      activeProbe = resources;
+      try {
+        if (Thread.currentThread().isInterrupted()) return outcome("deadline");
+        return FragmentedUdpProbe.run(family, resources::icmpSocket);
+      } finally {
+        resources.close();
+        activeProbe = null;
+      }
+    }
     if ("exit-check".equals(transport) || "icmp-check".equals(transport)) {
       if (command.size() != 2 || !command.containsKey("request_id")) return outcome("invalid");
       ProbeResources resources = new ProbeResources();

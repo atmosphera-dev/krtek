@@ -467,18 +467,27 @@ async fn translated_fragments_are_consumed_and_sized_in_both_crypto_directions()
             .unwrap();
         for (v6, source_fragmented) in [(false, false), (false, true), (true, true)] {
             let app = packet(&config, v6, 17, &vec![0x97; 1600], false, false);
-            // IPv4 routers can fragment; IPv6 can only preserve source permission.
+            // IPv4 can be split here; existing source fragments forward at once.
+            let mut wire_fragments = Vec::new();
             if source_fragmented {
-                for fragment in fragments(&app, 800).into_iter().rev() {
+                let expected = fragments(
+                    &packet(&config, v6, 17, &vec![0x97; 1600], true, false),
+                    800,
+                );
+                for (fragment, expected) in fragments(&app, 800).into_iter().zip(expected).rev() {
                     capture.try_send(&fragment).unwrap();
+                    let received = observed(&mut observations).await;
+                    assert_eq!(
+                        received, expected,
+                        "fragment must arrive before the next send"
+                    );
+                    wire_fragments.push(received);
                 }
             } else {
                 capture.try_send(&app).unwrap();
+                wire_fragments.push(observed(&mut observations).await);
+                wire_fragments.push(observed(&mut observations).await);
             }
-            let mut wire_fragments = vec![
-                observed(&mut observations).await,
-                observed(&mut observations).await,
-            ];
             assert!(
                 wire_fragments
                     .iter()
@@ -491,20 +500,30 @@ async fn translated_fragments_are_consumed_and_sized_in_both_crypto_directions()
             );
             assert_eq!(wire_sum(&wire, if v6 { 40 } else { 20 }, 17), [0, 0]);
             let inbound = application_reply(&wire);
+            let mut captured = Vec::new();
             if source_fragmented {
-                for fragment in fragments(&inbound, 800).into_iter().rev() {
+                let expected = fragments(&application_reply(&app), 800);
+                for (fragment, expected) in fragments(&inbound, 800).into_iter().zip(expected).rev()
+                {
                     inject
                         .send(Packet::<[u8]>::copy_from(&fragment).try_into_ip().unwrap())
                         .await
                         .unwrap();
+                    let received = capture_bytes(&capture).await;
+                    assert_eq!(
+                        received, expected,
+                        "return fragment must arrive before the next send"
+                    );
+                    captured.push(received);
                 }
             } else {
                 inject
                     .send(Packet::<[u8]>::copy_from(&inbound).try_into_ip().unwrap())
                     .await
                     .unwrap();
+                captured.push(capture_bytes(&capture).await);
+                captured.push(capture_bytes(&capture).await);
             }
-            let captured = vec![capture_bytes(&capture).await, capture_bytes(&capture).await];
             assert!(captured.iter().all(|packet| packet.len() <= 1280));
             assert_eq!(rejoin(captured), application_reply(&app));
         }
@@ -620,17 +639,37 @@ async fn retired_translated_bytes_and_assembly_never_enter_an_identical_or_rotat
         let incomplete = packet(&config, false, 17, &[0x79; 900], false, false);
         let pieces = fragments(&incomplete, 480);
         capture.try_send(&pieces[0]).unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(30), observations.recv())
-                .await
-                .is_err()
-        );
+        let expected = fragments(&packet(&config, false, 17, &[0x79; 900], true, false), 480);
+        assert_eq!(observed(&mut observations).await, expected[0]);
+        let mut queued = {
+            let result = owner
+                .path
+                .lock()
+                .unwrap()
+                .process(
+                    &pieces[0],
+                    talpid_netstack::address_translation::Direction::Outbound,
+                    1280,
+                    Instant::now(),
+                )
+                .unwrap();
+            let talpid_netstack::address_translation::TranslationOutcome::Packets(mut packets) =
+                result
+            else {
+                panic!("immediate fragment")
+            };
+            packets.pop().unwrap()
+        };
+        assert!(matches!(
+            queued.write(|_| Err(io::ErrorKind::WouldBlock.into())),
+            RelayWriteOutcome::Retry
+        ));
         client.shutdown().await;
         assert!(session.current());
         assert!(!old.current());
         assert!(
             owner.path.lock().unwrap().deadline().is_none(),
-            "retired assembly retained its deadline"
+            "retired path retained a feedback deadline"
         );
         drop((owner, check, client));
         assert_eq!(credit.used(), 0);
@@ -668,12 +707,17 @@ async fn retired_translated_bytes_and_assembly_never_enter_an_identical_or_rotat
             blocked.write_to(&sink, |_| panic!("old bytes reached successor")),
             RelayWriteOutcome::Stale
         ));
+        assert!(matches!(
+            queued.write(|_| panic!("old queued fragment reached successor")),
+            RelayWriteOutcome::Stale
+        ));
+        drop(queued);
         capture.try_send(&pieces[1]).unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(30), observations.recv())
-                .await
-                .is_err(),
-            "old first fragment entered successor assembly"
+        let expected = fragments(&packet(&config, false, 17, &[0x79; 900], true, false), 480);
+        assert_eq!(
+            observed(&mut observations).await,
+            expected[1],
+            "a fresh tail is independently translatable under the successor"
         );
         let app = packet(&config, false, 17, b"fresh-successor-nonce", false, false);
         capture.try_send(&app).unwrap();

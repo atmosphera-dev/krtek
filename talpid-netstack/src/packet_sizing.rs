@@ -1,10 +1,6 @@
 //! Checked emission and sender-side PMTU feedback, using application credit.
-use crate::{
-    address_translation::{
-        Header, ParseContext, TranslationError, checksum, is_icmp_error, set_transport_checksum,
-        word,
-    },
-    fragment_state::{Fragmentation, copied_options},
+use crate::address_translation::{
+    Header, ParseContext, TranslationError, checksum, is_icmp_error, set_transport_checksum, word,
 };
 use std::{
     collections::VecDeque,
@@ -38,116 +34,137 @@ impl Emission {
     }
 }
 
+pub(crate) fn needs_feedback(bytes: &[u8], header: &Header, mtu: u16) -> bool {
+    bytes.len() > usize::from(mtu)
+        && (!header.ipv4 || word(bytes, 6) & 0x4000 != 0 || usize::from(mtu) < header.transport + 8)
+}
+
+/// Size only this translated packet. The caller retains the original invocation
+/// for feedback; no earlier fragment confers authority to emit IPv6 fragments.
 pub(crate) fn emit(
-    bytes: &[u8],
+    bytes: RelayBuffer,
+    header: &Header,
     mtu: u16,
-    fragmentation: Option<Fragmentation>,
     attempt: &RelayAttempt,
     buffers: &dyn RelayBufferAllocator,
 ) -> Result<Emission, TranslationError> {
-    let header = Header::parse(bytes, ParseContext::Received)?;
-    let mtu = usize::from(mtu);
-    let too_big = bytes.len() > mtu;
-    if too_big
-        && ((header.ipv4 && word(bytes, 6) & 0x4000 != 0)
-            || (!header.ipv4 && fragmentation.is_none()))
-    {
+    if needs_feedback(&bytes, header, mtu) {
         return Err(TranslationError::PacketTooBig);
     }
-    let (prefix, next_field, id) = if header.ipv4 {
-        (header.transport, 9, 0)
-    } else if let Some(fragment) = fragmentation {
-        (fragment.boundary, fragment.next_field, fragment.id)
-    } else {
-        (40, 6, 0)
-    };
-    let (options, option_length) = if header.ipv4 {
-        copied_options(&bytes[..prefix])?
-    } else {
-        ([0; 40], 0)
-    };
-    let overhead = prefix + if header.ipv4 { 0 } else { 8 };
-    let quantum = if too_big {
-        mtu.checked_sub(overhead)
-            .ok_or(TranslationError::PacketTooBig)?
-            / 8
-            * 8
-    } else {
-        bytes.len()
-    };
-    if quantum == 0 {
-        return Err(TranslationError::PacketTooBig);
-    }
-    let count = if too_big {
-        (bytes.len() - prefix).div_ceil(quantum)
-    } else {
-        1
-    };
-    let metadata =
-        buffers.try_reserve(count * std::mem::size_of::<RelayPacket>() + BUFFER_OVERHEAD)?;
-    let mut packets = VecDeque::with_capacity(count);
-    if !too_big {
-        packets.push_back(attempt.packet(RelayBuffer::copy_from(bytes, buffers)?)?);
+    if bytes.len() <= usize::from(mtu) {
+        let metadata = buffers.try_reserve(std::mem::size_of::<RelayPacket>() + BUFFER_OVERHEAD)?;
+        let mut packets = VecDeque::with_capacity(1);
+        packets.push_back(attempt.packet(bytes)?);
         return Ok(Emission {
             packets,
             _metadata: metadata,
         });
     }
+    let prefix = header.transport;
+    let (options, option_length) = copied_options(&bytes[..prefix])?;
+    let original_offset = usize::from(word(&bytes, 6) & 0x1fff) * 8;
+    let original_more = word(&bytes, 6) & 0x2000 != 0;
     let payload = &bytes[prefix..];
-    let mut offset = 0;
-    while offset < payload.len() {
-        let prefix_length = if header.ipv4 && offset != 0 {
-            20 + option_length
-        } else {
-            prefix
-        };
-        let overhead = prefix_length + if header.ipv4 { 0 } else { 8 };
-        let capacity = mtu
-            .checked_sub(overhead)
-            .ok_or(TranslationError::PacketTooBig)?;
-        let remaining = payload.len() - offset;
-        let length = if remaining > capacity {
-            capacity / 8 * 8
-        } else {
-            remaining
-        };
-        if length == 0 {
-            return Err(TranslationError::PacketTooBig);
+    // Walk twice: preflight every size/offset and reserve the complete allocation
+    // peak before creating any output. A later refusal cannot partially emit.
+    let pieces = || {
+        let mut offset = 0;
+        std::iter::from_fn(move || {
+            if offset == payload.len() {
+                return None;
+            }
+            let ip = if original_offset + offset == 0 {
+                prefix
+            } else {
+                20 + option_length
+            };
+            let capacity = usize::from(mtu) - ip;
+            let remaining = payload.len() - offset;
+            let length = if remaining > capacity {
+                capacity / 8 * 8
+            } else {
+                remaining
+            };
+            let start = offset;
+            offset += length;
+            Some((start, ip, length))
+        })
+    };
+    let mut count = 0;
+    let mut total = 0;
+    for (offset, ip, length) in pieces() {
+        if length == 0
+            || original_offset + offset > 0x1fff * 8
+            || original_offset + offset + length + prefix > 65_535
+        {
+            return Err(TranslationError::Malformed);
         }
-        let charge = buffers.try_reserve(overhead + length + BUFFER_OVERHEAD)?;
-        let mut output = vec![0; overhead + length];
-        if header.ipv4 && offset != 0 {
-            output[..20].copy_from_slice(&bytes[..20]);
-            output[20..prefix_length].copy_from_slice(&options[..option_length]);
-            output[0] = 0x40 | (prefix_length / 4) as u8;
+        count += 1;
+        total += ip + length + BUFFER_OVERHEAD;
+    }
+    let metadata =
+        buffers.try_reserve(count * std::mem::size_of::<RelayPacket>() + BUFFER_OVERHEAD)?;
+    let mut peak = buffers.try_reserve(total)?;
+    let mut packets = VecDeque::with_capacity(count);
+    for (offset, ip, length) in pieces() {
+        let size = ip + length + BUFFER_OVERHEAD;
+        total -= size;
+        // Split off one ticket at a time, avoiding the allocator's bounded
+        // partition-list size even for a legal 65 KiB packet at a small MTU.
+        let mut parts = peak.partition(&[size, total])?;
+        peak = parts.pop().expect("remaining peak ticket");
+        let charge = parts.pop().expect("current packet ticket");
+        let mut output = vec![0; ip + length];
+        output[..20].copy_from_slice(&bytes[..20]);
+        if original_offset + offset == 0 {
+            output[20..ip].copy_from_slice(&bytes[20..prefix]);
         } else {
-            output[..prefix_length].copy_from_slice(&bytes[..prefix_length]);
+            output[20..ip].copy_from_slice(&options[..option_length]);
         }
-        let more = offset + length < payload.len();
-        if header.ipv4 {
-            output[2..4].copy_from_slice(&((overhead + length) as u16).to_be_bytes());
-            output[6..8].copy_from_slice(
-                &(((offset / 8) as u16) | if more { 0x2000 } else { 0 }).to_be_bytes(),
-            );
-            output[10..12].fill(0);
-            let sum = checksum(&[&output[..prefix_length]]);
-            output[10..12].copy_from_slice(&sum.to_be_bytes());
-        } else {
-            output[next_field] = 44;
-            output[prefix_length] = bytes[next_field];
-            output[prefix_length + 2..prefix_length + 4]
-                .copy_from_slice(&((offset as u16) | u16::from(more)).to_be_bytes());
-            output[prefix_length + 4..prefix_length + 8].copy_from_slice(&id.to_be_bytes());
-            output[4..6].copy_from_slice(&((overhead + length - 40) as u16).to_be_bytes());
-        }
-        output[overhead..].copy_from_slice(&payload[offset..offset + length]);
+        output[0] = 0x40 | (ip / 4) as u8;
+        output[2..4].copy_from_slice(&((ip + length) as u16).to_be_bytes());
+        let more = offset + length < payload.len() || original_more;
+        output[6..8].copy_from_slice(
+            &(((original_offset + offset) / 8) as u16 | if more { 0x2000 } else { 0 })
+                .to_be_bytes(),
+        );
+        output[10..12].fill(0);
+        let sum = checksum(&[&output[..ip]]);
+        output[10..12].copy_from_slice(&sum.to_be_bytes());
+        output[ip..].copy_from_slice(&payload[offset..offset + length]);
         packets.push_back(attempt.packet(RelayBuffer::from_reservation(output, charge)?)?);
-        offset += length;
     }
     Ok(Emission {
         packets,
         _metadata: metadata,
     })
+}
+
+/// Canonical copied options, in wire order, without a heap allocation.
+fn copied_options(header: &[u8]) -> Result<([u8; 40], usize), TranslationError> {
+    let mut result = [0; 40];
+    let mut length = 0;
+    let mut offset = 20;
+    while offset < header.len() {
+        let kind = header[offset];
+        if kind == 0 {
+            break;
+        }
+        if kind == 1 {
+            offset += 1;
+            continue;
+        }
+        let size = usize::from(*header.get(offset + 1).ok_or(TranslationError::Malformed)?);
+        if size < 2 || offset + size > header.len() {
+            return Err(TranslationError::Malformed);
+        }
+        if kind & 0x80 != 0 {
+            result[length..length + size].copy_from_slice(&header[offset..offset + size]);
+            length += size;
+        }
+        offset += size;
+    }
+    Ok((result, length.div_ceil(4) * 4))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,7 +281,7 @@ impl FeedbackQueue {
     pub fn generate(
         &mut self,
         invoking: &[u8],
-        validated_datagram: &[u8],
+        header: &Header,
         route: FeedbackRoute,
         attempt: &RelayAttempt,
         now: Instant,
@@ -275,18 +292,7 @@ impl FeedbackQueue {
             return_mtu,
             side,
         } = route;
-        let header = Header::parse(invoking, ParseContext::Quotation)?;
-        let datagram = Header::parse(validated_datagram, ParseContext::Received)?;
-        if header.ipv4 != datagram.ipv4
-            || header.source != datagram.source
-            || header.destination != datagram.destination
-        {
-            return Err(TranslationError::Endpoint);
-        }
-        // The quote can end before ICMP's type or even its extension chain.
-        // Suppression uses the validated full datagram; non-initial provenance
-        // remains a refusal even if somebody supplies a normalized first header.
-        if header.non_initial || suppress(validated_datagram, &datagram) {
+        if suppress(invoking, header) {
             return Err(TranslationError::Suppressed);
         }
         self.maintain(now);
@@ -360,12 +366,13 @@ impl FeedbackQueue {
 }
 
 fn suppress(bytes: &[u8], header: &Header) -> bool {
-    if is_icmp_error(bytes, header) || header.non_initial {
+    if !header.non_initial && is_icmp_error(bytes, header) {
         return true;
     }
     match (header.source, header.destination) {
         (IpAddr::V4(source), IpAddr::V4(destination)) => {
-            source.octets()[0] == 0
+            header.non_initial
+                || source.octets()[0] == 0
                 || source.is_loopback()
                 || source.octets()[0] >= 224
                 || destination.is_multicast()
@@ -377,7 +384,8 @@ fn suppress(bytes: &[u8], header: &Header) -> bool {
             source.is_unspecified()
                 || source.is_multicast()
                 || source.is_loopback()
-                || (header.protocol == 58
+                || (!header.non_initial
+                    && header.protocol == 58
                     && bytes
                         .get(header.transport)
                         .is_some_and(|kind| *kind < 128 || *kind == 137))
