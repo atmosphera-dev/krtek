@@ -283,7 +283,7 @@ fn output_mtu_is_directional_and_ptb_quotes_the_sender_view() {
                     u32::from(mtu)
                 );
             }
-            let header = Header::parse(&wire, false).unwrap();
+            let header = Header::parse(&wire, ParseContext::Received).unwrap();
             assert_eq!(header.destination, source);
             assert_eq!(
                 header.source,
@@ -360,7 +360,7 @@ fn completed_fragment_ids_release_slots_without_evicting_rejection_tombstones() 
                     1,
                     "completed datagram did not reach consumer"
                 );
-                let header = Header::parse(&delivered[0], false).unwrap();
+                let header = Header::parse(&delivered[0], ParseContext::Received).unwrap();
                 assert_eq!(
                     header.source,
                     if direction == Direction::Outbound {
@@ -456,7 +456,9 @@ fn ipv4_fragments_and_ipv6_source_fragment_boundaries_survive_mtu_sizing() {
         assert_eq!(wire_checksum(&complete, boundary, 17), 0);
         assert_eq!(&complete[boundary + 8..], &original[boundary + 8..]);
         assert_eq!(
-            Header::parse(&complete, false).unwrap().source,
+            Header::parse(&complete, ParseContext::Received)
+                .unwrap()
+                .source,
             address(ASSIGNED, v4)
         );
         if !v4 {

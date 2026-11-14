@@ -74,7 +74,7 @@ fn check_quote(
     if v4 {
         assert_eq!(oracle(&view.bytes()[..20]), 0);
     }
-    let header = Header::parse(view.bytes(), false).unwrap();
+    let header = Header::parse(view.bytes(), ParseContext::Received).unwrap();
     let changed = address(
         if direction == Direction::Inbound {
             FIXED

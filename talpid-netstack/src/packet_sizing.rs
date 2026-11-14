@@ -1,7 +1,8 @@
 //! Checked emission and sender-side PMTU feedback, using application credit.
 use crate::{
     address_translation::{
-        Header, TranslationError, checksum, is_icmp_error, set_transport_checksum, word,
+        Header, ParseContext, TranslationError, checksum, is_icmp_error, set_transport_checksum,
+        word,
     },
     fragment_state::{Fragmentation, copied_options},
 };
@@ -44,7 +45,7 @@ pub(crate) fn emit(
     attempt: &RelayAttempt,
     buffers: &dyn RelayBufferAllocator,
 ) -> Result<Emission, TranslationError> {
-    let header = Header::parse(bytes, false)?;
+    let header = Header::parse(bytes, ParseContext::Received)?;
     let mtu = usize::from(mtu);
     let too_big = bytes.len() > mtu;
     if too_big
@@ -274,8 +275,8 @@ impl FeedbackQueue {
             return_mtu,
             side,
         } = route;
-        let header = Header::parse(invoking, true)?;
-        let datagram = Header::parse(validated_datagram, false)?;
+        let header = Header::parse(invoking, ParseContext::Quotation)?;
+        let datagram = Header::parse(validated_datagram, ParseContext::Received)?;
         if header.ipv4 != datagram.ipv4
             || header.source != datagram.source
             || header.destination != datagram.destination
@@ -340,7 +341,7 @@ impl FeedbackQueue {
             _ => return Err(TranslationError::Family),
         }
         output[ip + 8..].copy_from_slice(&invoking[..quote]);
-        let outer = Header::parse(&output, false)?;
+        let outer = Header::parse(&output, ParseContext::Received)?;
         set_transport_checksum(&mut output, &outer);
         let packet = attempt.packet(RelayBuffer::from_reservation(output, charge)?)?;
         self.slots.fetch_add(1, Ordering::AcqRel);

@@ -1,8 +1,9 @@
 //! One-to-one address translation owned by one tunnel target attempt.
 //!
-//! Input is one plain IP wire packet, with complete checksums, not a TUN PI,
-//! virtio/GSO object or partial checksum seed. Platform capture admission must
-//! establish that representation before using this boundary. Local bypasses it.
+//! Input is one plain IP wire packet (possibly a fragment), with wire checksums,
+//! not a TUN PI, virtio/GSO object or partial checksum seed. Platform capture
+//! admission must establish that representation before this boundary. Local
+//! bypasses it.
 //! ESP is opaque passthrough (tunnel-mode IPsec works; transport mode without
 //! NAT-T is not supported). NAT-T UDP 4500 uses the ordinary UDP path.
 use std::{net::IpAddr, sync::Arc};
@@ -45,6 +46,7 @@ pub enum TranslationError {
     FeedbackFull,
     RateLimited,
     Suppressed,
+    ShortHeader,
 }
 
 impl From<RelayFlowError> for TranslationError {
@@ -61,7 +63,7 @@ impl From<RelayFlowError> for TranslationError {
 #[derive(Clone, Debug, Default)]
 pub struct TranslationSummary {
     pub translated: u64,
-    refusals: [u64; 14],
+    refusals: [u64; 15],
 }
 
 impl TranslationSummary {
@@ -156,7 +158,7 @@ impl AddressTranslator {
         if !self.attempt.current() {
             return Err(TranslationError::Stale);
         }
-        let header = Header::parse(bytes, false)?;
+        let header = Header::parse(bytes, ParseContext::Received)?;
         let (old, new) = self.endpoints(&header, direction)?;
         validate_transport(bytes, &header)?;
         // Quotations are validated before any output allocation too.
@@ -175,21 +177,23 @@ impl AddressTranslator {
     ) -> Result<RelayBuffer, TranslationError> {
         let mut output = RelayBuffer::copy_from(bytes, self.buffers.as_ref())?;
         rewrite_endpoint(&mut output, &header, direction == Direction::Outbound, new)?;
-        if let Some(quote) = quote {
-            crate::icmp_quotation::rewrite(&mut output, &quote, old, new)?;
-            // Quotation mutations change the ICMP body, not just its pseudoheader.
-            set_transport_checksum(&mut output, &header);
-        } else if let Some(offset) = checksum_field(&header, bytes)? {
-            let value = word(bytes, offset);
+        let quote_delta = quote
+            .map(|quote| crate::icmp_quotation::rewrite(&mut output, &quote, old, new))
+            .transpose()?;
+        if let Some(offset) = checksum_field(&header, bytes)? {
+            let mut value = word(bytes, offset);
+            if let Some(delta) = quote_delta {
+                value = delta.apply(value);
+            }
             if !(header.protocol == 17 && header.ipv4 && value == 0)
                 && !(header.protocol == 1 && header.ipv4)
             {
-                let mut value = adjusted(value, &address_bytes(old), &address_bytes(new));
+                value = adjusted(value, &address_bytes(old), &address_bytes(new));
                 if header.protocol == 17 && value == 0 {
                     value = u16::MAX;
                 }
-                output[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
             }
+            output[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
         }
         if !self.attempt.current() {
             return Err(TranslationError::Stale);
@@ -246,25 +250,30 @@ pub(crate) struct FragmentHeader {
     pub id: u32,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ParseContext {
+    /// Exact present packet, including an independently received fragment.
+    Received,
+    /// A legal prefix of an invoking packet inside a complete ICMP message.
+    Quotation,
+    /// The legacy ledger owns layout validation and needs the Fragment boundary.
+    FragmentLayout,
+}
+
 impl Header {
-    /// Quotes may end before the original datagram; never pad absent bytes.
-    pub(crate) fn parse(bytes: &[u8], quoted: bool) -> Result<Self, TranslationError> {
-        Self::parse_inner(bytes, quoted, false)
+    /// Atomic IPv6 has a Fragment header, but its transport is complete.
+    pub(crate) fn partial(&self) -> bool {
+        self.non_initial || (self.fragmented && self.fragment.is_none_or(|fragment| fragment.more))
     }
 
     pub(crate) fn parse_fragment(bytes: &[u8]) -> Result<Self, TranslationError> {
-        let header = Self::parse_inner(bytes, true, true)?;
-        if header.declared != bytes.len() {
-            return Err(TranslationError::Malformed);
-        }
-        Ok(header)
+        Self::parse(bytes, ParseContext::FragmentLayout)
     }
 
-    fn parse_inner(
-        bytes: &[u8],
-        quoted: bool,
-        stop_fragment: bool,
-    ) -> Result<Self, TranslationError> {
+    /// Quotes may end before the original datagram; never pad absent bytes.
+    pub(crate) fn parse(bytes: &[u8], context: ParseContext) -> Result<Self, TranslationError> {
+        let quoted = context == ParseContext::Quotation;
+        let stop_fragment = context == ParseContext::FragmentLayout;
         let malformed = TranslationError::Malformed;
         if bytes.len() > MAX_RELAY_PACKET_SIZE {
             return Err(malformed);
@@ -315,14 +324,33 @@ impl Header {
         if (!quoted && header.declared != bytes.len()) || header.declared < header.transport {
             return Err(malformed);
         }
+        if header.ipv4 && context == ParseContext::Received && header.fragmented {
+            let flags = word(bytes, 6);
+            validate_fragment_layout(
+                header.transport,
+                usize::from(flags & 0x1fff) * 8,
+                flags & 0x2000 != 0,
+                header.declared - header.transport,
+            )?;
+            if flags & 0x4000 != 0 {
+                return Err(malformed);
+            }
+        }
         if !header.ipv4 {
             let end = bytes.len().min(header.declared);
             let mut extensions = 0;
             let mut next_field = 6;
             while matches!(header.protocol, 0 | 43 | 44 | 60) {
                 extensions += 1;
-                if extensions > 8 || header.transport + 8 > header.declared {
+                if extensions > 8 {
                     return Err(malformed);
+                }
+                if header.transport + 8 > header.declared {
+                    return Err(if header.partial() && !quoted && !stop_fragment {
+                        TranslationError::ShortHeader
+                    } else {
+                        malformed
+                    });
                 }
                 let offset = header.transport;
                 let protocol = header.protocol;
@@ -338,8 +366,15 @@ impl Header {
                 } else {
                     (usize::from(bytes[offset + 1]) + 1) * 8
                 };
-                if offset + length > header.declared || (protocol == 0 && offset != 40) {
+                if protocol == 0 && offset != 40 {
                     return Err(malformed);
+                }
+                if offset + length > header.declared {
+                    return Err(if header.partial() && !quoted && !stop_fragment {
+                        TranslationError::ShortHeader
+                    } else {
+                        malformed
+                    });
                 }
                 let present = length.min(end - offset);
                 match protocol {
@@ -371,6 +406,15 @@ impl Header {
                                     bytes[offset + 4..offset + 8].try_into().unwrap(),
                                 ),
                             });
+                            if context == ParseContext::Received {
+                                let fragment = header.fragment.unwrap();
+                                validate_fragment_layout(
+                                    offset - 40,
+                                    fragment.offset,
+                                    fragment.more,
+                                    header.declared - offset - 8,
+                                )?;
+                            }
                         }
                     }
                     _ => (),
@@ -390,11 +434,20 @@ impl Header {
                 }
             }
         }
-        if header.fragmented && !quoted {
-            return Err(TranslationError::Fragment);
-        }
         Ok(header)
     }
+}
+
+fn validate_fragment_layout(
+    prefix: usize,
+    offset: usize,
+    more: bool,
+    length: usize,
+) -> Result<(), TranslationError> {
+    if length == 0 || (more && !length.is_multiple_of(8)) || prefix + offset + length > 65_535 {
+        return Err(TranslationError::Malformed);
+    }
+    Ok(())
 }
 
 fn validate_options(
@@ -539,7 +592,8 @@ pub(crate) fn rewrite_endpoint(
 }
 
 pub(crate) fn is_icmp_error(bytes: &[u8], header: &Header) -> bool {
-    header.transport_known
+    !header.non_initial
+        && header.transport_known
         && bytes.get(header.transport).is_some_and(|kind| {
             (header.ipv4 && header.protocol == 1 && matches!(kind, 3 | 11 | 12))
                 || (!header.ipv4 && header.protocol == 58 && matches!(kind, 1..=4))
@@ -550,7 +604,7 @@ pub(crate) fn checksum_field(
     header: &Header,
     bytes: &[u8],
 ) -> Result<Option<usize>, TranslationError> {
-    if !header.transport_known {
+    if header.non_initial || !header.transport_known {
         return Ok(None);
     }
     let offset = match header.protocol {
@@ -565,9 +619,6 @@ pub(crate) fn checksum_field(
         50 => return Ok(None),
         _ => return Err(TranslationError::UnsupportedTranslation),
     };
-    if header.non_initial {
-        return Ok(None);
-    }
     Ok(
         (header.transport + offset + 2 <= bytes.len().min(header.declared))
             .then_some(header.transport + offset),
@@ -603,20 +654,37 @@ pub(crate) fn set_transport_checksum(bytes: &mut [u8], header: &Header) {
 }
 
 pub(crate) fn validate_transport(bytes: &[u8], header: &Header) -> Result<(), TranslationError> {
+    // A tail has no upper-layer boundary or semantics to dispatch on.
+    if header.non_initial {
+        return Ok(());
+    }
     let segment = &bytes[header.transport..];
     let malformed = TranslationError::Malformed;
+    let short = if header.partial() {
+        TranslationError::ShortHeader
+    } else {
+        malformed
+    };
     match header.protocol {
         6 => {
             if segment.len() < 20 {
-                return Err(malformed);
+                return Err(short);
             }
             let length = usize::from(segment[12] >> 4) * 4;
-            if length < 20 || length > segment.len() {
+            if length < 20 {
                 return Err(malformed);
+            }
+            if length > segment.len() {
+                return Err(short);
             }
         }
         17 => {
-            if segment.len() < 8 || usize::from(word(segment, 4)) != segment.len() {
+            if segment.len() < 8 {
+                return Err(short);
+            }
+            if word(segment, 4) < 8
+                || (!header.partial() && usize::from(word(segment, 4)) != segment.len())
+            {
                 return Err(malformed);
             }
             if word(segment, 6) == 0 {
@@ -629,7 +697,7 @@ pub(crate) fn validate_transport(bytes: &[u8], header: &Header) -> Result<(), Tr
         }
         1 if header.ipv4 => {
             if segment.len() < 8 {
-                return Err(malformed);
+                return Err(short);
             }
             let minimum = match segment[0] {
                 0 | 8 | 15 | 16 => 8,
@@ -639,7 +707,7 @@ pub(crate) fn validate_transport(bytes: &[u8], header: &Header) -> Result<(), Tr
                 _ => return Err(TranslationError::UnsupportedTranslation),
             };
             if segment.len() < minimum {
-                return Err(malformed);
+                return Err(short);
             }
             if !is_icmp_error(bytes, header) && segment[1] != 0 {
                 return Err(malformed);
@@ -647,7 +715,7 @@ pub(crate) fn validate_transport(bytes: &[u8], header: &Header) -> Result<(), Tr
         }
         58 if !header.ipv4 => {
             if segment.len() < 8 {
-                return Err(malformed);
+                return Err(short);
             }
             if !matches!(segment[0], 1..=4 | 128 | 129) {
                 return Err(TranslationError::UnsupportedTranslation);
@@ -665,17 +733,19 @@ pub(crate) fn validate_transport(bytes: &[u8], header: &Header) -> Result<(), Tr
             return if segment.len() >= minimum {
                 Ok(())
             } else {
-                Err(malformed)
+                Err(short)
             };
         }
         _ => return Err(TranslationError::UnsupportedTranslation),
     }
-    if transport_checksum(bytes, header) != 0 {
+    if !header.partial() && transport_checksum(bytes, header) != 0 {
         return Err(TranslationError::Checksum);
     }
     Ok(())
 }
 
+#[cfg(test)]
+mod fragment_tests;
 #[cfg(test)]
 mod path_tests;
 #[cfg(test)]

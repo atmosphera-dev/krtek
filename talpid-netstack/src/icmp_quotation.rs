@@ -2,8 +2,8 @@
 //! Only complete fields present on the wire are updated. Nested errors are
 //! refused rather than recursing through attacker-controlled quotations.
 use crate::address_translation::{
-    Direction, Header, TranslationError, address_bytes, adjusted, checksum_field, is_icmp_error,
-    rewrite_endpoint, word,
+    Direction, Header, ParseContext, TranslationError, address_bytes, adjusted, checksum_field,
+    is_icmp_error, rewrite_endpoint, word,
 };
 use std::net::IpAddr;
 
@@ -40,7 +40,16 @@ pub(crate) fn inspect(
     }
     let start = outer.transport + 8;
     let quoted = &bytes[start..];
-    let header = Header::parse(quoted, true)?;
+    let header = Header::parse(quoted, ParseContext::Quotation).map_err(|error| {
+        if outer.partial()
+            && error == TranslationError::Malformed
+            && quoted.len() < if outer.ipv4 { 20 } else { 40 }
+        {
+            TranslationError::ShortHeader
+        } else {
+            error
+        }
+    })?;
     if header.ipv4 != outer.ipv4 {
         return Err(TranslationError::Family);
     }
@@ -70,15 +79,15 @@ pub(crate) fn inspect(
             132 => 12,
             _ => 0,
         };
-        if !header.fragmented && header.declared - header.transport < minimum {
+        if !header.partial() && header.declared - header.transport < minimum {
             return Err(TranslationError::Malformed);
         }
         match header.protocol {
             6 => {
-                if (!header.fragmented && header.declared < header.transport + 20)
+                if (!header.partial() && header.declared < header.transport + 20)
                     || (transport.len() > 12
                         && (transport[12] >> 4 < 5
-                            || (!header.fragmented
+                            || (!header.partial()
                                 && usize::from(transport[12] >> 4) * 4
                                     > header.declared - header.transport)))
                 {
@@ -86,7 +95,7 @@ pub(crate) fn inspect(
                 }
             }
             17 if transport.len() >= 6
-                && !header.fragmented
+                && !header.partial()
                 && usize::from(word(transport, 4)) != header.declared - header.transport =>
             {
                 return Err(TranslationError::Malformed);
@@ -114,6 +123,17 @@ pub(crate) fn inspect(
         }
     }
     let checksum = checksum_field(&header, quoted)?;
+    // A complete outer message may legally quote a truncated original. A first
+    // outer fragment cannot omit a field that will arrive later and need a
+    // rewrite: the tail is deliberately opaque and there is no retained state.
+    if outer.partial()
+        && (!header.transport_known
+            || (!header.non_initial
+                && matches!(header.protocol, 6 | 17 | 1 | 58)
+                && checksum.is_none()))
+    {
+        return Err(TranslationError::ShortHeader);
+    }
     Ok(Some(Quotation {
         start,
         header,
@@ -122,13 +142,39 @@ pub(crate) fn inspect(
     }))
 }
 
+/// At most eight endpoint words, one IPv4 header word and one L4 word change.
+/// The delta is bounded stack data, not a copy/recalculation of the ICMP body.
+pub(crate) struct ChangedWords {
+    old: [u8; 20],
+    new: [u8; 20],
+    length: usize,
+}
+
+impl ChangedWords {
+    fn record(&mut self, old: &[u8], new: &[u8]) {
+        let end = self.length + old.len();
+        self.old[self.length..end].copy_from_slice(old);
+        self.new[self.length..end].copy_from_slice(new);
+        self.length = end;
+    }
+
+    pub(crate) fn apply(&self, value: u16) -> u16 {
+        adjusted(value, &self.old[..self.length], &self.new[..self.length])
+    }
+}
+
 pub(crate) fn rewrite(
     bytes: &mut [u8],
     quote: &Quotation,
     old: IpAddr,
     new: IpAddr,
-) -> Result<(), TranslationError> {
+) -> Result<ChangedWords, TranslationError> {
     let quoted = &mut bytes[quote.start..];
+    let mut delta = ChangedWords {
+        old: [0; 20],
+        new: [0; 20],
+        length: 0,
+    };
     if let Some(offset) = quote.checksum {
         let previous = word(quoted, offset);
         if !(quote.header.ipv4
@@ -139,7 +185,14 @@ pub(crate) fn rewrite(
                 value = u16::MAX;
             }
             quoted[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+            delta.record(&previous.to_be_bytes(), &value.to_be_bytes());
         }
     }
-    rewrite_endpoint(quoted, &quote.header, quote.source, new)
+    let old_ip_checksum = quote.header.ipv4.then(|| word(quoted, 10));
+    rewrite_endpoint(quoted, &quote.header, quote.source, new)?;
+    delta.record(&address_bytes(old), &address_bytes(new));
+    if let Some(previous) = old_ip_checksum {
+        delta.record(&previous.to_be_bytes(), &word(quoted, 10).to_be_bytes());
+    }
+    Ok(delta)
 }

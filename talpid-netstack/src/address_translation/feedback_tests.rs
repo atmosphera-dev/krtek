@@ -67,7 +67,7 @@ fn feedback(path: &mut TargetPacketPath, original: &[u8], direction: Direction, 
     );
     assert_eq!(wire_checksum(&output, 40, 58), 0);
     assert_eq!(&output[48..], &original[..output.len() - 48]);
-    let outer = Header::parse(&output, false).unwrap();
+    let outer = Header::parse(&output, ParseContext::Received).unwrap();
     assert_eq!(
         outer.source,
         address(

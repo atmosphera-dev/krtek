@@ -147,7 +147,7 @@ impl TargetPacketPath {
         match emitted {
             Ok(packets) => Ok(TranslationOutcome::Packets(packets)),
             Err(TranslationError::PacketTooBig) => {
-                let header = Header::parse(&datagram.bytes, false)?;
+                let header = Header::parse(&datagram.bytes, ParseContext::Received)?;
                 let sources = if direction == Direction::Outbound {
                     self.mapper.config.fixed
                 } else {
