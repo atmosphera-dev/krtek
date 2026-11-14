@@ -15,10 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 use talpid_netstack::{
-    address_translation::{
-        Direction, TargetConfig, TargetPacketPath, TranslationError, TranslationOutcome,
-    },
-    packet_sizing::{Emission, Feedback, FeedbackSide},
+    address_translation::{Direction, TargetConfig, TargetPacketPath, TranslationError},
     smoltcp_network::{
         SmoltcpIcmpSocket, SmoltcpIpRecv, SmoltcpIpSend, SmoltcpNetworkConfig, SmoltcpNetworkGuard,
         smoltcp_network_retained,
@@ -183,7 +180,6 @@ impl PendingManaged {
             application: self.broker.application_buffers(),
             ordinary_send,
             path: Mutex::new(path),
-            feedback: tokio::sync::Notify::new(),
             _storage: storage,
             installed: AtomicBool::new(false),
         });
@@ -197,7 +193,6 @@ impl PendingManaged {
                 ordinary_receive,
                 owner: owner.clone(),
                 turn: 0,
-                emission: None,
             },
             owner,
         })
@@ -229,7 +224,6 @@ pub(crate) struct ManagedControl {
     application: Arc<dyn RelayBufferAllocator>,
     ordinary_send: TransportSend,
     path: Mutex<TargetPacketPath>,
-    feedback: tokio::sync::Notify,
     _storage: Arc<dyn RelayBufferReservation>,
     installed: AtomicBool,
 }
@@ -288,10 +282,6 @@ impl ManagedControl {
     }
     pub(super) async fn stop(&self) {
         self.revoke();
-        self.path
-            .lock()
-            .expect("target path")
-            .maintain(Instant::now());
         self.guard.lock().await.stop().await;
         // Every production caller has already joined create_devices failure or
         // devices.stop(). The control guard is the final transport task owner.
@@ -379,7 +369,6 @@ pub(super) struct ManagedReceive {
     ordinary_receive: TransportReceive,
     owner: Arc<ManagedControl>,
     turn: u8,
-    emission: Option<Emission>,
 }
 
 impl ManagedControl {
@@ -387,86 +376,34 @@ impl ManagedControl {
         &self,
         bytes: &[u8],
         direction: Direction,
-    ) -> Result<TranslationOutcome, TranslationError> {
-        let result = self.path.lock().expect("target path").process(
-            bytes,
-            direction,
-            self.control.capability().identity().mtu,
-            Instant::now(),
-        );
-        self.feedback.notify_one();
-        result
-    }
-    async fn target_feedback(&self) -> Feedback {
-        loop {
-            let wake = self.feedback.notified();
-            let deadline = {
-                let mut path = self.path.lock().expect("target path");
-                path.maintain(Instant::now());
-                if let Some(feedback) = path.take_feedback_for(FeedbackSide::Target) {
-                    return feedback;
-                }
-                path.deadline()
-            };
-            match deadline {
-                Some(deadline) => {
-                    tokio::select! { _ = wake => (), _ = tokio::time::sleep_until(deadline.into()) => () }
-                }
-                None => wake.await,
-            }
-        }
+    ) -> Result<talpid_types::relay_flow::RelayPacket, TranslationError> {
+        self.path
+            .lock()
+            .expect("target path")
+            .process(bytes, direction)
     }
     fn refused(&self, reason: TranslationError) {
         self.path.lock().expect("target path").refused(reason);
     }
-    fn handoff_refused(&self, error: RelayFlowError, feedback: bool) {
+    fn handoff_refused(&self, error: RelayFlowError) {
         self.refused(match error {
-            RelayFlowError::Full if feedback => TranslationError::FeedbackFull,
             RelayFlowError::Full => TranslationError::Full,
             RelayFlowError::Stale | RelayFlowError::Closed => TranslationError::Stale,
             RelayFlowError::Invalid => TranslationError::Malformed,
         });
-    }
-    fn flush_app_feedback(&self) {
-        loop {
-            let feedback = self
-                .path
-                .lock()
-                .expect("target path")
-                .take_feedback_for(FeedbackSide::App);
-            let Some(feedback) = feedback else {
-                return;
-            };
-            if let Err(error) = self.ordinary_send.try_send_feedback(feedback) {
-                self.refused(if error == AttachmentError::Full {
-                    TranslationError::FeedbackFull
-                } else {
-                    TranslationError::Stale
-                });
-            }
-        }
     }
 }
 
 impl ManagedReceive {
     async fn ordinary_parts(
         receive: &mut TransportReceive,
-        emission: &mut Option<Emission>,
         owner: &ManagedControl,
     ) -> io::Result<talpid_types::relay_flow::RelayPacket> {
         loop {
-            if let Some(packet) = emission.as_mut().and_then(Emission::pop) {
-                return Ok(packet);
-            }
-            *emission = None;
             let packet = receive.recv().await.map_err(|_| unavailable())?;
             let view = packet.view();
-            match owner.translate(view.bytes(), Direction::Outbound) {
-                Ok(TranslationOutcome::Packets(packets)) => *emission = Some(packets),
-                Ok(TranslationOutcome::FeedbackQueued(FeedbackSide::App)) => {
-                    owner.flush_app_feedback();
-                }
-                _ => (),
+            if let Ok(packet) = owner.translate(view.bytes(), Direction::Outbound) {
+                return Ok(packet);
             }
             tokio::task::yield_now().await;
         }
@@ -476,7 +413,6 @@ impl ManagedReceive {
 enum Selected {
     Private(Option<Packet<Ip>>),
     Application(talpid_types::relay_flow::RelayPacket),
-    Feedback(Feedback),
 }
 impl IpRecv for ManagedReceive {
     async fn recv<'a>(
@@ -490,27 +426,18 @@ impl IpRecv for ManagedReceive {
             // Rotate priority: neither an application flood nor private probes
             // can starve the other. Each handoff yields at most one packet.
             let turn = self.turn;
-            self.turn = (turn + 1) % 3;
+            self.turn = (turn + 1) % 2;
             let owner = self.owner.clone();
             let packet = if turn == 0 {
                 tokio::select! { biased;
                     _ = owner.cancelled() => return Err(unavailable()),
                     packet = self.receive.recv(pool) => Selected::Private(packet?.next()),
-                    feedback = owner.target_feedback() => Selected::Feedback(feedback),
-                    packet = Self::ordinary_parts(&mut self.ordinary_receive, &mut self.emission, &owner) => Selected::Application(packet?),
-                }
-            } else if turn == 1 {
-                tokio::select! { biased;
-                    _ = owner.cancelled() => return Err(unavailable()),
-                    packet = Self::ordinary_parts(&mut self.ordinary_receive, &mut self.emission, &owner) => Selected::Application(packet?),
-                    packet = self.receive.recv(pool) => Selected::Private(packet?.next()),
-                    feedback = owner.target_feedback() => Selected::Feedback(feedback),
+                    packet = Self::ordinary_parts(&mut self.ordinary_receive, &owner) => Selected::Application(packet?),
                 }
             } else {
                 tokio::select! { biased;
                     _ = owner.cancelled() => return Err(unavailable()),
-                    feedback = owner.target_feedback() => Selected::Feedback(feedback),
-                    packet = Self::ordinary_parts(&mut self.ordinary_receive, &mut self.emission, &owner) => Selected::Application(packet?),
+                    packet = Self::ordinary_parts(&mut self.ordinary_receive, &owner) => Selected::Application(packet?),
                     packet = self.receive.recv(pool) => Selected::Private(packet?.next()),
                 }
             };
@@ -530,19 +457,10 @@ impl IpRecv for ManagedReceive {
                 ) {
                     Ok(packet) => packet,
                     Err(error) => {
-                        self.owner.handoff_refused(error, false);
+                        self.owner.handoff_refused(error);
                         continue;
                     }
                 },
-                Selected::Feedback(feedback) => {
-                    match talpid_netstack::raw_packet::handoff_feedback(feedback, |packet| packet) {
-                        Ok(packet) => packet,
-                        Err(error) => {
-                            self.owner.handoff_refused(error, true);
-                            continue;
-                        }
-                    }
-                }
             };
             if !self.owner.live() {
                 return Err(unavailable());
@@ -576,23 +494,16 @@ impl IpSend for ManagedSend {
             }
             Reply::Discard => Ok(()),
             Reply::Application => {
-                if let Ok(TranslationOutcome::Packets(mut packets)) =
-                    self.owner.translate(&bytes, Direction::Inbound)
-                {
-                    while let Some(packet) = packets.pop() {
-                        match self.owner.ordinary_send.try_send_packet(packet) {
-                            Ok(()) => (),
-                            Err(AttachmentError::Full) => {
-                                self.owner.refused(TranslationError::Full)
-                            }
-                            Err(AttachmentError::OrdinaryUnready) => {
-                                self.owner.refused(TranslationError::Stale)
-                            }
-                            Err(_) => return Err(unavailable()),
+                if let Ok(packet) = self.owner.translate(&bytes, Direction::Inbound) {
+                    match self.owner.ordinary_send.try_send_packet(packet) {
+                        Ok(()) => (),
+                        Err(AttachmentError::Full) => self.owner.refused(TranslationError::Full),
+                        Err(AttachmentError::OrdinaryUnready) => {
+                            self.owner.refused(TranslationError::Stale)
                         }
+                        Err(_) => return Err(unavailable()),
                     }
                 }
-                self.owner.flush_app_feedback();
                 Ok(())
             }
         }

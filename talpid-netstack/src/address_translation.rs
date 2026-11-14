@@ -7,11 +7,9 @@
 //! ESP is opaque passthrough (tunnel-mode IPsec works; transport mode without
 //! NAT-T is not supported). NAT-T UDP 4500 uses the ordinary UDP path.
 use std::{net::IpAddr, sync::Arc};
-#[cfg(test)]
-use talpid_types::relay_flow::RelayPacket;
 use talpid_types::relay_flow::{
     BUFFER_OVERHEAD, MAX_RELAY_PACKET_SIZE, RelayAttempt, RelayBuffer, RelayBufferAllocator,
-    RelayBufferReservation, RelayFlowError, RelaySources,
+    RelayBufferReservation, RelayFlowError, RelayPacket, RelaySources,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,10 +38,6 @@ pub enum TranslationError {
     BackendRefused,
     Full,
     Stale,
-    PacketTooBig,
-    FeedbackFull,
-    RateLimited,
-    Suppressed,
     ShortHeader,
 }
 
@@ -61,7 +55,7 @@ impl From<RelayFlowError> for TranslationError {
 #[derive(Clone, Debug, Default)]
 pub struct TranslationSummary {
     pub translated: u64,
-    refusals: [u64; 13],
+    refusals: [u64; 9],
 }
 
 impl TranslationSummary {
@@ -121,7 +115,6 @@ impl AddressTranslator {
         self.summary.refuse(TranslationError::BackendRefused);
     }
 
-    #[cfg(test)]
     pub fn translate(
         &mut self,
         bytes: &[u8],
@@ -627,13 +620,6 @@ pub(crate) fn transport_checksum(bytes: &[u8], header: &Header) -> u16 {
     }
 }
 
-pub(crate) fn set_transport_checksum(bytes: &mut [u8], header: &Header) {
-    let offset = header.transport + 2;
-    bytes[offset..offset + 2].fill(0);
-    let value = transport_checksum(bytes, header);
-    bytes[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
-}
-
 pub(crate) fn validate_transport(bytes: &[u8], header: &Header) -> Result<(), TranslationError> {
     // A tail has no upper-layer boundary or semantics to dispatch on.
     if header.non_initial {
@@ -735,4 +721,4 @@ mod quotation_tests;
 mod tests;
 
 mod path;
-pub use path::{TargetPacketPath, TranslationOutcome};
+pub use path::TargetPacketPath;

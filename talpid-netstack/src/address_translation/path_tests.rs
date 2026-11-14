@@ -1,16 +1,7 @@
 use super::{tests::*, *};
-use crate::{
-    buffer_budget::BufferBudget,
-    packet_sizing::{Emission, FeedbackSide},
-};
-use std::{
-    io,
-    time::{Duration, Instant},
-};
+use crate::buffer_budget::BufferBudget;
+use std::io;
 use talpid_types::relay_flow::{RelayAttemptOwner, RelayCaptureOwner, RelayWriteOutcome};
-
-#[path = "feedback_tests.rs"]
-mod feedback_tests;
 
 #[path = "transit_tests.rs"]
 mod transit_tests;
@@ -32,24 +23,15 @@ fn path() -> (
     )
 }
 
-fn packets(outcome: TranslationOutcome) -> Emission {
-    match outcome {
-        TranslationOutcome::Packets(packets) => packets,
-        _ => panic!("expected emission"),
-    }
-}
-
-fn receive(mut emission: Emission) -> Vec<Vec<u8>> {
+fn receive(mut packet: RelayPacket) -> Vec<Vec<u8>> {
     let mut output = Vec::new();
-    while let Some(mut packet) = emission.pop() {
-        assert!(matches!(
-            packet.write(|bytes| {
-                output.push(bytes.to_vec());
-                Ok(bytes.len())
-            }),
-            RelayWriteOutcome::Written
-        ));
-    }
+    assert!(matches!(
+        packet.write(|bytes| {
+            output.push(bytes.to_vec());
+            Ok(bytes.len())
+        }),
+        RelayWriteOutcome::Written
+    ));
     output
 }
 
@@ -155,7 +137,6 @@ fn rejoin(fragments: &[Vec<u8>], v6_boundary: usize) -> Vec<u8> {
 #[test]
 fn out_of_order_split_transport_fragments_reach_independent_receiver_in_both_directions() {
     let (mut path, _capture, _attempt, _) = path();
-    let now = Instant::now();
     for v4 in [true, false] {
         for direction in [Direction::Outbound, Direction::Inbound] {
             let (source, destination) = if direction == Direction::Outbound {
@@ -169,8 +150,8 @@ fn out_of_order_split_transport_fragments_reach_independent_receiver_in_both_dir
             let pieces = source_fragments(&original, 24, 40);
             let mut output = Vec::new();
             for piece in pieces.iter().rev() {
-                let result = path.process(piece, direction, 1280, now).unwrap();
-                let received = receive(packets(result));
+                let result = path.process(piece, direction).unwrap();
+                let received = receive(result);
                 assert_eq!(received.len(), 1);
                 output.extend(received);
             }
@@ -190,79 +171,8 @@ fn out_of_order_split_transport_fragments_reach_independent_receiver_in_both_dir
 }
 
 #[test]
-fn output_mtu_is_directional_and_ptb_quotes_the_sender_view() {
+fn ipv4_and_ipv6_source_fragment_boundaries_survive_delivery() {
     let (mut path, _capture, _attempt, _) = path();
-    let now = Instant::now();
-    for v4 in [true, false] {
-        for direction in [Direction::Outbound, Direction::Inbound] {
-            let (source, destination) = if direction == Direction::Outbound {
-                (address(FIXED, v4), remote(v4))
-            } else {
-                (remote(v4), address(ASSIGNED, v4))
-            };
-            let original = large(v4, source, destination, true);
-            let side = if direction == Direction::Outbound {
-                FeedbackSide::App
-            } else {
-                FeedbackSide::Target
-            };
-            assert!(
-                matches!(path.process(&original, direction, 1280, now), Ok(TranslationOutcome::FeedbackQueued(actual)) if actual == side)
-            );
-            let mut feedback = path.take_feedback().unwrap();
-            assert_eq!(feedback.side(), side);
-            let mut wire = Vec::new();
-            assert!(matches!(
-                feedback.write(|bytes| {
-                    wire.extend_from_slice(bytes);
-                    Ok(bytes.len())
-                }),
-                RelayWriteOutcome::Written
-            ));
-            let ip = if v4 { 20 } else { 40 };
-            assert!(wire.len() <= if v4 { 576 } else { 1280 });
-            assert_eq!(wire_checksum(&wire, ip, if v4 { 1 } else { 58 }), 0);
-            assert_eq!(&wire[ip + 8..], &original[..wire.len() - ip - 8]);
-            let mtu = if direction == Direction::Outbound {
-                1380
-            } else {
-                1280
-            };
-            if v4 {
-                assert_eq!(word(&wire, 26), mtu);
-                assert_eq!(oracle(&wire[..20]), 0);
-            } else {
-                assert_eq!(
-                    u32::from_be_bytes(wire[44..48].try_into().unwrap()),
-                    u32::from(mtu)
-                );
-            }
-            let header = Header::parse(&wire, ParseContext::Received).unwrap();
-            assert_eq!(header.destination, source);
-            assert_eq!(
-                header.source,
-                if v4 && side == FeedbackSide::App {
-                    assert_ne!(header.source, source, "feedback source is local to the app");
-                    destination
-                } else {
-                    address(
-                        if side == FeedbackSide::App {
-                            FIXED
-                        } else {
-                            ASSIGNED
-                        },
-                        v4,
-                    )
-                }
-            );
-        }
-    }
-}
-
-#[test]
-fn ipv4_fragments_and_ipv6_source_fragment_boundaries_survive_mtu_sizing() {
-    let (mut path, _capture, _attempt, _) = path();
-    let now = Instant::now();
     for v4 in [true, false] {
         let mut original = large(v4, address(FIXED, v4), remote(v4), false);
         let boundary = if v4 { 20 } else { 48 };
@@ -272,23 +182,20 @@ fn ipv4_fragments_and_ipv6_source_fragment_boundaries_survive_mtu_sizing() {
             let length = (original.len() - 40) as u16;
             original[4..6].copy_from_slice(&length.to_be_bytes());
         }
-        let output = if v4 {
-            receive(packets(
-                path.process(&original, Direction::Outbound, 1280, now)
-                    .unwrap(),
-            ))
-        } else {
-            let inputs = source_fragments(&original, 1024, boundary);
-            let mut emitted = Vec::new();
-            for piece in inputs.iter().rev() {
-                match path.process(piece, Direction::Outbound, 1280, now).unwrap() {
-                    TranslationOutcome::Packets(packets) => emitted.extend(receive(packets)),
-                    _ => panic!("source fragments must survive"),
-                }
+        let inputs = source_fragments(&original, 1600, boundary);
+        let mut output = Vec::new();
+        for piece in inputs.iter().rev() {
+            let received = receive(path.process(piece, Direction::Outbound).unwrap());
+            assert_eq!(received.len(), 1);
+            assert_eq!(received[0].len(), piece.len());
+            if v4 {
+                assert_eq!(&received[0][2..10], &piece[2..10]);
+            } else {
+                assert_eq!(&received[0][40..56], &piece[40..56]);
             }
-            emitted
-        };
-        assert!(output.len() > 1 && output.iter().all(|p| p.len() <= 1380));
+            output.extend(received);
+        }
+        assert_eq!(output.len(), inputs.len());
         let complete = rejoin(&output, boundary);
         assert_eq!(wire_checksum(&complete, boundary, 17), 0);
         assert_eq!(&complete[boundary + 8..], &original[boundary + 8..]);
@@ -305,149 +212,14 @@ fn ipv4_fragments_and_ipv6_source_fragment_boundaries_survive_mtu_sizing() {
 }
 
 #[test]
-fn blocked_feedback_full_rate_limit_and_retirement_retain_charges_and_exact_authority() {
-    let (mut path, capture, attempt, budget) = path();
-    let now = Instant::now();
-    let before = budget.used();
-    let original = large(true, remote(true), address(ASSIGNED, true), true);
-    let mut held = Vec::new();
-    for index in 0..16 {
-        let time = now + Duration::from_secs(index / 8);
-        assert!(matches!(
-            path.process(&original, Direction::Inbound, 1280, time),
-            Ok(TranslationOutcome::FeedbackQueued(FeedbackSide::Target))
-        ));
-        held.push(path.take_feedback().unwrap());
-        if index == 7 {
-            assert!(matches!(
-                path.process(&original, Direction::Inbound, 1280, time),
-                Err(TranslationError::RateLimited)
-            ));
-        }
-    }
-    assert!(matches!(
-        path.process(
-            &original,
-            Direction::Inbound,
-            1280,
-            now + Duration::from_secs(2)
-        ),
-        Err(TranslationError::FeedbackFull)
-    ));
-    assert!(matches!(
-        held[0].write(|_| Err(io::ErrorKind::WouldBlock.into())),
-        RelayWriteOutcome::Retry
-    ));
-    assert_eq!(budget.used(), before);
-    attempt.retire();
-    let successor = capture.open_attempt(&budget).unwrap();
-    successor.activate().unwrap();
-    assert!(matches!(
-        held[0].write(|_| panic!("old feedback into successor")),
-        RelayWriteOutcome::Stale
-    ));
-    assert!(matches!(
-        path.process(&original, Direction::Inbound, 1280, now),
-        Err(TranslationError::Stale)
-    ));
-    drop(path);
-    drop(held);
-    drop(successor);
-    drop(attempt);
-    drop(capture);
-    assert_eq!(budget.used(), 0);
-}
-
-#[test]
-fn feedback_suppresses_errors_and_ipv4_multicast_but_keeps_ipv6_multicast_ptb_exception() {
-    let (mut path, _capture, _attempt, _) = path();
-    let now = Instant::now();
-    for v4 in [true, false] {
-        let quoted = large(v4, remote(v4), address(FIXED, v4), false);
-        let mut body = vec![if v4 { 3 } else { 2 }, 0, 0, 0, 0, 0, 5, 0];
-        body.extend_from_slice(&quoted);
-        let error = packet(
-            address(FIXED, v4),
-            remote(v4),
-            if v4 { 1 } else { 58 },
-            &body,
-        );
-        let mut error = error;
-        if v4 {
-            error[6] = 0x40;
-            fix_checksums(&mut error, 20, 1);
-        }
-        assert!(matches!(
-            path.process(&error, Direction::Outbound, 1280, now),
-            Err(TranslationError::Suppressed)
-        ));
-    }
-    let v4 = large(
-        true,
-        address(FIXED, true),
-        "239.1.1.1".parse().unwrap(),
-        true,
-    );
-    assert!(matches!(
-        path.process(&v4, Direction::Outbound, 1280, now),
-        Err(TranslationError::Suppressed)
-    ));
-    let v6 = large(
-        false,
-        address(FIXED, false),
-        "ff02::1".parse().unwrap(),
-        false,
-    );
-    assert!(matches!(
-        path.process(&v6, Direction::Outbound, 1280, now),
-        Ok(TranslationOutcome::FeedbackQueued(FeedbackSide::App))
-    ));
-}
-
-#[test]
-fn reserved_feedback_progress_survives_exhausted_application_credit() {
-    let (mut path, _capture, _attempt, budget) = path();
-    let now = Instant::now();
-    let all = budget.reserve(budget.limit() - budget.used()).unwrap();
-    let original = large(true, remote(true), address(ASSIGNED, true), true);
-    assert!(matches!(
-        path.process(&original, Direction::Inbound, 1280, now),
-        Ok(TranslationOutcome::FeedbackQueued(FeedbackSide::Target))
-    ));
-    let small = packet(address(FIXED, true), remote(true), 17, &segment(17));
-    assert!(matches!(
-        path.process(&small, Direction::Outbound, 1280, now),
-        Err(TranslationError::Full)
-    ));
-    drop(all);
-    assert_eq!(
-        receive(packets(
-            path.process(&small, Direction::Outbound, 1280, now)
-                .unwrap()
-        ))
-        .len(),
-        1
-    );
-}
-
-#[test]
 fn fragment_attempt_retirement_and_conflicting_headers_cannot_mix_with_successor() {
     let (mut path, capture, attempt, budget) = path();
-    let now = Instant::now();
     let original = large(false, address(FIXED, false), remote(false), false);
     let pieces = source_fragments(&original, 512, 40);
-    let mut queued = packets(
-        path.process(&pieces[0], Direction::Outbound, 1280, now)
-            .unwrap(),
-    )
-    .pop()
-    .unwrap();
+    let mut queued = path.process(&pieces[0], Direction::Outbound).unwrap();
     let mut conflicting = pieces[1].clone();
     conflicting[40] = 6;
-    let opaque = receive(packets(
-        path.process(&conflicting, Direction::Outbound, 1280, now)
-            .unwrap(),
-    ));
+    let opaque = receive(path.process(&conflicting, Direction::Outbound).unwrap());
     assert_eq!(&opaque[0][40..], &conflicting[40..]);
     attempt.retire();
     let successor = capture.open_attempt(&budget).unwrap();
@@ -463,23 +235,17 @@ fn fragment_attempt_retirement_and_conflicting_headers_cannot_mix_with_successor
     )
     .unwrap();
     assert!(matches!(
-        path.process(&pieces[1], Direction::Outbound, 1280, now),
+        path.process(&pieces[1], Direction::Outbound),
         Err(TranslationError::Stale)
     ));
     for piece in pieces.iter().skip(1) {
-        assert!(matches!(
-            next.process(piece, Direction::Outbound, 1280, now),
-            Ok(TranslationOutcome::Packets(_))
-        ));
+        assert!(next.process(piece, Direction::Outbound).is_ok());
     }
-    assert!(matches!(
-        next.process(&pieces[0], Direction::Outbound, 1280, now),
-        Ok(TranslationOutcome::Packets(_))
-    ));
+    assert!(next.process(&pieces[0], Direction::Outbound).is_ok());
 }
 
 #[test]
-fn ipv4_emission_keeps_first_options_and_only_copied_options_on_later_fragments() {
+fn ipv4_delivery_keeps_all_received_options() {
     let (mut path, _capture, _attempt, _) = path();
     let mut original = large(true, address(FIXED, true), remote(true), false);
     original.splice(20..20, [7, 7, 4, 0, 0, 0, 0, 1, 148, 4, 0, 0]);
@@ -487,37 +253,39 @@ fn ipv4_emission_keeps_first_options_and_only_copied_options_on_later_fragments(
     let n = original.len() as u16;
     original[2..4].copy_from_slice(&n.to_be_bytes());
     fix_checksums(&mut original, 32, 17);
-    let output = receive(packets(
-        path.process(&original, Direction::Outbound, 1280, Instant::now())
-            .unwrap(),
-    ));
-    assert!(output.len() > 1);
-    assert_eq!(&output[0][20..32], &original[20..32]);
-    for fragment in output.iter().skip(1) {
-        assert_eq!(fragment[0] & 15, 6);
-        assert_eq!(&fragment[20..24], &[148, 4, 0, 0]);
+    for inputs in [
+        vec![original.clone()],
+        source_fragments(&original, 1600, 40),
+    ] {
+        let mut output = Vec::new();
+        for input in &inputs {
+            let received = receive(path.process(input, Direction::Outbound).unwrap());
+            assert_eq!(received.len(), 1);
+            assert_eq!(received[0].len(), input.len());
+            assert_eq!(received[0][0] & 15, 8);
+            assert_eq!(&received[0][20..32], &input[20..32]);
+            output.extend(received);
+        }
+        let joined = rejoin(&output, 40);
+        assert_eq!(wire_checksum(&joined, 32, 17), 0);
+        assert_eq!(&joined[40..], &original[40..]);
     }
-    let joined = rejoin(&output, 40);
-    assert_eq!(wire_checksum(&joined, 32, 17), 0);
-    assert_eq!(&joined[40..], &original[40..]);
 }
 
 #[test]
-fn atomic_ipv6_fragment_does_not_grant_router_fragment_permission() {
+fn atomic_ipv6_fragment_is_delivered_without_normalization() {
     let (mut path, _capture, _attempt, _) = path();
-    let now = Instant::now();
     let large = large(false, address(FIXED, false), remote(false), false);
     let atomic = source_fragments(&large, 65528, 40).remove(0);
-    assert!(matches!(
-        path.process(&atomic, Direction::Outbound, 1280, now),
-        Ok(TranslationOutcome::FeedbackQueued(FeedbackSide::App))
-    ));
+    let output = receive(path.process(&atomic, Direction::Outbound).unwrap());
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].len(), atomic.len());
+    assert_eq!(output[0][6], 44);
+    assert_eq!(&output[0][40..48], &atomic[40..48]);
+    assert_eq!(wire_checksum(&output[0], 48, 17), 0);
     let small = packet(address(FIXED, false), remote(false), 6, &segment(6));
     let atomic = source_fragments(&small, 65528, 40).remove(0);
-    let output = receive(packets(
-        path.process(&atomic, Direction::Outbound, 1280, now)
-            .unwrap(),
-    ));
+    let output = receive(path.process(&atomic, Direction::Outbound).unwrap());
     assert_eq!(output.len(), 1);
     assert_eq!(output[0][6], 44);
     assert_eq!(&output[0][40..48], &atomic[40..48]);
@@ -560,10 +328,7 @@ fn other_protocols_keep_valid_checksum_domains_at_the_final_sink() {
                     (remote(v4), address(ASSIGNED, v4))
                 };
                 let original = packet(source, destination, protocol, payload);
-                let output = receive(packets(
-                    path.process(&original, direction, 1280, Instant::now())
-                        .unwrap(),
-                ));
+                let output = receive(path.process(&original, direction).unwrap());
                 let offset = if v4 { 20 } else { 40 };
                 let received = &output[0][offset..];
                 assert_eq!(received, payload);

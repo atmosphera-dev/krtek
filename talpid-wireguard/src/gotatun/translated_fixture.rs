@@ -303,7 +303,7 @@ async fn translated_singlehop_and_multihop_consumers_see_both_address_domains() 
 }
 
 #[tokio::test]
-async fn directional_pmtu_feedback_reaches_the_original_sender_through_crypto() {
+async fn real_peer_pmtu_errors_reach_the_original_sender_through_crypto() {
     for multihop in [false, true] {
         let (broker, _root, credit) = broker();
         let mut config = config();
@@ -327,47 +327,30 @@ async fn directional_pmtu_feedback_reaches_the_original_sender_through_crypto() 
             .await
             .unwrap();
         for v6 in [false, true] {
-            let mut app = packet(&config, v6, 17, &vec![0x96; 1600], false, false);
-            if !v6 {
-                app[6] = 0x40;
-                fix_wire(&mut app, 20, 17);
-            }
-            capture.try_send(&app).unwrap();
-            let feedback = capture_bytes(&capture).await;
             let offset = if v6 { 40 } else { 20 };
-            assert!(feedback.len() <= if v6 { 1280 } else { 576 });
-            assert_eq!(wire_sum(&feedback, offset, if v6 { 58 } else { 1 }), [0, 0]);
-            assert_eq!(&feedback[offset + 8..], &app[..feedback.len() - offset - 8]);
-            assert_eq!(&feedback[offset + 6..offset + 8], &config.mtu.to_be_bytes());
-            assert!(
-                tokio::time::timeout(Duration::from_millis(30), observations.recv())
-                    .await
-                    .is_err()
-            );
-            let mut inbound =
-                application_reply(&packet(&config, v6, 17, &vec![0x75; 1400], true, false));
-            if !v6 {
-                inbound[6] = 0x40;
-                fix_wire(&mut inbound, 20, 17);
-            }
+            let icmp = if v6 { 58 } else { 1 };
+            let pmtu = |inbound, assigned| {
+                let mut error = quoted_error(&config, v6, 17, inbound, assigned);
+                error[offset] = if v6 { 2 } else { 3 };
+                error[offset + 1] = if v6 { 0 } else { 4 };
+                error[offset + 4..offset + 8].copy_from_slice(&1280u32.to_be_bytes());
+                fix_wire(&mut error, offset, icmp);
+                error
+            };
+            // These errors originate at the peer/application fixture, never at
+            // TargetPacketPath. Both real crypto directions preserve the MTU.
+            capture.try_send(&pmtu(false, false)).unwrap();
+            let received = observed(&mut observations).await;
+            assert_eq!(received, pmtu(false, true));
+            assert_eq!(wire_sum(&received, offset, icmp), [0, 0]);
+            let inbound = pmtu(true, true);
             inject
                 .send(Packet::<[u8]>::copy_from(&inbound).try_into_ip().unwrap())
                 .await
                 .unwrap();
-            let feedback = observed(&mut observations).await;
-            assert!(feedback.len() <= if v6 { 1280 } else { 576 });
-            assert_eq!(wire_sum(&feedback, offset, if v6 { 58 } else { 1 }), [0, 0]);
-            assert_eq!(&feedback[offset + 6..offset + 8], &1280u16.to_be_bytes());
-            assert_eq!(
-                &feedback[offset + 8..],
-                &inbound[..feedback.len() - offset - 8]
-            );
-            assert!(
-                tokio::time::timeout(Duration::from_millis(30), capture.reply())
-                    .await
-                    .is_err(),
-                "target PMTU sent to app"
-            );
+            let received = capture_bytes(&capture).await;
+            assert_eq!(received, pmtu(true, false));
+            assert_eq!(wire_sum(&received, offset, icmp), [0, 0]);
         }
         client.shutdown().await;
         drop((owner, check, client));
@@ -442,7 +425,7 @@ fn rejoin(mut packets: Vec<Vec<u8>>) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn translated_fragments_are_consumed_and_sized_in_both_crypto_directions() {
+async fn translated_fragments_keep_exact_size_in_both_crypto_directions() {
     for multihop in [false, true] {
         let (broker, _root, credit) = broker();
         let mut config = config();
@@ -465,16 +448,17 @@ async fn translated_fragments_are_consumed_and_sized_in_both_crypto_directions()
         establish_and_observe(&mut check, &client, &owner, async { Ok(()) })
             .await
             .unwrap();
-        for (v6, source_fragmented) in [(false, false), (false, true), (true, true)] {
+        for (v6, source_fragmented) in [(false, false), (true, false), (false, true), (true, true)]
+        {
             let app = packet(&config, v6, 17, &vec![0x97; 1600], false, false);
-            // IPv4 can be split here; existing source fragments forward at once.
+            // Ordinary packets and source fragments each cross as one input.
             let mut wire_fragments = Vec::new();
             if source_fragmented {
                 let expected = fragments(
                     &packet(&config, v6, 17, &vec![0x97; 1600], true, false),
-                    800,
+                    1328,
                 );
-                for (fragment, expected) in fragments(&app, 800).into_iter().zip(expected).rev() {
+                for (fragment, expected) in fragments(&app, 1328).into_iter().zip(expected).rev() {
                     capture.try_send(&fragment).unwrap();
                     let received = observed(&mut observations).await;
                     assert_eq!(
@@ -486,24 +470,30 @@ async fn translated_fragments_are_consumed_and_sized_in_both_crypto_directions()
             } else {
                 capture.try_send(&app).unwrap();
                 wire_fragments.push(observed(&mut observations).await);
-                wire_fragments.push(observed(&mut observations).await);
             }
-            assert!(
-                wire_fragments
-                    .iter()
-                    .all(|packet| packet.len() <= usize::from(config.mtu))
-            );
-            let wire = rejoin(std::mem::take(&mut wire_fragments));
+            assert_eq!(wire_fragments.len(), if source_fragmented { 2 } else { 1 });
+            let wire = if source_fragmented {
+                rejoin(std::mem::take(&mut wire_fragments))
+            } else {
+                wire_fragments.remove(0)
+            };
             assert_eq!(
                 wire,
                 packet(&config, v6, 17, &vec![0x97; 1600], true, false)
             );
             assert_eq!(wire_sum(&wire, if v6 { 40 } else { 20 }, 17), [0, 0]);
+            if !source_fragmented {
+                // The independent peer echoes ordinary unfragmented UDP too.
+                // Consume and verify that real return before the separate
+                // explicit inbound-arrival proof below, not in the next vector.
+                assert_eq!(capture_bytes(&capture).await, application_reply(&app));
+            }
             let inbound = application_reply(&wire);
             let mut captured = Vec::new();
             if source_fragmented {
-                let expected = fragments(&application_reply(&app), 800);
-                for (fragment, expected) in fragments(&inbound, 800).into_iter().zip(expected).rev()
+                let expected = fragments(&application_reply(&app), 1328);
+                for (fragment, expected) in
+                    fragments(&inbound, 1328).into_iter().zip(expected).rev()
                 {
                     inject
                         .send(Packet::<[u8]>::copy_from(&fragment).try_into_ip().unwrap())
@@ -522,10 +512,15 @@ async fn translated_fragments_are_consumed_and_sized_in_both_crypto_directions()
                     .await
                     .unwrap();
                 captured.push(capture_bytes(&capture).await);
-                captured.push(capture_bytes(&capture).await);
             }
-            assert!(captured.iter().all(|packet| packet.len() <= 1280));
-            assert_eq!(rejoin(captured), application_reply(&app));
+            assert_eq!(captured.len(), if source_fragmented { 2 } else { 1 });
+            let joined = if source_fragmented {
+                rejoin(captured)
+            } else {
+                captured.remove(0)
+            };
+            assert_eq!(joined, application_reply(&app));
+            assert_eq!(wire_sum(&joined, if v6 { 40 } else { 20 }, 17), [0, 0]);
         }
         client.shutdown().await;
         drop((owner, check, client));
@@ -642,23 +637,15 @@ async fn retired_translated_bytes_and_assembly_never_enter_an_identical_or_rotat
         let expected = fragments(&packet(&config, false, 17, &[0x79; 900], true, false), 480);
         assert_eq!(observed(&mut observations).await, expected[0]);
         let mut queued = {
-            let result = owner
+            owner
                 .path
                 .lock()
                 .unwrap()
                 .process(
                     &pieces[0],
                     talpid_netstack::address_translation::Direction::Outbound,
-                    1280,
-                    Instant::now(),
                 )
-                .unwrap();
-            let talpid_netstack::address_translation::TranslationOutcome::Packets(mut packets) =
-                result
-            else {
-                panic!("immediate fragment")
-            };
-            packets.pop().unwrap()
+                .unwrap()
         };
         assert!(matches!(
             queued.write(|_| Err(io::ErrorKind::WouldBlock.into())),
@@ -667,10 +654,6 @@ async fn retired_translated_bytes_and_assembly_never_enter_an_identical_or_rotat
         client.shutdown().await;
         assert!(session.current());
         assert!(!old.current());
-        assert!(
-            owner.path.lock().unwrap().deadline().is_none(),
-            "retired path retained a feedback deadline"
-        );
         drop((owner, check, client));
         assert_eq!(credit.used(), 0);
         remote.stop().await;

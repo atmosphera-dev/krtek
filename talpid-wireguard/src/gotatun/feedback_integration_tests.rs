@@ -1,10 +1,7 @@
 //! Scheduling gates wrap the existing adapter/crypto peer only in this fixture.
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use talpid_netstack::{
-    address_translation::{Direction, TranslationOutcome},
-    packet_sizing::FeedbackSide,
-};
+use talpid_netstack::address_translation::Direction;
 use talpid_types::relay_flow::{RelayBufferAllocator, RelayBufferReservation, RelayFlowError};
 
 struct Gate {
@@ -101,10 +98,7 @@ impl Tunnel for GatedTunnel {
 impl GatedTunnel {
     async fn new(mut pending: PendingManaged, config: &Config) -> Self {
         let pair = pending.create(config).await.unwrap();
-        let gate = Arc::new(Gate {
-            permits: tokio::sync::Semaphore::new(0),
-            ..Gate::default()
-        });
+        let gate = Arc::new(Gate::default());
         let device = DeviceBuilder::new()
             .with_udp(transport_factory(
                 true,
@@ -193,23 +187,6 @@ fn available(allocator: &dyn RelayBufferAllocator) -> usize {
     }
     low
 }
-async fn held_feedback(owner: &ManagedControl) -> talpid_netstack::packet_sizing::Feedback {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if let Some(feedback) = owner
-                .path
-                .lock()
-                .unwrap()
-                .take_feedback_for(FeedbackSide::Target)
-            {
-                return feedback;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-    })
-    .await
-    .expect("authenticated input did not generate target feedback")
-}
 async fn inject(input: &mpsc::Sender<Packet<Ip>>, bytes: &[u8]) {
     input
         .send(Packet::<[u8]>::copy_from(bytes).try_into_ip().unwrap())
@@ -231,41 +208,49 @@ fn local_progress(session: &talpid_types::relay_flow::RelayCapture) {
     let count = consumer.recv(&mut bytes).unwrap();
     assert_eq!(&bytes[..count], b"independent-local");
 }
-
 struct RefusableApplication {
     inner: BufferBudget,
     exhausted: Arc<AtomicBool>,
+    refused: Arc<tokio::sync::Notify>,
 }
 impl RelayBufferAllocator for RefusableApplication {
     fn try_reserve(&self, bytes: usize) -> Result<Arc<dyn RelayBufferReservation>, RelayFlowError> {
         if self.exhausted.load(Ordering::Acquire) {
+            self.refused.notify_one();
             return Err(RelayFlowError::Full);
         }
         self.inner.try_reserve(bytes)
     }
 }
-fn refusable_broker() -> (AttachmentBroker, BufferBudget, Arc<AtomicBool>) {
+fn refusable_broker() -> (
+    AttachmentBroker,
+    BufferBudget,
+    Arc<AtomicBool>,
+    Arc<tokio::sync::Notify>,
+) {
     let root = BufferBudget::new(64 * 1024 * 1024);
     let application = root.reserve(22 * 1024 * 1024).unwrap().region().unwrap();
     let control = root.reserve(8 * 1024 * 1024).unwrap().region().unwrap();
     let capture = root.reserve(2 * 1024 * 1024).unwrap().region().unwrap();
     let exhausted = Arc::new(AtomicBool::new(false));
+    let refused = Arc::new(tokio::sync::Notify::new());
     let broker = AttachmentBroker::new(
         Arc::new(RefusableApplication {
             inner: application,
             exhausted: exhausted.clone(),
+            refused: refused.clone(),
         }),
         Arc::new(capture),
         Arc::new(control.clone()),
     )
     .unwrap();
     broker.set_mode(AttachmentMode::ManagedRequired).unwrap();
-    (broker, control, exhausted)
+    (broker, control, exhausted, refused)
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn feedback_and_fresh_private_probes_progress_with_continuously_ready_ordinary_emission() {
+async fn ordinary_and_fresh_private_probes_progress_with_continuously_ready_packets() {
     let (broker, _root, credit) = broker();
     let mut config = config();
     let (remote, mut observations, input) = remote_controlled(&mut config, false).await;
@@ -274,76 +259,26 @@ async fn feedback_and_fresh_private_probes_progress_with_continuously_ready_ordi
     let client = GatedTunnel::new(source, &config).await;
     let mut check = client.check().await;
     client.gate.enabled.store(true, Ordering::Release);
-    // One datagram leaves more than 40 ordinary fragments continuously ready.
-    capture
-        .try_send(&packet(
-            &config,
-            false,
-            17,
-            &vec![0x81; 60000],
-            false,
-            false,
-        ))
-        .unwrap();
+    // Separate packet arrivals, not a removed splitter's emission backlog.
+    for nonce in 0..40 {
+        capture.try_send(&oversize(&config, false, nonce)).unwrap();
+    }
     let mut held = client.gate.held_after(0).await;
-    assert!(client.owner.path.lock().unwrap().deadline().is_none());
-    let feedback_started = Instant::now();
     inject(&input, &oversize(&config, true, 0x82)).await;
-    // Hold a real generated object, then put it back by generating a second
-    // packet: the first remains charged and the second competes at the merge.
-    let first = held_feedback(&client.owner).await;
-    inject(&input, &oversize(&config, true, 0x83)).await;
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if let Some(deadline) = client.owner.path.lock().unwrap().deadline() {
-                assert!(deadline >= feedback_started);
-                assert!(deadline <= Instant::now() + Duration::from_millis(125));
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    let returned = capture_bytes(&capture).await;
+    assert_eq!(returned, application_reply(&oversize(&config, false, 0x82)));
     let previous = client.owner.ledger.lock().unwrap().highest;
     assert!(check.establish_connectivity(&client).await.unwrap());
-    let mut ordinary = 0;
-    let mut feedback = 0;
     for _ in 0..8 {
         client.gate.permits.add_permits(1);
         held = client.gate.held_after(held).await;
-        while let Ok(bytes) = observations.try_recv() {
-            if bytes[9] == 1 {
-                feedback += 1;
-                assert_eq!(
-                    &bytes[28..],
-                    &oversize(&config, true, 0x83)[..bytes.len() - 28]
-                );
-            } else {
-                ordinary += 1;
-            }
-        }
     }
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while ordinary + feedback < 7 {
-            let bytes = observed(&mut observations).await;
-            if bytes[9] == 1 {
-                feedback += 1;
-            } else {
-                ordinary += 1;
-            }
-        }
-    })
-    .await
-    .unwrap();
-    assert!(
-        feedback > 0,
-        "feedback was placed permanently behind ready ordinary fragments"
-    );
-    assert!(ordinary > 0);
+    for nonce in 0..7 {
+        let received = observed(&mut observations).await;
+        assert_eq!(received, application_reply(&oversize(&config, true, nonce)));
+    }
     private_done(&client.owner, previous).await;
     local_progress(&capture.capability().unwrap());
-    drop(first);
     client.shutdown().await;
     drop(check);
     assert_eq!(credit.used(), 0);
@@ -352,8 +287,8 @@ async fn feedback_and_fresh_private_probes_progress_with_continuously_ready_ordi
 
 #[cfg(unix)]
 #[tokio::test]
-async fn feedback_reserved_credit_blocked_writes_full_limit_and_retirement_reach_real_consumers() {
-    let (broker, credit, exhausted) = refusable_broker();
+async fn ordinary_owned_packets_preserve_blocked_writes_retirement_and_refunds() {
+    let (broker, credit, exhausted, refused_allocation) = refusable_broker();
     let application = broker.application_buffers();
     let baseline = available(application.as_ref());
     let mut config = config();
@@ -361,149 +296,82 @@ async fn feedback_reserved_credit_blocked_writes_full_limit_and_retirement_reach
     let source = projected(&broker, &config);
     let capture = bind(&broker);
     let session = capture.capability().unwrap();
+    let sink = session.sink().unwrap();
     let client = GatedTunnel::new(source, &config).await;
     let mut check = client.check().await;
-    client.gate.enabled.store(true, Ordering::Release);
-    capture
-        .try_send(&packet(
-            &config,
-            false,
-            17,
-            &vec![0x91; 60000],
-            false,
-            false,
-        ))
-        .unwrap();
-    let held = client.gate.held_after(0).await;
-    // Both directions retain original sender-side quotes while ordinary credit
-    // is unavailable. The outgoing queue item is charged before exhaustion.
     let app = oversize(&config, false, 0x92);
     capture.try_send(&app).unwrap();
+    assert_eq!(
+        observed(&mut observations).await,
+        application_reply(&oversize(&config, true, 0x92))
+    );
+    let mut blocked = tokio::time::timeout(Duration::from_secs(2), capture.reply())
+        .await
+        .unwrap()
+        .unwrap();
+    let before = available(application.as_ref());
+    let expected = application_reply(&app);
+    for _ in 0..2 {
+        assert!(matches!(
+            blocked.write_to(&sink, |bytes| {
+                assert_eq!(bytes, expected);
+                Err(io::ErrorKind::WouldBlock.into())
+            }),
+            RelayWriteOutcome::Retry
+        ));
+        assert_eq!(
+            available(application.as_ref()),
+            before,
+            "WouldBlock released owned charge"
+        );
+    }
+    let target = client
+        .owner
+        .path
+        .lock()
+        .unwrap()
+        .process(&app, Direction::Outbound)
+        .unwrap();
+    // Preserve the real ordinary queue bound. The blocked writer remains charged
+    // outside this queue, just as in normal descriptor backpressure.
+    for _ in 0..talpid_tunnel::packet_attachment::PACKET_CAPACITY {
+        client.owner.ordinary_send.try_send(&expected).unwrap();
+    }
+    let queued = available(application.as_ref());
+    assert_eq!(
+        client.owner.ordinary_send.try_send(&expected),
+        Err(talpid_tunnel::packet_attachment::AttachmentError::Full)
+    );
+    assert_eq!(available(application.as_ref()), queued);
     let exhaustion = application
         .try_reserve(available(application.as_ref()))
         .unwrap();
-    assert_eq!(available(application.as_ref()), 0);
-    // Keep allocation refusal stable as discarded ordinary buffers refund their
-    // tickets; the already-precharged feedback child remains independently usable.
     exhausted.store(true, Ordering::Release);
+    let refused = client
+        .owner
+        .path
+        .lock()
+        .unwrap()
+        .summary()
+        .refused(TranslationError::Full);
     inject(&input, &oversize(&config, true, 0x93)).await;
-    let target_feedback = held_feedback(&client.owner).await;
-    let feedback_allocator = target_feedback.buffers();
-    inject(&input, &oversize(&config, true, 0x94)).await;
+    tokio::time::timeout(Duration::from_secs(2), refused_allocation.notified())
+        .await
+        .expect("ordinary allocation refusal not observed");
+    assert!(
+        client
+            .owner
+            .path
+            .lock()
+            .unwrap()
+            .summary()
+            .refused(TranslationError::Full)
+            > refused
+    );
     let previous = client.owner.ledger.lock().unwrap().highest;
     assert!(check.establish_connectivity(&client).await.unwrap());
-    client.gate.permits.add_permits(16);
-    client.gate.held_after(held).await;
-    let mut app_feedback = tokio::time::timeout(Duration::from_secs(2), capture.reply())
-        .await
-        .expect("app feedback used exhausted ordinary credit")
-        .unwrap();
-    let before = available(feedback_allocator.as_ref());
-    let mut saved = None;
-    assert!(matches!(
-        app_feedback.write(|bytes| {
-            saved = Some(bytes.to_vec());
-            Err(io::ErrorKind::WouldBlock.into())
-        }),
-        RelayWriteOutcome::Retry
-    ));
-    assert_eq!(
-        available(feedback_allocator.as_ref()),
-        before,
-        "WouldBlock released feedback charge"
-    );
-    let app_bytes = saved.unwrap();
-    assert_eq!(&app_bytes[28..], &app[..app_bytes.len() - 28]);
-    assert!(matches!(
-        app_feedback.write(|bytes| {
-            assert_eq!(bytes, app_bytes);
-            Err(io::ErrorKind::WouldBlock.into())
-        }),
-        RelayWriteOutcome::Retry
-    ));
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let bytes = observed(&mut observations).await;
-            if bytes[9] == 1 {
-                assert_eq!(
-                    &bytes[28..],
-                    &oversize(&config, true, 0x94)[..bytes.len() - 28]
-                );
-                break;
-            }
-        }
-    })
-    .await
-    .expect("target feedback used exhausted ordinary credit");
     private_done(&client.owner, previous).await;
     local_progress(&session);
-    // Keep 16 actual feedback objects live, including the blocked writer and
-    // retained target producer. A lost slot on WouldBlock admits an illegal 17th.
-    let now = Instant::now() + Duration::from_secs(4);
-    for _ in 0..8 {
-        let result =
-            client
-                .owner
-                .path
-                .lock()
-                .unwrap()
-                .process(&app, Direction::Outbound, 1280, now);
-        assert!(matches!(
-            result,
-            Ok(TranslationOutcome::FeedbackQueued(FeedbackSide::App))
-        ));
-        client.owner.flush_app_feedback();
-    }
-    assert!(matches!(
-        client
-            .owner
-            .path
-            .lock()
-            .unwrap()
-            .process(&app, Direction::Outbound, 1280, now),
-        Err(TranslationError::RateLimited)
-    ));
-    for _ in 0..6 {
-        assert!(matches!(
-            client.owner.path.lock().unwrap().process(
-                &app,
-                Direction::Outbound,
-                1280,
-                now + Duration::from_secs(2)
-            ),
-            Ok(TranslationOutcome::FeedbackQueued(FeedbackSide::App))
-        ));
-        client.owner.flush_app_feedback();
-    }
-    assert!(matches!(
-        client.owner.path.lock().unwrap().process(
-            &app,
-            Direction::Outbound,
-            1280,
-            now + Duration::from_secs(3)
-        ),
-        Err(TranslationError::FeedbackFull)
-    ));
-    assert_eq!(
-        client
-            .owner
-            .path
-            .lock()
-            .unwrap()
-            .summary()
-            .refused(TranslationError::FeedbackFull),
-        1
-    );
-    assert_eq!(
-        client
-            .owner
-            .path
-            .lock()
-            .unwrap()
-            .summary()
-            .refused(TranslationError::RateLimited),
-        1
-    );
     exhausted.store(false, Ordering::Release);
     drop(exhaustion);
     client.shutdown().await;
@@ -533,50 +401,36 @@ async fn feedback_reserved_credit_blocked_writes_full_limit_and_retirement_reach
         .await
         .unwrap();
     assert!(matches!(
-        app_feedback.write(|_| panic!("old app feedback entered successor")),
+        blocked.write_to(&sink, |_| panic!("old return entered successor")),
         RelayWriteOutcome::Stale
     ));
     assert!(matches!(
-        talpid_netstack::raw_packet::handoff_feedback(target_feedback, |_| panic!(
-            "old target feedback entered successor"
+        talpid_netstack::raw_packet::handoff(target, application.as_ref(), |_| panic!(
+            "old target entered successor"
         )),
         Err(RelayFlowError::Stale)
     ));
     let before = available(application.as_ref());
-    drop((app_feedback, feedback_allocator));
+    drop(blocked);
     assert!(
-        available(application.as_ref()) >= before + 64 * 1024,
-        "joined old feedback credit was not refunded"
+        available(application.as_ref()) >= before + expected.len(),
+        "old owned packet was not refunded"
     );
-    let app = packet(
-        &config,
-        false,
-        17,
-        b"fresh-after-feedback-retirement",
-        false,
-        false,
-    );
+    let app = packet(&config, false, 17, b"fresh-after-retirement", false, false);
     capture.try_send(&app).unwrap();
     assert_eq!(
         observed(&mut observations).await,
-        packet(
-            &config,
-            false,
-            17,
-            b"fresh-after-feedback-retirement",
-            true,
-            false
-        )
+        packet(&config, false, 17, b"fresh-after-retirement", true, false)
     );
     assert_eq!(capture_bytes(&capture).await, application_reply(&app));
     local_progress(&session);
-    capture.try_send(&oversize(&config, false, 0x95)).unwrap();
-    assert_eq!(capture_bytes(&capture).await[20..22], [3, 4]);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(30), observations.recv())
-            .await
-            .is_err()
+    let large = oversize(&config, false, 0x95);
+    capture.try_send(&large).unwrap();
+    assert_eq!(
+        observed(&mut observations).await,
+        application_reply(&oversize(&config, true, 0x95))
     );
+    assert_eq!(capture_bytes(&capture).await, application_reply(&large));
     successor.shutdown().await;
     drop((owner, check, successor));
     assert_eq!(credit.used(), 0);

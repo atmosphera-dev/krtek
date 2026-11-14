@@ -288,13 +288,14 @@ fixed pair; private-use addressing does not guarantee collision-free routing.
 Capture admission and classification select Local, a tunnel target or Drop.
 Tunnel targets translate each received packet or fragment immediately, using
 address checksum deltas; they do not reassemble, remember fragment identities
-or normalize atomic IPv6 headers. A fitting packet keeps its fragment layout.
-An oversized IPv4 DF=0 packet can be split further, preserving its original
-ID/offset/MF and copied options; DF=1 gets fragmentation-needed feedback.
-Oversized IPv6 packets, including source and atomic fragments, get Packet Too
-Big feedback, never router fragmentation. Feedback quotes the current invocation
-and retains the exact target attempt through the final writer. The assigned
-source filter and separate private-control path remain unchanged.
+or normalize atomic IPv6 headers. Each input produces one owned packet with
+the same length and layout, apart from address/checksum/quotation rewrites.
+Transmit MTU is native carrier metadata, not an endpoint receive limit: even
+larger incoming fragments are injected unchanged. The adapter neither fragments
+IP nor generates PMTU errors; real peer/network ICMP and its quotations pass
+through translation. Packets retain the exact target attempt through the final
+writer. The assigned source filter and separate private-control path remain
+unchanged.
 
 Local is a receiver, not tunnel transit. It terminates connections using its
 stack and protected, physical-network-bound sockets. Its current pre-stack

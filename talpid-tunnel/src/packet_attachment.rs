@@ -134,12 +134,7 @@ struct Capture {
 
 struct Queues {
     outbound: VecDeque<RelayPacket>,
-    inbound: VecDeque<ReturnPacket>,
-}
-
-enum ReturnPacket {
-    Application(RelayPacket),
-    Feedback(talpid_netstack::packet_sizing::Feedback),
+    inbound: VecDeque<RelayPacket>,
 }
 
 struct Attempt {
@@ -341,7 +336,7 @@ pub struct TransportPair {
 pub struct AttachmentReply {
     inner: Weak<Inner>,
     attempt: Arc<Attempt>,
-    packet: ReturnPacket,
+    packet: RelayPacket,
 }
 
 impl AttachmentBroker {
@@ -1408,7 +1403,7 @@ fn enqueue(
         queues.outbound.push_back(packet);
         attempt.outbound.notify_one();
     } else {
-        queues.inbound.push_back(ReturnPacket::Application(packet));
+        queues.inbound.push_back(packet);
         inner.replies.notify_one();
     }
     Ok(())
@@ -1505,8 +1500,8 @@ impl TransportReceive {
 }
 
 impl TransportSend {
-    /// Move already-accounted output without copying it out of its attempt or
-    /// reserved feedback region. The broker still checks the exact queue owner.
+    /// Move already-accounted output without copying it out of its attempt.
+    /// The broker still checks the exact queue owner.
     pub fn try_send_packet(&self, packet: RelayPacket) -> Result<(), AttachmentError> {
         if !packet
             .view()
@@ -1515,20 +1510,9 @@ impl TransportSend {
         {
             return Err(AttachmentError::Stale);
         }
-        self.enqueue_return(ReturnPacket::Application(packet))
+        self.enqueue_return(packet)
     }
-    pub fn try_send_feedback(
-        &self,
-        feedback: talpid_netstack::packet_sizing::Feedback,
-    ) -> Result<(), AttachmentError> {
-        if feedback.side() != talpid_netstack::packet_sizing::FeedbackSide::App
-            || !feedback.attempt().same_attempt(&self.control.capability())
-        {
-            return Err(AttachmentError::Stale);
-        }
-        self.enqueue_return(ReturnPacket::Feedback(feedback))
-    }
-    fn enqueue_return(&self, packet: ReturnPacket) -> Result<(), AttachmentError> {
+    fn enqueue_return(&self, packet: RelayPacket) -> Result<(), AttachmentError> {
         let inner = self
             .control
             .inner
@@ -1582,10 +1566,7 @@ impl AttachmentReply {
         sink: &RelaySink,
         operation: impl FnOnce(&[u8]) -> io::Result<usize>,
     ) -> RelayWriteOutcome {
-        let outcome = match &mut self.packet {
-            ReturnPacket::Application(packet) => packet.write_to(sink, operation),
-            ReturnPacket::Feedback(feedback) => feedback.write_to(sink, operation),
-        };
+        let outcome = self.packet.write_to(sink, operation);
         self.complete_write(outcome)
     }
 
@@ -1593,10 +1574,7 @@ impl AttachmentReply {
         &mut self,
         operation: impl FnOnce(&[u8]) -> io::Result<usize>,
     ) -> RelayWriteOutcome {
-        let outcome = match &mut self.packet {
-            ReturnPacket::Application(packet) => packet.write(operation),
-            ReturnPacket::Feedback(feedback) => feedback.write(operation),
-        };
+        let outcome = self.packet.write(operation);
         self.complete_write(outcome)
     }
 
