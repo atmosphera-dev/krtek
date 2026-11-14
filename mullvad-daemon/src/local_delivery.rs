@@ -965,6 +965,7 @@ impl<F: FrontendFactory> Delivery<F> {
                 .is_some_and(|owner| owner.state() == OwnerState::Running)
     }
 
+    #[cfg(test)]
     pub fn configuration_ready(&self) -> bool {
         self.ready()
             && self.pending.is_none()

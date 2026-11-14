@@ -431,11 +431,9 @@ pub fn open_tun(
         let effective_config = provider.config_mut().clone();
         drop(provider);
         use talpid_tunnel::tun_provider::transport::UserspaceTun;
-        let (tun, fd) = match mode.open(
-            effective_config,
-            |_| TunnelError::FatalStartWireguardError(Box::new(managed_control::unavailable())),
-            || get_tunnel_for_userspace(tun_provider, config),
-        )? {
+        let (tun, fd) = match mode.open(effective_config, managed_admission_error, || {
+            get_tunnel_for_userspace(tun_provider, config)
+        })? {
             UserspaceTun::Managed(source) => {
                 return Ok(OpenedTun {
                     source: OpenedSource::Managed(managed_control::PendingManaged::new(source)),
@@ -465,6 +463,13 @@ pub fn open_tun(
             is_new: tun.is_new,
         })
     }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn managed_admission_error(
+    error: talpid_tunnel::packet_attachment::AttachmentError,
+) -> TunnelError {
+    TunnelError::FatalStartWireguardError(Box::new(error))
 }
 
 /// Start a GotaTun tunnel on `tun`.
@@ -859,4 +864,52 @@ where
     let ip_recv = PcapSniffer::new(ip_recv, w, start_time);
 
     (ip_send, ip_recv)
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use talpid_netstack::buffer_budget::BufferBudget;
+    use talpid_tunnel::{
+        packet_attachment::{AttachmentBroker, AttachmentError, AttachmentMode},
+        tun_provider::transport::TransportMode,
+    };
+
+    #[test]
+    fn managed_admission_failure_retains_attachment_error_in_start_chain() {
+        let root = BufferBudget::new(64 * 1024 * 1024);
+        let broker = AttachmentBroker::new(
+            Arc::new(root.reserve(22 * 1024 * 1024).unwrap().region().unwrap()),
+            Arc::new(root.reserve(2 * 1024 * 1024).unwrap().region().unwrap()),
+            Arc::new(root.reserve(8 * 1024 * 1024).unwrap().region().unwrap()),
+        )
+        .unwrap();
+        broker.set_mode(AttachmentMode::ManagedRequired).unwrap();
+        broker.pause_transport();
+        let result = TransportMode::selected(Some(&broker)).open::<(), TunnelError>(
+            tun_provider::blocking_config(),
+            managed_admission_error,
+            || panic!("managed failure opened a native descriptor"),
+        );
+        let Err(TunnelError::FatalStartWireguardError(cause)) = result else {
+            panic!("managed admission failure lost its start error");
+        };
+        assert_eq!(
+            cause.downcast_ref::<AttachmentError>(),
+            Some(&AttachmentError::Closed)
+        );
+        assert_eq!(cause.to_string(), "Managed packet attachment: Closed");
+        for error in [
+            AttachmentError::Disabled,
+            AttachmentError::Busy,
+            AttachmentError::Full,
+            AttachmentError::CaptureUnready,
+        ] {
+            let TunnelError::FatalStartWireguardError(cause) = managed_admission_error(error)
+            else {
+                unreachable!()
+            };
+            assert_eq!(cause.downcast_ref::<AttachmentError>(), Some(&error));
+        }
+    }
 }

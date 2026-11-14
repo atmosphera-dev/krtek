@@ -512,9 +512,6 @@ pub(crate) enum InternalDaemonEvent {
     LocationEvent(LocationEventData),
     /// A generic event for when any settings change.
     SettingsChanged,
-    /// Resume a mode-aware Connect without blocking the current event.
-    #[cfg(target_os = "android")]
-    LocalNetworkReconcile,
     /// The split tunnel paths or state were updated.
     #[cfg(any(target_os = "windows", target_os = "android", target_os = "macos"))]
     ExcludedPathsEvent(ExcludedPathsUpdate, oneshot::Sender<Result<(), Error>>),
@@ -1176,7 +1173,7 @@ impl Daemon {
     fn handle_initial_target_state(&mut self) {
         match self.target_state.to_strict() {
             either::Either::Right(_) => {
-                self.send_connect();
+                self.connect_tunnel();
             }
             either::Either::Left(_) => {
                 // Fetching GeoIpLocation is automatically done when connecting.
@@ -1305,9 +1302,6 @@ impl Daemon {
                             .notifier()
                             .notify_local_network_status(status);
                     }
-                    // Owner readiness can be the last event before parameters
-                    // exist. Resume the admission continuation on this exact
-                    // acknowledgement, not on a later incidental broker event.
                     self.refresh_local_network_status(false).await;
                 }
             }
@@ -1332,13 +1326,8 @@ impl Daemon {
             } else {
                 vec![]
             });
-        let continued = if external || !self.local_network.failed() {
-            self.continue_local_connect().await
-        } else {
-            false
-        };
         let phase = local_network::TunnelPhase::from(&self.tunnel_state);
-        let status = if external && continued {
+        let status = if external {
             self.local_network
                 .update(
                     &self.settings.local_network_access,
@@ -1360,26 +1349,6 @@ impl Daemon {
                 .notifier()
                 .notify_local_network_status(status);
         }
-    }
-
-    async fn continue_local_connect(&mut self) -> bool {
-        match self
-            .local_network
-            .continue_connect(
-                &mut self.local_connect,
-                &self.settings.local_network_access,
-                *self.target_state,
-            )
-            .await
-        {
-            Ok(Some(command)) => self.send_tunnel_command(command),
-            Ok(None) => {}
-            Err(error) => {
-                log::error!("Router/target admission withheld: {error}");
-                return false;
-            }
-        }
-        true
     }
 
     async fn handle_event(&mut self, event: InternalDaemonEvent) -> bool {
@@ -1418,8 +1387,6 @@ impl Daemon {
                 self.update_feature_indicators_on_settings_changed();
                 self.update_local_network_status().await;
             }
-            #[cfg(target_os = "android")]
-            LocalNetworkReconcile => self.update_local_network_status().await,
             #[cfg(any(target_os = "windows", target_os = "android", target_os = "macos"))]
             ExcludedPathsEvent(update, tx) => self.handle_new_excluded_paths(update, tx).await,
             LeakDetected(leak_info) => {
@@ -3758,16 +3725,13 @@ impl Daemon {
     /// progress towards that state.
     /// Returns a bool representing whether a state change was initiated.
     async fn set_target_state(&mut self, new_state: TargetState) -> bool {
-        if new_state != *self.target_state
-            || self.tunnel_state.is_in_error_state()
-            || (new_state == TargetState::Secured && self.local_network.has_owner())
-        {
+        if new_state != *self.target_state || self.tunnel_state.is_in_error_state() {
             log::debug!("Target state {:?} => {:?}", *self.target_state, new_state);
 
             self.target_state.set(new_state).await;
 
             match *self.target_state {
-                TargetState::Secured => self.send_connect(),
+                TargetState::Secured => self.connect_tunnel(),
                 TargetState::Unsecured => self.disconnect_tunnel(),
             }
             true
@@ -3776,18 +3740,11 @@ impl Daemon {
         }
     }
 
-    fn send_connect(&mut self) {
-        self.connect_tunnel();
-    }
-
     #[track_caller]
     fn connect_tunnel(&mut self) {
-        #[cfg(not(target_os = "android"))]
-        self.send_tunnel_command(TunnelCommand::Connect);
-        #[cfg(target_os = "android")]
-        {
-            self.local_connect.connect();
-            let _ = self.tx.send(InternalDaemonEvent::LocalNetworkReconcile);
+        self.local_connect.connect();
+        if let Some(command) = self.local_network.continue_connect(&mut self.local_connect) {
+            self.send_tunnel_command(command);
         }
     }
 

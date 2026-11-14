@@ -28,6 +28,7 @@ struct PacketPlatform {
     released: tokio::sync::Notify,
     fail_release: AtomicBool,
     retain_handover: AtomicBool,
+    delayed_completion: Mutex<Option<oneshot::Sender<(i64, CaptureNetworkObservation)>>>,
     authority: Mutex<Option<Arc<DeliveryAuthority>>>,
     generation: std::sync::atomic::AtomicI64,
     physical: (SocketAddr, SocketAddr),
@@ -161,23 +162,29 @@ impl FrontendPlatform for PacketPlatform {
     }
     fn bind(&self, generation: i64, _: &str) -> io::Result<bool> {
         let expected = self.expected.lock().unwrap().clone().unwrap();
-        Ok(self.feed.publish(
-            self.feed.registration(),
-            generation,
-            CaptureNetworkObservation {
-                network_handle: generation << 32,
-                network: format!("net-{generation}"),
-                interface_name: expected.interface_name,
-                owner_uid: expected.owner_uid,
-                routes: expected.routes,
-                addresses: expected.addresses,
-                dns_servers: expected.dns_servers,
-                mtu: expected.mtu,
-                fresh: true,
-                lost: false,
-                api_level: 33,
-            },
-        ))
+        let observation = CaptureNetworkObservation {
+            network_handle: generation << 32,
+            network: format!("net-{generation}"),
+            interface_name: expected.interface_name,
+            owner_uid: expected.owner_uid,
+            routes: expected.routes,
+            addresses: expected.addresses,
+            dns_servers: expected.dns_servers,
+            mtu: expected.mtu,
+            fresh: true,
+            lost: false,
+            api_level: 33,
+        };
+        if let Some(delayed) = self.delayed_completion.lock().unwrap().take() {
+            delayed
+                .send((generation, observation))
+                .map_err(|_| io::Error::other("delayed completion receiver closed"))?;
+            Ok(true)
+        } else {
+            Ok(self
+                .feed
+                .publish(self.feed.registration(), generation, observation))
+        }
     }
     fn closed(&self, generation: i64) -> io::Result<()> {
         assert!(
@@ -352,6 +359,7 @@ async fn daemon_route_handover_retains_the_partial_grant_and_same_physical_tcp_s
         released: tokio::sync::Notify::new(),
         fail_release: AtomicBool::new(false),
         retain_handover: AtomicBool::new(false),
+        delayed_completion: Mutex::new(None),
         authority: Mutex::new(None),
         generation: 0.into(),
         physical,
@@ -556,6 +564,7 @@ async fn managed_capture_delivers_local_nonces_and_never_relays_denied_local() {
         released: tokio::sync::Notify::new(),
         fail_release: AtomicBool::new(false),
         retain_handover: AtomicBool::new(false),
+        delayed_completion: Mutex::new(None),
         authority: Mutex::new(None),
         generation: 0.into(),
         physical,
@@ -738,6 +747,7 @@ async fn assigned_config_handover_retains_local_sources_and_joined_shutdown() {
         released: tokio::sync::Notify::new(),
         fail_release: AtomicBool::new(false),
         retain_handover: AtomicBool::new(false),
+        delayed_completion: Mutex::new(None),
         authority: Mutex::new(None),
         generation: 0.into(),
         physical: (
@@ -923,6 +933,7 @@ fn release_fixture() -> (
         released: tokio::sync::Notify::new(),
         fail_release: AtomicBool::new(false),
         retain_handover: AtomicBool::new(false),
+        delayed_completion: Mutex::new(None),
         authority: Mutex::new(None),
         generation: 0.into(),
         physical: (
@@ -1200,20 +1211,293 @@ struct Handover {
 }
 
 #[tokio::test]
-async fn router_admission_owns_local_reader_before_connect_and_before_parameters() {
+async fn second_settings_reconnect_cannot_close_queued_target_admission() {
+    use talpid_tunnel::tun_provider::transport::ManagedTun;
+
+    for admit_before_second in [false, true] {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let physical = (tcp.local_addr().unwrap(), udp.local_addr().unwrap());
+        let tcp_task = tokio::spawn(async move {
+            let (mut stream, tuple) = tcp.accept().await.unwrap();
+            for index in 0..4 {
+                let mut bytes = [0; 8];
+                stream.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(bytes.as_slice(), format!("{index:08}").as_bytes());
+                assert_eq!(stream.peer_addr().unwrap(), tuple);
+                stream.write_all(&bytes).await.unwrap();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), tcp.accept())
+                    .await
+                    .is_err(),
+                "Local TCP was reopened"
+            );
+        });
+        let udp_task = tokio::spawn(async move {
+            let mut tuple = None;
+            for index in 0..4 {
+                let mut bytes = [0; 128];
+                let (count, source) = udp.recv_from(&mut bytes).await.unwrap();
+                assert_eq!(&bytes[..count], format!("{index:08}").as_bytes());
+                assert_eq!(*tuple.get_or_insert(source), source);
+                udp.send_to(&bytes[..count], source).await.unwrap();
+            }
+        });
+        let mut h = Handover::unstarted_with_physical(policy(), physical);
+        h.observe(TunnelPhase::Disconnected);
+        h.continuation.connect();
+        assert_eq!(h.admit().await, Some("Connect"));
+        h.connect_endpoint().await;
+        let broker = h.runtime.broker();
+        let session = broker.snapshot().session_generation;
+        let authority = h.platform.authority.lock().unwrap().clone().unwrap();
+        let local = flow(Transport::Tcp, 45994);
+        let udp_flow = flow(Transport::Udp, 45995);
+        let grant = authority.authorize(local).unwrap();
+        let peer = |h: &Handover| {
+            UnixDatagram::from_std(
+                h.platform
+                    .peer
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .try_clone()
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        peer(&h)
+            .send(&tcp_packet(local, 100, 0, 2, &[]))
+            .await
+            .unwrap();
+        let syn = capture_reply(&peer(&h)).await;
+        let mut ack = u32::from_be_bytes(syn[24..28].try_into().unwrap()).wrapping_add(1);
+        let mut sequence = 101;
+
+        for index in 0..4 {
+            if index == 1 {
+                let old = h.transport.take().unwrap();
+                let old_request = h.request.take().unwrap();
+                let cleanup = broker.transport_cleanup();
+                let old_attempt = old.control.capability();
+                let mut old_packet = old_attempt
+                    .packet(
+                        talpid_types::relay_flow::RelayBuffer::copy_from(
+                            b"stale-final-write",
+                            broker.application_buffers().as_ref(),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                // The first settings reconnect uses the same dispatch boundary
+                // as the daemon. Hold its queued Connect before ManagedTun::request.
+                h.continuation.connect();
+                let command = h.advance().await.unwrap().unwrap();
+                h.observe(TunnelPhase::Disconnecting);
+                old.control.detach();
+                drop(old);
+                old_request.transport_joined();
+                if command == "Disconnect" {
+                    h.observe(TunnelPhase::Disconnected);
+                    assert_eq!(h.admit().await, Some("Connect"));
+                }
+                h.observe(TunnelPhase::Connecting);
+                let mut intermediate = assigned_config();
+                intermediate.mtu = 1380;
+                intermediate.addresses.retain(std::net::IpAddr::is_ipv4);
+                intermediate.ipv6_gateway = None;
+                intermediate.routes.retain(ipnetwork::IpNetwork::is_ipv4);
+                // Linux's admission entry does not apply Android's projection.
+                // Supply that same pure projection for this never-acquired target.
+                let intermediate = talpid_tunnel::tun_provider::transport::router_config(
+                    &intermediate,
+                    broker.local_routes(),
+                );
+                let (completion, delayed) = oneshot::channel();
+                *h.platform.delayed_completion.lock().unwrap() = Some(completion);
+                let mut admitted = admit_before_second
+                    .then(|| ManagedTun::request(broker.clone(), intermediate.clone()).unwrap());
+                h.continuation.connect();
+                let second = h.advance().await.unwrap();
+                if admitted.is_none() {
+                    admitted = Some(
+                        ManagedTun::request(broker.clone(), intermediate)
+                            .expect("second settings reconnect closed queued target admission"),
+                    );
+                }
+                assert_eq!(
+                    second,
+                    Some("Connect"),
+                    "normal reconnect became Disconnect"
+                );
+                let mut admitted = admitted.unwrap();
+                let cancelled = broker.pending_request().unwrap();
+                h.runtime
+                    .internal_update(&h.policy, h.target, h.phase)
+                    .await;
+                let (generation, observation) = bounded(delayed).await.unwrap();
+                assert!(
+                    h.platform
+                        .opened
+                        .lock()
+                        .unwrap()
+                        .last()
+                        .unwrap()
+                        .same_android_config(cancelled.config())
+                );
+                let intermediate_cleanup = broker.transport_cleanup();
+                // The TSM cancels this exact superseded request, not global
+                // admission. No frontend acknowledgement may make it ready/Up.
+                intermediate_cleanup.cancel();
+                admitted.request.transport_joined();
+                assert!(admitted.request.configured().await.is_err());
+                assert!(!old_attempt.current());
+                assert!(broker.pending_request().is_none());
+                // Complete the exact matching frontend observation only after
+                // cancellation. Local may adopt the sink, never this old target.
+                assert!(h.platform.feed.publish(
+                    h.platform.feed.registration(),
+                    generation,
+                    observation.clone()
+                ));
+                h.settle_capture().await;
+                assert_eq!(
+                    broker.snapshot().capture_generation,
+                    Some(generation as u64)
+                );
+                assert!(broker.snapshot().capture_ready);
+                assert!(!broker.snapshot().ordinary_ready);
+                assert!(admitted.request.configured().await.is_err());
+                let mut final_config = assigned_config();
+                final_config.mtu = 1280;
+                h.connect_endpoint_with(final_config).await;
+                let latest = h
+                    .request
+                    .as_mut()
+                    .unwrap()
+                    .configured()
+                    .await
+                    .unwrap()
+                    .generation();
+                // Delayed predecessor cleanup must not choose the new request.
+                cleanup.cancel();
+                drop(old_request);
+                intermediate_cleanup.cancel();
+                assert!(!h.platform.feed.publish(
+                    h.platform.feed.registration(),
+                    generation,
+                    observation
+                ));
+                assert!(
+                    admitted.request.configured().await.is_err(),
+                    "late matching completion certified cancelled target after successor settled"
+                );
+                drop(admitted);
+                assert_eq!(
+                    h.request
+                        .as_mut()
+                        .unwrap()
+                        .configured()
+                        .await
+                        .unwrap()
+                        .generation(),
+                    latest
+                );
+                assert!(h.transport.as_ref().unwrap().control.current());
+                assert!(matches!(
+                    old_packet.write(|_| panic!("old packet reached final write")),
+                    talpid_types::relay_flow::RelayWriteOutcome::Stale
+                ));
+                let applied = h.platform.opened.lock().unwrap().last().unwrap().clone();
+                assert_eq!(applied.mtu, 1280);
+                assert!(applied.addresses.iter().any(std::net::IpAddr::is_ipv4));
+                assert!(applied.addresses.iter().any(std::net::IpAddr::is_ipv6));
+            } else if index == 2 {
+                h.user_disconnect();
+                assert!(!h.transport.as_ref().unwrap().control.current());
+                assert!(ManagedTun::request(broker.clone(), assigned_config()).is_err());
+                h.observe(TunnelPhase::Disconnecting);
+                h.acknowledge_transport_close();
+                h.advance().await.unwrap();
+                bounded(async {
+                    while !h.runtime.capture_configuration_ready() {
+                        h.runtime.notifications().1.await;
+                        h.advance().await.unwrap();
+                    }
+                })
+                .await;
+            } else if index == 3 {
+                // A subsequent explicit secured Connect releases the intentional
+                // unsecured stop without a blocking preflight capture.
+                h.target = TargetState::Secured;
+                h.continuation.connect();
+                assert_eq!(h.admit().await, Some("Connect"));
+                h.connect_endpoint().await;
+            }
+            assert_eq!(broker.snapshot().session_generation, session);
+            assert!(authority.current(&grant));
+            let capture = peer(&h);
+            let nonce = format!("{index:08}");
+            capture
+                .send(&tcp_packet(local, sequence, ack, 0x18, nonce.as_bytes()))
+                .await
+                .unwrap();
+            let mut received = Vec::new();
+            while received.len() < 8 {
+                let bytes = capture_reply(&capture).await;
+                let payload = packet::parse(&bytes).unwrap().payload;
+                received.extend_from_slice(payload);
+                ack = ack.wrapping_add(payload.len() as u32);
+            }
+            assert_eq!(received, nonce.as_bytes());
+            sequence += 8;
+            capture
+                .send(&tcp_packet(local, sequence, ack, 0x10, &[]))
+                .await
+                .unwrap();
+            capture
+                .send(&udp_packet(udp_flow, nonce.as_bytes()))
+                .await
+                .unwrap();
+            loop {
+                let bytes = capture_reply(&capture).await;
+                let packet = packet::parse(&bytes).unwrap();
+                if packet.flow.transport == Transport::Udp {
+                    assert_eq!(packet.payload, nonce.as_bytes());
+                    break;
+                }
+            }
+        }
+        bounded(tcp_task).await.unwrap();
+        bounded(udp_task).await.unwrap();
+        h.runtime.begin_shutdown();
+        assert!(!h.transport.as_ref().unwrap().control.current());
+        assert!(ManagedTun::request(broker, assigned_config()).is_err());
+        h.close().await;
+    }
+}
+
+#[tokio::test]
+async fn connect_dispatch_does_not_wait_for_capture_or_parameters() {
     let mut h = Handover::new(policy());
     h.continuation.connect();
     assert_eq!(
         h.advance().await.unwrap(),
-        None,
-        "Connect preceded capture acknowledgement"
+        Some("Connect"),
+        "Connect was withheld before parameters/capture acknowledgement"
     );
     assert!(
         h.runtime.has_owner(),
-        "pre-parameter blocking reader absent"
+        "independent Local Partial reader absent"
     );
     bounded(h.runtime.notifications().1).await;
-    assert_eq!(h.advance().await.unwrap(), Some("Connect"));
+    assert_eq!(h.advance().await.unwrap(), None);
+    assert!(
+        h.platform.opened.lock().unwrap().is_empty(),
+        "blocking preflight was established"
+    );
     assert_eq!(
         h.runtime.status().forwarding,
         ForwardingAvailability::Active
@@ -1257,6 +1541,7 @@ async fn continuation_leaves_off_status_for_the_daemon_notification_boundary() {
         },
     ] {
         let mut h = Handover::new(policy());
+        h.continuation.connect();
         assert_eq!(h.admit().await, Some("Connect"));
         h.connect_endpoint().await;
         h.user_disconnect();
@@ -1278,13 +1563,7 @@ async fn continuation_leaves_off_status_for_the_daemon_notification_boundary() {
         h.policy = off;
         // Reproduce refresh_local_network_status: continuation first, then the
         // publication call whose returned sample actually reaches the notifier.
-        assert!(
-            h.runtime
-                .continue_connect(&mut h.continuation, &h.policy, h.target)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(h.runtime.continue_connect(&mut h.continuation).is_none());
         let published = h
             .runtime
             .update(&h.policy, h.target, h.phase)
@@ -1386,12 +1665,14 @@ async fn runtime_router_keeps_one_local_tcp_udp_consumer_through_held_boundaries
             }
             5 => {
                 h.continuation.connect();
-                assert_eq!(h.advance().await.unwrap(), Some("Disconnect"));
+                assert_eq!(h.advance().await.unwrap(), Some("Connect"));
                 h.observe(TunnelPhase::Disconnecting);
             }
             6 => {
-                h.acknowledge_transport_close();
-                assert_eq!(h.admit().await, Some("Connect"));
+                h.transport.take();
+                h.request.take();
+                h.observe(TunnelPhase::Connecting);
+                assert_eq!(h.advance().await.unwrap(), None);
             }
             9 => {
                 h.runtime.suspend();
@@ -1418,6 +1699,7 @@ async fn runtime_router_keeps_one_local_tcp_udp_consumer_through_held_boundaries
             _ => {}
         }
         h.runtime.update(&h.policy, h.target, h.phase).await;
+        h.settle_capture().await;
         assert_eq!(
             h.runtime.status().forwarding,
             ForwardingAvailability::Active,
@@ -1512,7 +1794,7 @@ async fn runtime_router_keeps_one_local_tcp_udp_consumer_through_held_boundaries
     assert_eq!(
         h.platform.starts.load(SeqCst),
         4,
-        "Partial -> blocking -> target -> Partial only; retries must reuse the fd"
+        "Partial -> Error blocking -> target -> Partial; no pre-Connect blocking capture"
     );
     h.close().await;
 }
@@ -1524,19 +1806,14 @@ async fn disconnect_cancels_pre_parameter_admission_without_a_late_connect() {
         policy(),
         ("127.0.0.1:9".parse().unwrap(), udp.local_addr().unwrap()),
     );
+    h.observe(TunnelPhase::Disconnected);
     h.continuation.connect();
     assert_eq!(
         h.advance().await.unwrap(),
-        None,
-        "Connect before initial TSM snapshot"
+        Some("Connect"),
+        "direct Connect was withheld before parameters"
     );
-    assert!(!h.runtime.has_owner());
-    h.observe(TunnelPhase::Disconnected);
-    assert_eq!(
-        h.advance().await.unwrap(),
-        None,
-        "Connect before native acknowledgement"
-    );
+    assert!(h.platform.opened.lock().unwrap().is_empty());
     h.user_disconnect();
     assert_eq!(h.advance().await.unwrap(), None);
     bounded(async {
@@ -1546,7 +1823,7 @@ async fn disconnect_cancels_pre_parameter_admission_without_a_late_connect() {
         }
     })
     .await;
-    assert_eq!(h.commands, ["Disconnect"]);
+    assert_eq!(h.commands, ["Connect", "Disconnect"]);
     assert_eq!(
         h.runtime.status().forwarding,
         ForwardingAvailability::Active
@@ -1577,7 +1854,7 @@ async fn disconnect_cancels_pre_parameter_admission_without_a_late_connect() {
     assert_eq!(h.advance().await.unwrap(), None);
     assert_eq!(
         h.commands,
-        ["Disconnect"],
+        ["Connect", "Disconnect"],
         "late native ack resumed cancelled Secured intent"
     );
     assert!(!h.runtime.broker().snapshot().ordinary_ready);
@@ -1612,15 +1889,13 @@ async fn actual_capture_loss_retries_with_a_fresh_router_not_a_cancelled_target_
     h.acknowledge_transport_close();
     h.observe(TunnelPhase::Error);
     h.continuation.connect();
-    assert_eq!(h.advance().await.unwrap(), Some("Disconnect"));
-    h.acknowledge_transport_close();
     assert_eq!(
         h.admit().await,
         Some("Connect"),
         "explicit retry stalled on the cancelled target's old request"
     );
-    assert_ne!(broker.snapshot().session_generation, old_session);
     h.connect_endpoint().await;
+    assert_ne!(broker.snapshot().session_generation, old_session);
     let peer = UnixDatagram::from_std(
         h.platform
             .peer
@@ -1680,6 +1955,7 @@ impl Handover {
             released: tokio::sync::Notify::new(),
             fail_release: AtomicBool::new(false),
             retain_handover: AtomicBool::new(false),
+            delayed_completion: Mutex::new(None),
             authority: Mutex::new(None),
             generation: 0.into(),
             physical,
@@ -1713,10 +1989,7 @@ impl Handover {
 
     async fn advance(&mut self) -> io::Result<Option<&'static str>> {
         use talpid_core::tunnel_state_machine::TunnelCommand;
-        let command = self
-            .runtime
-            .continue_connect(&mut self.continuation, &self.policy, self.target)
-            .await?;
+        let command = self.runtime.continue_connect(&mut self.continuation);
         let command = command.map(|command| match command {
             TunnelCommand::Connect => "Connect",
             TunnelCommand::Disconnect => "Disconnect",
@@ -1788,6 +2061,7 @@ impl Handover {
         self.runtime
             .update(&self.policy, self.target, self.phase)
             .await;
+        self.settle_capture().await;
         assert_eq!(
             self.runtime.status().forwarding,
             if self.policy.announced_routes().is_empty() {
@@ -1796,6 +2070,27 @@ impl Handover {
                 ForwardingAvailability::Active
             }
         );
+    }
+
+    async fn settle_capture(&mut self) {
+        bounded(async {
+            loop {
+                self.runtime
+                    .owner_changed(&self.policy, self.target, self.phase);
+                self.runtime
+                    .internal_update(&self.policy, self.target, self.phase)
+                    .await;
+                if self.runtime.capture_configuration_ready() {
+                    break;
+                }
+                let (_, owner, broker) = self.runtime.notifications();
+                tokio::select! {
+                    _ = owner => {},
+                    _ = broker => {},
+                }
+            }
+        })
+        .await;
     }
 
     fn user_disconnect(&mut self) {
@@ -1884,6 +2179,22 @@ async fn startup_snapshot_connects_or_serves_partial_without_an_initial_transiti
             // spawn() has initialized the producer's current state, but emits
             // no initial transition. Use the same snapshot seam as Daemon::run.
             h.continuation = h.runtime.initialize_transport(h.phase);
+            assert_eq!(
+                h.runtime.broker().snapshot().mode,
+                AttachmentMode::ManagedRequired
+            );
+            assert_eq!(
+                h.runtime.broker().local_routes(),
+                h.policy
+                    .announced_routes()
+                    .iter()
+                    .map(|cidr| cidr.network())
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                !h.runtime.has_owner(),
+                "startup selection established a capture"
+            );
             if target == TargetState::Secured {
                 h.continuation.connect();
             }
@@ -1934,8 +2245,8 @@ async fn coalesced_handover_keeps_reconnect_until_join_unless_user_disconnects()
             h.connect_endpoint().await;
             assert_eq!(
                 h.platform.starts.load(SeqCst),
-                2,
-                "blocking reader then actual target projection, including rules off"
+                if original.enabled { 2 } else { 1 },
+                "only Local Partial then actual target; rules off opens the target once"
             );
             h.commands.clear();
             h.policy = original.clone();
@@ -1951,7 +2262,7 @@ async fn coalesced_handover_keeps_reconnect_until_join_unless_user_disconnects()
             );
             assert!(h.transport.as_ref().unwrap().control.current());
             h.continuation.connect();
-            assert_eq!(h.advance().await.unwrap(), Some("Disconnect"));
+            assert_eq!(h.advance().await.unwrap(), Some("Connect"));
             h.observe(TunnelPhase::Disconnecting);
             // An ordinary settings event returns to A before the transport joins.
             h.policy = original;
@@ -1960,18 +2271,25 @@ async fn coalesced_handover_keeps_reconnect_until_join_unless_user_disconnects()
                 h.user_disconnect();
                 assert_eq!(h.advance().await.unwrap(), None);
             }
-            h.acknowledge_transport_close();
+            if user_disconnect {
+                h.acknowledge_transport_close();
+            } else {
+                h.transport.take();
+                h.request.take();
+                h.commands.push("Joined");
+                h.observe(TunnelPhase::Connecting);
+            }
             if user_disconnect {
                 assert_eq!(h.advance().await.unwrap(), None);
             } else {
                 assert_eq!(
-                    h.admit().await,
-                    Some("Connect"),
+                    h.advance().await.unwrap(),
+                    None,
                     "coalesced direction {direction}"
                 );
             }
             if user_disconnect {
-                assert_eq!(h.commands, ["Disconnect", "Disconnect", "Joined"]);
+                assert_eq!(h.commands, ["Connect", "Disconnect", "Joined"]);
                 if !h.policy.announced_routes().is_empty() {
                     bounded(h.runtime.notifications().1).await;
                     h.runtime.owner_changed(&h.policy, h.target, h.phase);
@@ -1983,7 +2301,7 @@ async fn coalesced_handover_keeps_reconnect_until_join_unless_user_disconnects()
                     assert_eq!(h.runtime.status().forwarding, ForwardingAvailability::Off);
                 }
             } else {
-                assert_eq!(h.commands, ["Disconnect", "Joined", "Connect"]);
+                assert_eq!(h.commands, ["Connect", "Joined"]);
                 h.connect_endpoint().await;
             }
             h.close().await;
@@ -2025,11 +2343,11 @@ async fn managed_teardown_revokes_now_but_releases_only_after_transport_join() {
             let mut h = Handover::new(policy());
             h.continuation.connect();
             assert_eq!(h.admit().await, Some("Connect"));
+            h.settle_capture().await;
             let initial_generation = h.platform.generation.load(SeqCst);
             let mut target = assigned_config();
             target.allow_lan = allow_lan;
             h.connect_endpoint_with(target).await;
-            bounded(h.runtime.notifications().1).await;
             h.wait_for_capture_release(initial_generation).await;
             if trigger != "shutdown" {
                 verify_live_router_change(h, trigger, fail_release, allow_lan).await;
@@ -2155,9 +2473,9 @@ async fn managed_teardown_revokes_now_but_releases_only_after_transport_join() {
     let mut h = Handover::new(policy());
     h.continuation.connect();
     h.admit().await;
+    h.settle_capture().await;
     let initial_generation = h.platform.generation.load(SeqCst);
     h.connect_endpoint().await;
-    bounded(h.runtime.notifications().1).await;
     h.wait_for_capture_release(initial_generation).await;
     h.commands.clear();
     h.platform.fail_release.store(true, SeqCst);
@@ -2364,6 +2682,7 @@ async fn joined_internal_transport_retry_replaces_capture_without_a_tsm_handover
     let mut h = Handover::new(policy());
     h.continuation.connect();
     assert_eq!(h.admit().await, Some("Connect"));
+    h.settle_capture().await;
     let initial_generation = h.platform.generation.load(SeqCst);
     h.connect_endpoint().await;
     h.wait_for_capture_release(initial_generation).await;

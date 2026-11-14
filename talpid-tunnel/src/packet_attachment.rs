@@ -37,6 +37,14 @@ pub enum AttachmentError {
     Invalid,
 }
 
+impl std::fmt::Display for AttachmentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Managed packet attachment: {self:?}")
+    }
+}
+
+impl std::error::Error for AttachmentError {}
+
 impl From<RelayFlowError> for AttachmentError {
     fn from(error: RelayFlowError) -> Self {
         match error {
@@ -863,8 +871,8 @@ impl AttachmentBroker {
         self.inner.replies.notify_one();
     }
 
-    /// Admit a new target only after the actor has observed joined teardown and
-    /// a usable blocking capture. This does not revive any retired attempt.
+    /// Release an explicit admission stop for a new Connect. The TSM owns old
+    /// target cleanup; this does not revive any retired attempt or await capture.
     pub fn resume_transport(&self) -> Result<(), AttachmentError> {
         let mut state = self.inner.state.lock().expect("attachment state");
         if state.closed {

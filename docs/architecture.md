@@ -306,6 +306,13 @@ DNS and LAN subtraction use the upstream projection once; DNS resolvers are not
 globally recaptured or reserved from an explicit Local rule. Mullvad's real gateway
 and SOCKS exceptions remain reserved.
 
+Managed selection and current Local routes are initialized before tunnel startup.
+Normal Connect/Reconnect commands go directly to the upstream tunnel state machine;
+they neither pause target admission nor wait for a blocking capture. A pending
+target request owns capture configuration/readiness. Explicit Disconnect and
+shutdown still revoke Mullvad admission, with exact-request cleanup and joined
+descriptor release; eligible Local sessions remain independent.
+
 Capture admission and classification select Local, a tunnel target or Drop.
 Tunnel targets translate each received packet or fragment immediately, using
 address checksum deltas; they do not reassemble, remember fragment identities
