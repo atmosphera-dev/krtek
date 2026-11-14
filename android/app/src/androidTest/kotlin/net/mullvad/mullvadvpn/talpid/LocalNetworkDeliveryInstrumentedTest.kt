@@ -1725,15 +1725,17 @@ class LocalNetworkDeliveryInstrumentedTest {
     private fun setPolicy(repository: SettingsRepository, policy: LocalNetworkAccess) =
         runBlocking {
             val current = checkNotNull(repository.settingsUpdates.value).localNetworkAccess
-            val revision = checkNotNull(repository.localNetworkStatus.value).revision
             assertTrue(repository.setLocalNetworkAccess(policy, current).isRight())
             withTimeout(10_000) {
                 repository.settingsUpdates.first { it?.localNetworkAccess == policy }
             }
-            if (current != policy)
-                withTimeout(30_000) {
-                    repository.localNetworkStatus.filterNotNull().first { it.revision > revision }
+            // Status revisions describe semantic status, not every policy edit.
+            // A covered CIDR edit can leave the same rule rows and ready capture.
+            withTimeout(30_000) {
+                repository.localNetworkStatus.filterNotNull().first { status ->
+                    status.rules.map { it.id } == policy.rules.map { it.id }
                 }
+            }
         }
 
     private fun disconnect(connection: ConnectionProxy) = runBlocking {
@@ -1996,13 +1998,64 @@ class LocalNetworkDeliveryInstrumentedTest {
                             }
                     )
                 setPolicy(repository, announced)
-                val added = connectedProof(consumer, repository, connection, before.generation)
-                assertNotEquals(before.generation, added.generation)
-                assertEquals(before.routes + "10.0.2.99/32", added.routes)
+                val added = connectedProof(consumer, repository, connection)
+                assertEquals(before, added, "Default-covered CIDRs reuse the entire capture")
+
+                // The peer must become newly authorized by the added rule, not
+                // keep replying through its original rule or the Mullvad path.
+                val withoutPeer =
+                    policy.copy(
+                        rules =
+                            policy.rules.map {
+                                it.copy(
+                                    id = UUID.randomUUID(),
+                                    cidrs =
+                                        listOf(
+                                            checkNotNull(
+                                                LocalCidr.parse("10.0.2.99/32").getOrNull()
+                                            )
+                                        ),
+                                )
+                            }
+                    )
+                setPolicy(repository, withoutPeer)
+                assertEquals(
+                    before,
+                    appliedConfiguration(withoutPeer, ForwardingAvailability.Active, "Connected"),
+                )
+                listOf("tcp", "udp").forEach { probeSocket(consumer, it, "blocked") }
+                val previousRevision = checkNotNull(repository.localNetworkStatus.value).revision
+                val peerRule = policy.rules.single().copy(id = UUID.randomUUID())
+                val newRule = withoutPeer.copy(rules = withoutPeer.rules + peerRule)
+                setPolicy(repository, newRule)
+                val newStatus =
+                    awaitState(
+                        repository,
+                        connection,
+                        ForwardingAvailability.Active,
+                        LocalRuleState.Forwarding,
+                        "Connected",
+                    )
+                assertTrue(newStatus.revision > previousRevision, "A new rule row is published")
+                assertEquals(newRule.rules.map { it.id }, newStatus.rules.map { it.id })
+                assertEquals(
+                    before,
+                    connectedProof(consumer, repository, connection),
+                    "Newly authorized TCP/UDP delivery does not require a new capture",
+                )
+                report("new_rule_destination_delivered", peer)
+                report(
+                    "new_rule_status_revision",
+                    "before=$previousRevision,after=${newStatus.revision}",
+                )
+                report("covered_route_reuses_capture", true)
                 setPolicy(repository, policy)
-                val restoredRoutes =
-                    connectedProof(consumer, repository, connection, added.generation)
-                assertEquals(before.routes, restoredRoutes.routes)
+                val restoredRoutes = connectedProof(consumer, repository, connection)
+                assertEquals(
+                    before,
+                    restoredRoutes,
+                    "Removing covered CIDRs retains capture identity",
+                )
 
                 runBlocking {
                     assertTrue(repository.setLocalNetworkSharing(!original.allowLan).isRight())

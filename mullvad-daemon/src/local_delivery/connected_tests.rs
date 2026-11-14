@@ -1211,6 +1211,68 @@ struct Handover {
 }
 
 #[tokio::test]
+async fn status_revisions_follow_rule_status_not_covered_route_edits() {
+    use mullvad_types::settings::local_network_access::status::{InactiveReason, RuleState};
+
+    let mut h = Handover::new(policy());
+    h.continuation.connect();
+    assert_eq!(h.admit().await, Some("Connect"));
+    h.connect_endpoint().await;
+    let before = h.runtime.status().clone();
+    let generation = h.runtime.broker().snapshot().capture_generation;
+    let starts = h.platform.starts.load(SeqCst);
+    h.policy.rules[0]
+        .cidrs
+        .push("10.0.2.99/32".parse().unwrap());
+    let covered = h.runtime.update(&h.policy, h.target, h.phase).await;
+    assert!(
+        covered.is_none(),
+        "Unchanged semantic status is not republished"
+    );
+    assert_eq!(h.runtime.status(), &before);
+    assert_eq!(h.platform.starts.load(SeqCst), starts);
+    assert_eq!(h.runtime.broker().snapshot().capture_generation, generation);
+
+    let mut added = h.policy.rules[0].clone();
+    added.id = "00000000-0000-0000-0000-000000000002".parse().unwrap();
+    h.policy.rules.push(added);
+    let added = h
+        .runtime
+        .update(&h.policy, h.target, h.phase)
+        .await
+        .expect("Adding a rule row must publish even when capture is reused");
+    assert_eq!(added.revision, before.revision + 1);
+    assert_eq!(added.rules.len(), 2);
+    for (status, rule) in added.rules.iter().zip(&h.policy.rules) {
+        assert_eq!(status.id, rule.id);
+        assert_eq!(status.state, RuleState::Forwarding);
+    }
+    h.policy.rules[1].enabled = false;
+    let disabled = h
+        .runtime
+        .update(&h.policy, h.target, h.phase)
+        .await
+        .expect("Changed rule state must publish independently of capture reuse");
+    assert_eq!(disabled.revision, added.revision + 1);
+    assert_eq!(disabled.rules[0].state, RuleState::Forwarding);
+    assert_eq!(
+        disabled.rules[1].state,
+        RuleState::Inactive(InactiveReason::RuleOff)
+    );
+    h.policy.rules.pop();
+    let removed = h
+        .runtime
+        .update(&h.policy, h.target, h.phase)
+        .await
+        .expect("Removing a rule row must publish");
+    assert_eq!(removed.revision, disabled.revision + 1);
+    assert_eq!(removed.rules, before.rules);
+    assert_eq!(h.platform.starts.load(SeqCst), starts);
+    assert_eq!(h.runtime.broker().snapshot().capture_generation, generation);
+    h.close().await;
+}
+
+#[tokio::test]
 async fn second_settings_reconnect_cannot_close_queued_target_admission() {
     use talpid_tunnel::tun_provider::transport::ManagedTun;
 
