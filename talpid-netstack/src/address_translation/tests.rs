@@ -218,7 +218,7 @@ fn wire_receivers_see_assigned_source_fixed_destination_and_unchanged_tuple() {
 }
 
 #[test]
-fn checksum_seeds_bad_checksums_and_ipv6_udp_zero_are_not_wire_packets() {
+fn checksum_values_do_not_establish_plain_tun_representation() {
     let (mut mapper, _capture, _attempt, _) = mapper();
     for v4 in [true, false] {
         for protocol in [6, 17, if v4 { 1 } else { 58 }] {
@@ -230,18 +230,18 @@ fn checksum_seeds_bad_checksums_and_ipv6_udp_zero_are_not_wire_packets() {
                 _ => 2,
             };
             bytes[offset + field..offset + field + 2].copy_from_slice(&[0x12, 0x34]);
-            assert!(matches!(
-                mapper.translate(&bytes, Direction::Outbound),
-                Err(TranslationError::Checksum)
-            ));
+            let residual = wire_checksum(&bytes, offset, protocol);
+            let output = mapper.translate(&bytes, Direction::Outbound).unwrap();
+            assert_eq!(
+                wire_checksum(output.view().bytes(), offset, protocol),
+                residual
+            );
         }
     }
     let mut bytes = packet(address(FIXED, false), remote(false), 17, &segment(17));
     bytes[46..48].fill(0);
-    assert!(matches!(
-        mapper.translate(&bytes, Direction::Outbound),
-        Err(TranslationError::Checksum)
-    ));
+    let output = mapper.translate(&bytes, Direction::Outbound).unwrap();
+    assert_eq!(&output.view().bytes()[46..48], &[0, 0]);
 }
 
 #[test]
@@ -271,11 +271,11 @@ fn udp_zero_is_preserved_in_ipv4_and_computed_zero_is_encoded_as_ffff() {
 }
 
 #[test]
-fn gre_esp_sctp_payloads_are_opaque_and_unknown_or_ah_are_counted_precisely() {
+fn opaque_protocols_pass_and_only_changed_ah_is_counted_as_unrepresentable() {
     let (mut mapper, _capture, _attempt, _) = mapper();
     for v4 in [true, false] {
         let offset = if v4 { 20 } else { 40 };
-        for protocol in [47, 50, 132] {
+        for protocol in [47, 50, 132, 253] {
             let original = packet(address(FIXED, v4), remote(v4), protocol, &segment(protocol));
             let translated = mapper.translate(&original, Direction::Outbound).unwrap();
             assert_eq!(&translated.view().bytes()[offset..], &original[offset..]);
@@ -289,19 +289,17 @@ fn gre_esp_sctp_payloads_are_opaque_and_unknown_or_ah_are_counted_precisely() {
                 )
             );
         }
-        for protocol in [51, 253] {
-            let original = packet(address(FIXED, v4), remote(v4), protocol, &segment(protocol));
-            assert!(matches!(
-                mapper.translate(&original, Direction::Outbound),
-                Err(TranslationError::UnsupportedTranslation)
-            ));
-        }
+        let original = packet(address(FIXED, v4), remote(v4), 51, &segment(51));
+        assert!(matches!(
+            mapper.translate(&original, Direction::Outbound),
+            Err(TranslationError::UnsupportedTranslation)
+        ));
     }
     assert_eq!(
         mapper
             .summary()
             .refused(TranslationError::UnsupportedTranslation),
-        4
+        2
     );
     assert_eq!(
         mapper.summary().refused(TranslationError::BackendRefused),
@@ -378,7 +376,7 @@ fn quoted_errors_translate_both_directions_without_inventing_absent_tcp_bytes() 
 }
 
 #[test]
-fn quotation_wrong_endpoint_nested_error_bad_length_and_truncations_refuse_without_panics() {
+fn quotation_nonmatching_and_nested_packets_pass_with_safe_truncation_bounds() {
     let (mut mapper, _capture, _attempt, _) = mapper();
     for v4 in [true, false] {
         let protocol = if v4 { 1 } else { 58 };
@@ -386,25 +384,26 @@ fn quotation_wrong_endpoint_nested_error_bad_length_and_truncations_refuse_witho
         let mut error = vec![if v4 { 3 } else { 2 }, 0, 0, 0, 0, 0, 5, 0];
         error.extend_from_slice(&quote);
         let bytes = packet(remote(v4), address(ASSIGNED, v4), protocol, &error);
-        assert!(matches!(
-            mapper.translate(&bytes, Direction::Inbound),
-            Err(TranslationError::Endpoint)
-        ));
+        let output = mapper.translate(&bytes, Direction::Inbound).unwrap();
+        let ip = if v4 { 20 } else { 40 };
+        assert_eq!(&output.view().bytes()[ip + 8..], &quote);
+        assert_eq!(wire_checksum(output.view().bytes(), ip, protocol), 0);
         for length in 0..bytes.len() {
-            assert!(
-                mapper
-                    .translate(&bytes[..length], Direction::Inbound)
-                    .is_err()
-            );
+            let output = mapper.translate(&bytes[..length], Direction::Inbound);
+            if length < ip {
+                assert!(output.is_err());
+            }
+            if let Ok(output) = output {
+                assert_eq!(output.view().bytes().len(), length);
+            }
         }
         let nested = packet(address(ASSIGNED, v4), remote(v4), protocol, &error);
         let mut outer_error = vec![if v4 { 3 } else { 2 }, 0, 0, 0, 0, 0, 5, 0];
         outer_error.extend_from_slice(&nested);
         let outer = packet(remote(v4), address(ASSIGNED, v4), protocol, &outer_error);
-        assert!(matches!(
-            mapper.translate(&outer, Direction::Inbound),
-            Err(TranslationError::UnsupportedTranslation)
-        ));
+        let output = mapper.translate(&outer, Direction::Inbound).unwrap();
+        assert_eq!(wire_checksum(output.view().bytes(), ip, protocol), 0);
+        assert_eq!(&output.view().bytes()[ip + 8 + ip + 8..], &quote);
     }
 }
 
@@ -434,10 +433,9 @@ fn ipv4_options_and_ipv6_hop_destination_and_inactive_routing_headers_survive() 
     assert_eq!(&translated.view().bytes()[40..64], &v6[40..64]);
     assert_eq!(wire_checksum(translated.view().bytes(), 64, 17), 0);
     v6[59] = 1;
-    assert!(matches!(
-        mapper.translate(&v6, Direction::Outbound),
-        Err(TranslationError::UnsupportedTranslation)
-    ));
+    let output = mapper.translate(&v6, Direction::Outbound).unwrap();
+    assert_eq!(&output.view().bytes()[40..64], &v6[40..64]);
+    assert_eq!(wire_checksum(output.view().bytes(), 64, 17), 0);
 }
 
 #[test]

@@ -35,4 +35,11 @@ impl TargetPacketPath {
     ) -> Result<RelayPacket, TranslationError> {
         self.mapper.translate(bytes, direction)
     }
+    pub fn process_owned(
+        &mut self,
+        packet: RelayPacket,
+        direction: Direction,
+    ) -> Result<RelayPacket, TranslationError> {
+        self.mapper.translate_owned(packet, direction)
+    }
 }

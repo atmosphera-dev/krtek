@@ -619,11 +619,16 @@ fn transit_short_first_has_no_tombstone() {
             body.extend_from_slice(&[0x65; 64]);
             let whole = packet(source, destination, 6, &body);
             let tiny = source_fragments(&whole, 8, 40).remove(0);
-            assert!(matches!(
-                path.process(&tiny, direction),
-                Err(TranslationError::ShortHeader)
-            ));
-            assert_eq!(path.summary().refused(TranslationError::ShortHeader), 1);
+            if v4 {
+                assert_eq!(forward(&mut path, &tiny, direction).len(), 1);
+                assert_eq!(path.summary().refused(TranslationError::ShortHeader), 0);
+            } else {
+                assert!(matches!(
+                    path.process(&tiny, direction),
+                    Err(TranslationError::ShortHeader)
+                ));
+                assert_eq!(path.summary().refused(TranslationError::ShortHeader), 1);
+            }
             let valid = source_fragments(&whole, 24, 40);
             assert_eq!(forward(&mut path, &valid[1], direction).len(), 1);
             assert_eq!(forward(&mut path, &valid[0], direction).len(), 1);
@@ -636,10 +641,7 @@ fn transit_short_first_has_no_tombstone() {
             } else {
                 overflow[42..44].copy_from_slice(&0xfff9u16.to_be_bytes());
             }
-            assert!(matches!(
-                path.process(&overflow, direction),
-                Err(TranslationError::Malformed)
-            ));
+            assert_eq!(forward(&mut path, &overflow, direction).len(), 1);
             assert_eq!(forward(&mut path, &valid[0], direction).len(), 1);
         }
     }

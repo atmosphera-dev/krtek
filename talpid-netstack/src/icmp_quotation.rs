@@ -1,198 +1,315 @@
-//! A quotation is a view of the original packet, never a zero-padded datagram.
-//! Only complete fields present on the wire are updated. Nested errors are
-//! refused rather than recursing through attacker-controlled quotations.
+//! Parse once into rewrite locations. Nested quotations are walked iteratively;
+//! their description storage is byte-credited and depth is bounded by input.
 use crate::address_translation::{
-    Direction, Header, ParseContext, TranslationError, address_bytes, adjusted, checksum_field,
-    is_icmp_error, rewrite_endpoint, word,
+    Header, ParseContext, TargetConfig, TranslationError, address_bytes, adjusted, checksum_offset,
+    ip_address, is_icmp_error, word,
 };
-use std::net::IpAddr;
+use std::{mem::size_of, net::IpAddr, sync::Arc};
+use talpid_types::relay_flow::{BUFFER_OVERHEAD, RelayBufferAllocator, RelayBufferReservation};
 
-pub(crate) struct Quotation {
+struct Layer {
     start: usize,
+    end: usize,
     header: Header,
     source: bool,
+    base_swap: bool,
+    pseudo_swap: bool,
+    old: IpAddr,
+    new: IpAddr,
     checksum: Option<usize>,
+    required_checksum_end: Option<usize>,
+    address_checksum: bool,
+}
+
+pub(crate) struct PacketRewrite {
+    outer: Layer,
+    quotes: Vec<Layer>,
+    _charge: Option<Arc<dyn RelayBufferReservation>>,
+}
+
+impl Layer {
+    fn inspect(
+        bytes: &[u8],
+        start: usize,
+        source: bool,
+        config: TargetConfig,
+        context: ParseContext,
+    ) -> Result<Self, TranslationError> {
+        let base = Header::base(bytes)?;
+        let address = |sources: talpid_types::relay_flow::RelaySources| {
+            if base.ipv4 {
+                sources.ipv4.map(IpAddr::V4)
+            } else {
+                sources.ipv6.map(IpAddr::V6)
+            }
+        };
+        // Source/destination alternate in quotes; old -> new does not.
+        let (old, new) = match (address(config.fixed), address(config.assigned)) {
+            (Some(old), Some(new)) => (old, new),
+            _ => (base.source, base.source),
+        };
+        let actual = if source {
+            base.source
+        } else {
+            base.destination
+        };
+        let base_swap = old != new && actual == old;
+        let base_checksum = checksum_offset(&base, bytes);
+        let base_dependent = base_checksum.is_some() && !(base.ipv4 && base.protocol == 1);
+        // An unlocatable no-swap packet is opaque native input. There is no
+        // changed field whose access could justify rejecting it.
+        let header = match base.clone().locate(bytes, context) {
+            Ok(header) => header,
+            Err(_)
+                if !base_swap
+                    || (base.ipv4
+                        && (source || (!base_dependent && !is_icmp_error(bytes, &base)))) =>
+            {
+                let mut opaque = base;
+                // IPv4 source deltas do not depend on destination options.
+                // Even a bad option length cannot hide the IHL-located word.
+                opaque.transport_known = source
+                    && opaque.ipv4
+                    && opaque.transport >= 20
+                    && opaque.transport <= bytes.len().min(opaque.declared);
+                opaque
+            }
+            Err(error) => return Err(error),
+        };
+        let pseudo = if source {
+            header.pseudo_source
+        } else {
+            header.pseudo_destination
+        };
+        let pseudo_swap = old != new
+            && pseudo.is_some_and(|offset| ip_address(bytes, offset, header.ipv4) == old);
+        let field = checksum_offset(&header, bytes);
+        let dependent = field.is_some() && !(header.ipv4 && header.protocol == 1);
+        if (base_swap || pseudo_swap) && header.protocol == 51 {
+            return Err(TranslationError::UnsupportedTranslation); // AH covers changed addresses, key unavailable.
+        }
+        if base_swap && dependent && pseudo.is_none() {
+            return Err(TranslationError::UnsupportedTranslation); // Unavailable routed/Home Address pseudo-endpoint.
+        }
+        let mut checksum = None;
+        let mut required_checksum_end = None;
+        if header.transport_known
+            && let Some(field) = field
+        {
+            // IPv4 fragment offsets unambiguously locate even a TCP checksum
+            // in a later fragment. IPv6 tails may start inside extensions.
+            let fragment_offset = if header.ipv4 {
+                header.fragment.map_or(0, |fragment| fragment.offset)
+            } else {
+                0
+            };
+            if (!header.non_initial || header.ipv4)
+                && !(header.non_initial && header.protocol == 1)
+                && let Some(relative) = field.checked_sub(fragment_offset)
+            {
+                let offset = header.transport + relative;
+                required_checksum_end = Some(offset + 2);
+                let end = bytes.len().min(header.declared);
+                if offset + 2 <= end {
+                    checksum = Some(offset);
+                } else if pseudo_swap
+                    && context == ParseContext::Received
+                    && (!header.ipv4 || !header.partial() || offset < end)
+                {
+                    return Err(TranslationError::ShortHeader);
+                }
+            }
+        }
+        Ok(Self {
+            start,
+            end: start + bytes.len().min(header.declared),
+            header,
+            source,
+            base_swap,
+            pseudo_swap,
+            old,
+            new,
+            checksum,
+            required_checksum_end,
+            address_checksum: pseudo_swap && dependent,
+        })
+    }
+
+    fn apply(&self, bytes: &mut [u8], delta: &mut ChangedWords) {
+        let packet = &mut bytes[self.start..];
+        if let Some(offset) = self.checksum {
+            let previous = word(packet, offset);
+            let mut value = delta.apply(previous);
+            if self.address_checksum && !(matches!(self.header.protocol, 17 | 136) && previous == 0)
+            {
+                value = adjusted(value, &address_bytes(self.old), &address_bytes(self.new));
+                if matches!(self.header.protocol, 17 | 136) && value == 0 {
+                    value = u16::MAX;
+                }
+            }
+            delta.replace(packet, offset, &value.to_be_bytes());
+        }
+        let base = match (self.header.ipv4, self.source) {
+            (true, true) => 12,
+            (true, false) => 16,
+            (false, true) => 8,
+            (false, false) => 24,
+        };
+        let pseudo = if self.source {
+            self.header.pseudo_source
+        } else {
+            self.header.pseudo_destination
+        };
+        let previous_ip = self.header.ipv4.then(|| word(packet, 10));
+        let mut ip_delta = ChangedWords::default();
+        for offset in [
+            self.base_swap.then_some(base),
+            pseudo.filter(|offset| self.pseudo_swap && *offset != base),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let new = address_bytes(self.new);
+            ip_delta.record(&packet[offset..offset + new.len()], &new, offset);
+            delta.replace(packet, offset, &new);
+        }
+        if let Some(previous) = previous_ip {
+            let value = ip_delta.apply(previous);
+            delta.replace(packet, 10, &value.to_be_bytes());
+        }
+    }
 }
 
 pub(crate) fn inspect(
     bytes: &[u8],
-    outer: &Header,
-    direction: Direction,
-    old: IpAddr,
-    _new: IpAddr,
-) -> Result<Option<Quotation>, TranslationError> {
-    if !is_icmp_error(bytes, outer) {
-        return Ok(None);
+    source: bool,
+    mut config: TargetConfig,
+    buffers: &dyn RelayBufferAllocator,
+) -> Result<PacketRewrite, TranslationError> {
+    // Normalize old -> new once; quoting alternates the selected address side.
+    if !source {
+        std::mem::swap(&mut config.fixed, &mut config.assigned);
     }
-    let icmp = &bytes[outer.transport..];
-    let valid_code = match (outer.ipv4, icmp[0]) {
-        (true, 3) => icmp[1] <= 15,
-        (true, 11) => icmp[1] <= 1,
-        (true, 12) => icmp[1] <= 2,
-        (false, 1) => icmp[1] <= 7,
-        (false, 2) => icmp[1] == 0,
-        (false, 3) => icmp[1] <= 1,
-        (false, 4) => icmp[1] <= 2,
-        _ => false,
+    let outer = Layer::inspect(bytes, 0, source, config, ParseContext::Received)?;
+    let outer_fragmented = outer.header.partial();
+    let mut result = PacketRewrite {
+        outer,
+        quotes: Vec::new(),
+        _charge: None,
     };
-    if !valid_code {
-        return Err(TranslationError::Malformed);
-    }
-    let start = outer.transport + 8;
-    let quoted = &bytes[start..];
-    let header = Header::parse(quoted, ParseContext::Quotation).map_err(|error| {
-        if outer.partial()
-            && error == TranslationError::Malformed
-            && quoted.len() < if outer.ipv4 { 20 } else { 40 }
+    loop {
+        let parent = result.quotes.last().unwrap_or(&result.outer);
+        let view = &bytes[parent.start..parent.end];
+        if !is_icmp_error(view, &parent.header) {
+            break;
+        }
+        let start = parent.start + parent.header.transport + 8;
+        if start > parent.end {
+            if outer_fragmented && (parent.base_swap || parent.pseudo_swap) {
+                return Err(TranslationError::ShortHeader);
+            }
+            break;
+        }
+        let quoted = &bytes[start..parent.end];
+        if quoted.len()
+            < if quoted.first().is_some_and(|byte| byte >> 4 == 6) {
+                40
+            } else {
+                20
+            }
         {
-            TranslationError::ShortHeader
-        } else {
-            error
+            if outer_fragmented && (parent.base_swap || parent.pseudo_swap) {
+                return Err(TranslationError::ShortHeader);
+            }
+            break;
         }
-    })?;
-    if header.ipv4 != outer.ipv4 {
-        return Err(TranslationError::Family);
-    }
-    let source = direction == Direction::Inbound;
-    if (if source {
-        header.source
-    } else {
-        header.destination
-    }) != old
-    {
-        return Err(TranslationError::Endpoint);
-    }
-    // An outbound error returns to the sender of the quoted incoming packet.
-    if !source && header.source != outer.destination {
-        return Err(TranslationError::Endpoint);
-    }
-    let available = quoted.len().min(header.declared);
-    if header.transport_known && !header.non_initial {
-        if is_icmp_error(&quoted[..available], &header) {
-            return Err(TranslationError::UnsupportedTranslation);
-        }
-        let transport = &quoted[header.transport..available];
-        let minimum = match header.protocol {
-            6 => 20,
-            1 | 17 | 58 | 50 => 8,
-            47 => 4,
-            132 => 12,
-            _ => 0,
-        };
-        if !header.partial() && header.declared - header.transport < minimum {
-            return Err(TranslationError::Malformed);
-        }
-        match header.protocol {
-            6 => {
-                if (!header.partial() && header.declared < header.transport + 20)
-                    || (transport.len() > 12
-                        && (transport[12] >> 4 < 5
-                            || (!header.partial()
-                                && usize::from(transport[12] >> 4) * 4
-                                    > header.declared - header.transport)))
-                {
-                    return Err(TranslationError::Malformed);
-                }
-            }
-            17 if transport.len() >= 6
-                && !header.partial()
-                && usize::from(word(transport, 4)) != header.declared - header.transport =>
-            {
-                return Err(TranslationError::Malformed);
-            }
-            17 if transport.len() >= 6 && word(transport, 4) < 8 => {
-                return Err(TranslationError::Malformed);
-            }
-            1 if header.ipv4
-                && ((!transport.is_empty() && !matches!(transport[0], 0 | 8 | 13..=18))
-                    || (transport.len() >= 2 && transport[1] != 0)) =>
-            {
-                return Err(TranslationError::UnsupportedTranslation);
-            }
-            58 if !header.ipv4
-                && ((!transport.is_empty() && !matches!(transport[0], 128 | 129))
-                    || (transport.len() >= 2 && transport[1] != 0)) =>
-            {
-                return Err(TranslationError::UnsupportedTranslation);
-            }
-            _ => (),
-        }
-        if header.protocol == 17 && !header.ipv4 && transport.len() >= 8 && word(transport, 6) == 0
+        if !quoted
+            .first()
+            .is_some_and(|byte| matches!(byte >> 4, 4 | 6))
         {
-            return Err(TranslationError::Checksum);
+            break;
         }
+        let layer = Layer::inspect(
+            quoted,
+            start,
+            !parent.source,
+            config,
+            ParseContext::Quotation,
+        )?;
+        if outer_fragmented
+            && (layer.base_swap || layer.pseudo_swap)
+            && ((!layer.header.transport_known
+                && (!layer.header.ipv4 || layer.address_checksum || layer.header.protocol == 1))
+                || (layer.address_checksum
+                    && layer.checksum.is_none()
+                    && layer
+                        .required_checksum_end
+                        .is_some_and(|end| end <= layer.header.declared)))
+        {
+            return Err(TranslationError::ShortHeader);
+        }
+        if result._charge.is_none() {
+            // Each additional layer consumes >=20 IP + 8 ICMP bytes. This is
+            // packet-derived capacity, not an extension/depth admission quota.
+            let capacity = bytes.len() / 28 + 1;
+            result._charge =
+                Some(buffers.try_reserve(capacity * size_of::<Layer>() + BUFFER_OVERHEAD)?);
+            result.quotes = Vec::with_capacity(capacity);
+            if result.quotes.capacity() * size_of::<Layer>() + BUFFER_OVERHEAD
+                > result._charge.as_ref().unwrap().bytes()
+            {
+                return Err(TranslationError::Full);
+            }
+        }
+        result.quotes.push(layer);
     }
-    let checksum = checksum_field(&header, quoted)?;
-    // A complete outer message may legally quote a truncated original. A first
-    // outer fragment cannot omit a field that will arrive later and need a
-    // rewrite: the tail is deliberately opaque and there is no retained state.
-    if outer.partial()
-        && (!header.transport_known
-            || (!header.non_initial
-                && matches!(header.protocol, 6 | 17 | 1 | 58)
-                && checksum.is_none()))
-    {
-        return Err(TranslationError::ShortHeader);
-    }
-    Ok(Some(Quotation {
-        start,
-        header,
-        source,
-        checksum,
-    }))
+    Ok(result)
 }
 
-/// At most eight endpoint words, one IPv4 header word and one L4 word change.
-/// The delta is bounded stack data, not a copy/recalculation of the ICMP body.
-pub(crate) struct ChangedWords {
-    old: [u8; 20],
-    new: [u8; 20],
-    length: usize,
+impl PacketRewrite {
+    pub(crate) fn apply(&self, bytes: &mut [u8]) {
+        let mut delta = ChangedWords::default();
+        for layer in self.quotes.iter().rev().chain(std::iter::once(&self.outer)) {
+            layer.apply(bytes, &mut delta);
+        }
+    }
+}
+
+/// Additive one's-complement delta. Fold after each record so arbitrarily deep
+/// present quotations need neither recursion nor a growing changed-word array.
+#[derive(Default)]
+struct ChangedWords {
+    sum: u32,
 }
 
 impl ChangedWords {
-    fn record(&mut self, old: &[u8], new: &[u8]) {
-        let end = self.length + old.len();
-        self.old[self.length..end].copy_from_slice(old);
-        self.new[self.length..end].copy_from_slice(new);
-        self.length = end;
-    }
-
-    pub(crate) fn apply(&self, value: u16) -> u16 {
-        adjusted(value, &self.old[..self.length], &self.new[..self.length])
-    }
-}
-
-pub(crate) fn rewrite(
-    bytes: &mut [u8],
-    quote: &Quotation,
-    old: IpAddr,
-    new: IpAddr,
-) -> Result<ChangedWords, TranslationError> {
-    let quoted = &mut bytes[quote.start..];
-    let mut delta = ChangedWords {
-        old: [0; 20],
-        new: [0; 20],
-        length: 0,
-    };
-    if let Some(offset) = quote.checksum {
-        let previous = word(quoted, offset);
-        if !(quote.header.ipv4
-            && (quote.header.protocol == 1 || (quote.header.protocol == 17 && previous == 0)))
-        {
-            let mut value = adjusted(previous, &address_bytes(old), &address_bytes(new));
-            if quote.header.protocol == 17 && value == 0 {
-                value = u16::MAX;
-            }
-            quoted[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
-            delta.record(&previous.to_be_bytes(), &value.to_be_bytes());
+    fn record(&mut self, old: &[u8], new: &[u8], offset: usize) {
+        for (old, new) in old.chunks_exact(2).zip(new.chunks_exact(2)) {
+            // Source-route option addresses can start on an odd byte. Their
+            // wire/header delta is byte-rotated; pseudoheader addresses are not.
+            let old = u16::from_be_bytes([old[0], old[1]])
+                .rotate_right(if offset.is_multiple_of(2) { 0 } else { 8 });
+            let new = u16::from_be_bytes([new[0], new[1]])
+                .rotate_right(if offset.is_multiple_of(2) { 0 } else { 8 });
+            self.sum += u32::from(!old);
+            self.sum += u32::from(new);
+            self.sum = (self.sum & 0xffff) + (self.sum >> 16);
         }
     }
-    let old_ip_checksum = quote.header.ipv4.then(|| word(quoted, 10));
-    rewrite_endpoint(quoted, &quote.header, quote.source, new)?;
-    delta.record(&address_bytes(old), &address_bytes(new));
-    if let Some(previous) = old_ip_checksum {
-        delta.record(&previous.to_be_bytes(), &word(quoted, 10).to_be_bytes());
+    fn replace(&mut self, bytes: &mut [u8], offset: usize, new: &[u8]) {
+        if &bytes[offset..offset + new.len()] != new {
+            self.record(&bytes[offset..offset + new.len()], new, offset);
+            bytes[offset..offset + new.len()].copy_from_slice(new);
+        }
     }
-    Ok(delta)
+    fn apply(&self, value: u16) -> u16 {
+        if self.sum == 0 || self.sum == 0xffff {
+            return value;
+        }
+        let mut sum = u32::from(!value) + self.sum;
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
 }

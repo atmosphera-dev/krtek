@@ -1,11 +1,10 @@
-//! One-to-one address translation owned by one tunnel target attempt.
+//! Stateless one-to-one address rewrites owned by one tunnel attempt.
 //!
-//! Input is one plain IP wire packet (possibly a fragment), with wire checksums,
-//! not a TUN PI, virtio/GSO object or partial checksum seed. Platform capture
-//! admission must establish that representation before this boundary. Local
-//! bypasses it.
-//! ESP is opaque passthrough (tunnel-mode IPsec works; transport mode without
-//! NAT-T is not supported). NAT-T UDP 4500 uses the ordinary UDP path.
+//! Capture establishes plain TUN bytes (no PI, virtio/GSO or partial checksum
+//! metadata). Checksum *values* do not establish that representation. Endpoints,
+//! not this adapter, validate incoming checksums, flags and transport messages.
+//! ESP stays opaque: tunnel mode works; encrypted transport-mode pseudoheaders
+//! cannot be repaired without the SA. NAT-T uses the ordinary UDP rewrite.
 use std::{net::IpAddr, sync::Arc};
 use talpid_types::relay_flow::{
     BUFFER_OVERHEAD, MAX_RELAY_PACKET_SIZE, RelayAttempt, RelayBuffer, RelayBufferAllocator,
@@ -84,8 +83,6 @@ impl AddressTranslator {
         buffers: Arc<dyn RelayBufferAllocator>,
     ) -> Result<Self, TranslationError> {
         if config.target_id == 0
-            || config.mtu < 68
-            || (config.assigned.ipv6.is_some() && config.mtu < 1280)
             || (config.assigned.ipv4.is_none() && config.assigned.ipv6.is_none())
             || (config.assigned.ipv4.is_some() && config.fixed.ipv4.is_none())
             || (config.assigned.ipv6.is_some() && config.fixed.ipv6.is_none())
@@ -110,7 +107,6 @@ impl AddressTranslator {
         &self.summary
     }
 
-    /// Call only for a real refusal by the selected backend, after translation.
     pub fn backend_refused(&mut self) {
         self.summary.refuse(TranslationError::BackendRefused);
     }
@@ -120,9 +116,34 @@ impl AddressTranslator {
         bytes: &[u8],
         direction: Direction,
     ) -> Result<RelayPacket, TranslationError> {
-        let result = self
-            .translate_buffer(bytes, direction)
-            .and_then(|bytes| self.attempt.packet(bytes).map_err(TranslationError::from));
+        let result = (|| {
+            let rewrite = self.inspect(bytes, direction)?;
+            let mut output = RelayBuffer::copy_from(bytes, self.buffers.as_ref())?;
+            rewrite.apply(&mut output);
+            Ok(self.attempt.packet(output)?)
+        })();
+        self.record(result)
+    }
+
+    /// Preserve the input attempt and its unique backing. A retained immutable
+    /// view requires a credited copy; it never observes the rewrite in place.
+    pub fn translate_owned(
+        &mut self,
+        packet: RelayPacket,
+        direction: Direction,
+    ) -> Result<RelayPacket, TranslationError> {
+        let result = packet.try_rewrite(&self.attempt, self.buffers.as_ref(), |bytes| {
+            let rewrite = self.inspect(bytes, direction)?;
+            rewrite.apply(bytes);
+            Ok(())
+        });
+        self.record(result)
+    }
+
+    fn record(
+        &mut self,
+        result: Result<RelayPacket, TranslationError>,
+    ) -> Result<RelayPacket, TranslationError> {
         match &result {
             Ok(_) => self.summary.translated = self.summary.translated.saturating_add(1),
             Err(reason) => self.summary.refuse(*reason),
@@ -130,90 +151,29 @@ impl AddressTranslator {
         result
     }
 
-    pub(crate) fn translate_buffer(
+    fn inspect(
         &self,
         bytes: &[u8],
         direction: Direction,
-    ) -> Result<RelayBuffer, TranslationError> {
-        let header = self.validate_packet(bytes, direction)?;
-        let (old, new) = self.endpoints(&header, direction)?;
-        let quote = crate::icmp_quotation::inspect(bytes, &header, direction, old, new)?;
-        self.rewrite_buffer(bytes, direction, header, old, new, quote)
-    }
-
-    fn validate_packet(
-        &self,
-        bytes: &[u8],
-        direction: Direction,
-    ) -> Result<Header, TranslationError> {
+    ) -> Result<crate::icmp_quotation::PacketRewrite, TranslationError> {
         if !self.attempt.current() {
             return Err(TranslationError::Stale);
         }
-        let header = Header::parse(bytes, ParseContext::Received)?;
-        let (old, new) = self.endpoints(&header, direction)?;
-        validate_transport(bytes, &header)?;
-        // Quotations are validated before any output allocation too.
-        crate::icmp_quotation::inspect(bytes, &header, direction, old, new)?;
-        Ok(header)
-    }
-
-    fn rewrite_buffer(
-        &self,
-        bytes: &[u8],
-        direction: Direction,
-        header: Header,
-        old: IpAddr,
-        new: IpAddr,
-        quote: Option<crate::icmp_quotation::Quotation>,
-    ) -> Result<RelayBuffer, TranslationError> {
-        let mut output = RelayBuffer::copy_from(bytes, self.buffers.as_ref())?;
-        rewrite_endpoint(&mut output, &header, direction == Direction::Outbound, new)?;
-        let quote_delta = quote
-            .map(|quote| crate::icmp_quotation::rewrite(&mut output, &quote, old, new))
-            .transpose()?;
-        if let Some(offset) = checksum_field(&header, bytes)? {
-            let mut value = word(bytes, offset);
-            if let Some(delta) = quote_delta {
-                value = delta.apply(value);
-            }
-            if !(header.protocol == 17 && header.ipv4 && value == 0)
-                && !(header.protocol == 1 && header.ipv4)
-            {
-                value = adjusted(value, &address_bytes(old), &address_bytes(new));
-                if header.protocol == 17 && value == 0 {
-                    value = u16::MAX;
-                }
-            }
-            output[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+        let ip = crate::raw_packet::inspect(bytes)?;
+        if direction == Direction::Outbound
+            && ip.source().is_some_and(|source| match source {
+                IpAddr::V4(_) => self.config.assigned.ipv4.is_none(),
+                IpAddr::V6(_) => self.config.assigned.ipv6.is_none(),
+            })
+        {
+            return Err(TranslationError::Family);
         }
-        if !self.attempt.current() {
-            return Err(TranslationError::Stale);
-        }
-        Ok(output)
-    }
-
-    pub(crate) fn endpoints(
-        &self,
-        header: &Header,
-        direction: Direction,
-    ) -> Result<(IpAddr, IpAddr), TranslationError> {
-        let address = |sources: RelaySources| {
-            if header.ipv4 {
-                sources.ipv4.map(IpAddr::V4)
-            } else {
-                sources.ipv6.map(IpAddr::V6)
-            }
-        };
-        let fixed = address(self.config.fixed).ok_or(TranslationError::Family)?;
-        let assigned = address(self.config.assigned).ok_or(TranslationError::Family)?;
-        let (actual, old, new) = match direction {
-            Direction::Outbound => (header.source, fixed, assigned),
-            Direction::Inbound => (header.destination, assigned, fixed),
-        };
-        if actual != old {
-            return Err(TranslationError::Endpoint);
-        }
-        Ok((old, new))
+        crate::icmp_quotation::inspect(
+            bytes,
+            direction == Direction::Outbound,
+            self.config,
+            self.buffers.as_ref(),
+        )
     }
 }
 
@@ -223,13 +183,15 @@ pub(crate) struct Header {
     pub source: IpAddr,
     pub destination: IpAddr,
     pub transport: usize,
-    /// False when a quotation ends before the upper-layer boundary is known.
     pub transport_known: bool,
     pub protocol: u8,
     pub declared: usize,
     pub non_initial: bool,
-    pub fragmented: bool,
     pub fragment: Option<FragmentHeader>,
+    /// Address locations used by the pseudoheader, including source routing and
+    /// Mobile IPv6. None means that the present bytes do not determine it.
+    pub pseudo_source: Option<usize>,
+    pub pseudo_destination: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -240,261 +202,232 @@ pub(crate) struct FragmentHeader {
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ParseContext {
-    /// Exact present packet, including an independently received fragment.
     Received,
-    /// A legal prefix of an invoking packet inside a complete ICMP message.
     Quotation,
 }
 
 impl Header {
-    /// Atomic IPv6 has a Fragment header, but its transport is complete.
     pub(crate) fn partial(&self) -> bool {
-        self.non_initial || (self.fragmented && self.fragment.is_none_or(|fragment| fragment.more))
+        self.non_initial || self.fragment.is_some_and(|fragment| fragment.more)
     }
 
-    /// Quotes may end before the original datagram; never pad absent bytes.
-    pub(crate) fn parse(bytes: &[u8], context: ParseContext) -> Result<Self, TranslationError> {
-        let quoted = context == ParseContext::Quotation;
-        let malformed = TranslationError::Malformed;
+    pub(crate) fn base(bytes: &[u8]) -> Result<Self, TranslationError> {
+        let ipv4 = match bytes.first().map(|byte| byte >> 4) {
+            Some(4) if bytes.len() >= 20 => true,
+            Some(6) if bytes.len() >= 40 => false,
+            _ => return Err(TranslationError::Malformed),
+        };
         if bytes.len() > MAX_RELAY_PACKET_SIZE {
-            return Err(malformed);
+            return Err(TranslationError::Malformed);
         }
-        let mut header = match bytes.first().map(|byte| byte >> 4) {
-            Some(4) if bytes.len() >= 20 => {
-                let size = usize::from(bytes[0] & 15) * 4;
-                let declared = usize::from(word(bytes, 2));
-                if !(20..=60).contains(&size) || (!quoted && size > bytes.len()) || declared < size
-                {
-                    return Err(malformed);
-                }
-                if size <= bytes.len() && checksum(&[&bytes[..size]]) != 0 {
-                    return Err(TranslationError::Checksum);
-                }
-                validate_options(&bytes[20..size.min(bytes.len())], true, size - 20, quoted)?;
-                let flags = word(bytes, 6);
-                if flags & 0x8000 != 0 || flags & 0x6000 == 0x6000 {
-                    return Err(malformed);
-                }
-                Self {
-                    ipv4: true,
-                    source: <[u8; 4]>::try_from(&bytes[12..16]).unwrap().into(),
-                    destination: <[u8; 4]>::try_from(&bytes[16..20]).unwrap().into(),
-                    transport: size,
-                    transport_known: size <= bytes.len(),
-                    protocol: bytes[9],
-                    declared,
-                    non_initial: flags & 0x1fff != 0,
-                    fragmented: flags & 0x3fff != 0,
-                    fragment: None,
-                }
-            }
-            Some(6) if bytes.len() >= 40 => Self {
-                ipv4: false,
-                source: <[u8; 16]>::try_from(&bytes[8..24]).unwrap().into(),
-                destination: <[u8; 16]>::try_from(&bytes[24..40]).unwrap().into(),
-                transport: 40,
-                transport_known: true,
-                protocol: bytes[6],
-                declared: 40 + usize::from(word(bytes, 4)),
-                non_initial: false,
-                fragmented: false,
-                fragment: None,
-            },
-            _ => return Err(malformed),
-        };
-        if (!quoted && header.declared != bytes.len()) || header.declared < header.transport {
-            return Err(malformed);
-        }
-        if header.ipv4 && context == ParseContext::Received && header.fragmented {
+        let source_offset = if ipv4 { 12 } else { 8 };
+        let destination_offset = if ipv4 { 16 } else { 24 };
+        let fragment = if ipv4 {
             let flags = word(bytes, 6);
-            validate_fragment_layout(
-                header.transport,
-                usize::from(flags & 0x1fff) * 8,
-                flags & 0x2000 != 0,
-                header.declared - header.transport,
-            )?;
-            if flags & 0x4000 != 0 {
-                return Err(malformed);
-            }
-        }
-        if !header.ipv4 {
-            let end = bytes.len().min(header.declared);
-            let mut extensions = 0;
-            while matches!(header.protocol, 0 | 43 | 44 | 60) {
-                extensions += 1;
-                if extensions > 8 {
-                    return Err(malformed);
-                }
-                if header.transport + 8 > header.declared {
-                    return Err(if header.partial() && !quoted {
-                        TranslationError::ShortHeader
-                    } else {
-                        malformed
-                    });
-                }
-                let offset = header.transport;
-                let protocol = header.protocol;
-                if offset + 2 > end {
-                    if !quoted {
-                        return Err(malformed);
-                    }
-                    header.transport_known = false;
-                    break;
-                }
-                let length = if protocol == 44 {
-                    8
-                } else {
-                    (usize::from(bytes[offset + 1]) + 1) * 8
-                };
-                if protocol == 0 && offset != 40 {
-                    return Err(malformed);
-                }
-                if offset + length > header.declared {
-                    return Err(if header.partial() && !quoted {
-                        TranslationError::ShortHeader
-                    } else {
-                        malformed
-                    });
-                }
-                let present = length.min(end - offset);
-                match protocol {
-                    0 | 60 => validate_options(
-                        &bytes[offset + 2..offset + present],
-                        false,
-                        length - 2,
-                        quoted,
-                    )?,
-                    43 if present >= 4 && bytes[offset + 3] != 0 => {
-                        return Err(TranslationError::UnsupportedTranslation);
-                    }
-                    44 => {
-                        if header.fragmented
-                            || bytes[offset + 1] != 0
-                            || (present >= 4 && word(bytes, offset + 2) & 6 != 0)
-                        {
-                            return Err(malformed);
-                        }
-                        header.non_initial = present >= 4 && word(bytes, offset + 2) & 0xfff8 != 0;
-                        header.fragmented = true;
-                        if present == 8 {
-                            header.fragment = Some(FragmentHeader {
-                                offset: usize::from(word(bytes, offset + 2) & 0xfff8),
-                                more: bytes[offset + 3] & 1 != 0,
-                            });
-                            if context == ParseContext::Received {
-                                let fragment = header.fragment.unwrap();
-                                validate_fragment_layout(
-                                    offset - 40,
-                                    fragment.offset,
-                                    fragment.more,
-                                    header.declared - offset - 8,
-                                )?;
-                            }
-                        }
-                    }
-                    _ => (),
-                }
-                if present < length {
-                    if !quoted {
-                        return Err(malformed);
-                    }
-                    header.transport_known = false;
-                    break;
-                }
-                header.protocol = bytes[offset];
-                header.transport += length;
-                if header.non_initial {
-                    break;
-                }
-            }
-        }
-        Ok(header)
-    }
-}
-
-fn validate_fragment_layout(
-    prefix: usize,
-    offset: usize,
-    more: bool,
-    length: usize,
-) -> Result<(), TranslationError> {
-    if length == 0 || (more && !length.is_multiple_of(8)) || prefix + offset + length > 65_535 {
-        return Err(TranslationError::Malformed);
-    }
-    Ok(())
-}
-
-fn validate_options(
-    bytes: &[u8],
-    ipv4: bool,
-    declared: usize,
-    quoted: bool,
-) -> Result<(), TranslationError> {
-    let mut offset = 0;
-    while offset < declared {
-        if offset >= bytes.len() {
-            return if quoted {
-                Ok(())
-            } else {
-                Err(TranslationError::Malformed)
-            };
-        }
-        let kind = bytes[offset];
-        if ipv4 && kind == 0 {
-            break;
-        }
-        if (ipv4 && kind == 1) || (!ipv4 && kind == 0) {
-            offset += 1;
-            continue;
-        }
-        // A visible unsupported kind is a semantic refusal even if its tail is
-        // absent. Missing bytes of a supported option are not malformed bytes.
-        if !(if ipv4 {
-            matches!(kind, 7 | 68 | 148)
-        } else {
-            matches!(kind, 1 | 5)
-        }) {
-            return Err(TranslationError::UnsupportedTranslation);
-        }
-        if offset + 2 > declared {
-            return Err(TranslationError::Malformed);
-        }
-        let Some(extra) = bytes.get(offset + 1) else {
-            return if quoted {
-                Ok(())
-            } else {
-                Err(TranslationError::Malformed)
-            };
-        };
-        let extra = usize::from(*extra);
-        let length = if ipv4 { extra } else { extra + 2 };
-        if length < 2 || offset + length > declared {
-            return Err(TranslationError::Malformed);
-        }
-        // RR, Timestamp, Router Alert do not change the pseudoheader endpoint.
-        // Source routes and Home Address options do, and are not transparent.
-        if (ipv4
-            && match kind {
-                148 => length != 4,
-                7 => length < 3 || (length - 3) % 4 != 0,
-                68 => length < 4,
-                _ => false,
+            (flags & 0x3fff != 0).then_some(FragmentHeader {
+                offset: usize::from(flags & 0x1fff) * 8,
+                more: flags & 0x2000 != 0,
             })
-            || (!ipv4 && kind == 5 && extra != 2)
-        {
+        } else {
+            None
+        };
+        Ok(Self {
+            ipv4,
+            source: ip_address(bytes, source_offset, ipv4),
+            destination: ip_address(bytes, destination_offset, ipv4),
+            transport: if ipv4 {
+                usize::from(bytes[0] & 15) * 4
+            } else {
+                40
+            },
+            transport_known: true,
+            protocol: bytes[if ipv4 { 9 } else { 6 }],
+            declared: if ipv4 {
+                usize::from(word(bytes, 2))
+            } else {
+                40 + usize::from(word(bytes, 4))
+            },
+            non_initial: fragment.is_some_and(|fragment| fragment.offset != 0),
+            fragment,
+            pseudo_source: Some(source_offset),
+            pseudo_destination: Some(destination_offset),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parse(bytes: &[u8], context: ParseContext) -> Result<Self, TranslationError> {
+        Self::base(bytes)?.locate(bytes, context)
+    }
+
+    /// Walk only the IP header chain. Declared lengths bound field discovery;
+    /// they neither truncate output nor require equality with the backing bytes.
+    pub(crate) fn locate(
+        mut self,
+        bytes: &[u8],
+        context: ParseContext,
+    ) -> Result<Self, TranslationError> {
+        let quoted = context == ParseContext::Quotation;
+        let end = bytes.len().min(self.declared);
+        if self.transport < if self.ipv4 { 20 } else { 40 } || self.declared < self.transport {
             return Err(TranslationError::Malformed);
         }
-        offset += length;
+        if self.ipv4 {
+            self.options(bytes, 20, self.transport, true, quoted)?;
+            self.transport_known = self.transport <= end;
+            if !self.transport_known && !quoted {
+                return Err(TranslationError::ShortHeader);
+            }
+            return Ok(self);
+        }
+        while matches!(self.protocol, 0 | 43 | 44 | 60) {
+            let offset = self.transport;
+            let protocol = self.protocol;
+            if offset + 2 > end {
+                if !quoted {
+                    return Err(TranslationError::ShortHeader);
+                }
+                self.transport_known = false;
+                break;
+            }
+            let length = if protocol == 44 {
+                8
+            } else {
+                (usize::from(bytes[offset + 1]) + 1) * 8
+            };
+            let next = offset
+                .checked_add(length)
+                .ok_or(TranslationError::Malformed)?;
+            if next > self.declared {
+                return Err(if self.partial() && !quoted {
+                    TranslationError::ShortHeader
+                } else {
+                    TranslationError::Malformed
+                });
+            }
+            match protocol {
+                0 | 60 => self.options(bytes, offset + 2, next, false, quoted)?,
+                43 if offset + 4 <= end && bytes[offset + 3] != 0 => {
+                    // RFC 8200 pseudo-destination: RH0/RH2's last address,
+                    // RFC 8754 SRH's Segment List[0]. Other active formats do
+                    // not supply a known stateless pseudoheader location here.
+                    self.pseudo_destination = match bytes[offset + 2] {
+                        0 | 2 if length >= 24 => Some(next - 16),
+                        4 if length >= 24 => Some(offset + 8),
+                        _ => None,
+                    }
+                    .filter(|start| start + 16 <= end);
+                }
+                43 if offset + 4 > end => self.pseudo_destination = None,
+                44 => {
+                    if next > end {
+                        if !quoted {
+                            return Err(TranslationError::ShortHeader);
+                        }
+                        self.transport_known = false;
+                        break;
+                    }
+                    let flags = word(bytes, offset + 2);
+                    self.fragment = Some(FragmentHeader {
+                        offset: usize::from(flags & 0xfff8),
+                        more: flags & 1 != 0,
+                    });
+                    self.non_initial = flags & 0xfff8 != 0;
+                }
+                _ => (),
+            }
+            if next > end {
+                if !quoted {
+                    return Err(TranslationError::ShortHeader);
+                }
+                self.transport_known = false;
+                break;
+            }
+            self.protocol = bytes[offset];
+            self.transport = next;
+            if self.non_initial {
+                break;
+            }
+        }
+        Ok(self)
     }
-    Ok(())
+
+    fn options(
+        &mut self,
+        bytes: &[u8],
+        mut offset: usize,
+        declared: usize,
+        ipv4: bool,
+        quoted: bool,
+    ) -> Result<(), TranslationError> {
+        let end = bytes.len().min(self.declared).min(declared);
+        while offset < declared {
+            if offset >= end {
+                if quoted {
+                    break;
+                }
+                return Err(TranslationError::ShortHeader);
+            }
+            let kind = bytes[offset];
+            if ipv4 && kind == 0 {
+                break;
+            }
+            if (ipv4 && kind == 1) || (!ipv4 && kind == 0) {
+                offset += 1;
+                continue;
+            }
+            if offset + 2 > end {
+                if ipv4 && matches!(kind, 131 | 137) {
+                    self.pseudo_destination = None;
+                }
+                if !ipv4 && kind == 201 {
+                    self.pseudo_source = None;
+                }
+                if quoted {
+                    break;
+                }
+                return Err(TranslationError::ShortHeader);
+            }
+            let length = usize::from(bytes[offset + 1]) + if ipv4 { 0 } else { 2 };
+            let next = offset
+                .checked_add(length)
+                .ok_or(TranslationError::Malformed)?;
+            if length < 2 || next > declared {
+                return Err(TranslationError::Malformed);
+            }
+            if ipv4 && matches!(kind, 131 | 137) {
+                // Only an active source route replaces the pseudo-destination.
+                if length < 7 || (length - 3) % 4 != 0 || offset + 3 > end {
+                    self.pseudo_destination = None;
+                } else if usize::from(bytes[offset + 2]) <= length {
+                    self.pseudo_destination = (next <= end).then_some(next - 4);
+                }
+            }
+            if !ipv4 && kind == 201 {
+                self.pseudo_source = (length == 18 && next <= end).then_some(offset + 2);
+            }
+            if next > end && !quoted {
+                return Err(TranslationError::ShortHeader);
+            }
+            offset = next; // Every non-pad option advances by at least two bytes.
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn word(bytes: &[u8], offset: usize) -> u16 {
     u16::from_be_bytes([bytes[offset], bytes[offset + 1]])
 }
 
-pub(crate) fn checksum(parts: &[&[u8]]) -> u16 {
-    gotatun::packet::checksum(parts)
+pub(crate) fn ip_address(bytes: &[u8], offset: usize, ipv4: bool) -> IpAddr {
+    if ipv4 {
+        <[u8; 4]>::try_from(&bytes[offset..offset + 4])
+            .unwrap()
+            .into()
+    } else {
+        <[u8; 16]>::try_from(&bytes[offset..offset + 16])
+            .unwrap()
+            .into()
+    }
 }
 
 pub(crate) fn address_bytes(address: IpAddr) -> VecAddress {
@@ -523,7 +456,7 @@ impl std::ops::Deref for VecAddress {
     }
 }
 
-/// RFC1624, valid for complete checksum words even in truncated quotations.
+/// RFC 1624, including complete checksum words in partial quotations.
 pub(crate) fn adjusted(value: u16, old: &[u8], new: &[u8]) -> u16 {
     let mut sum = u32::from(!value);
     for (old, new) in old.chunks_exact(2).zip(new.chunks_exact(2)) {
@@ -536,183 +469,47 @@ pub(crate) fn adjusted(value: u16, old: &[u8], new: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-pub(crate) fn rewrite_endpoint(
-    bytes: &mut [u8],
-    header: &Header,
-    source: bool,
-    address: IpAddr,
-) -> Result<(), TranslationError> {
-    let start = match (header.ipv4, source, address) {
-        (true, true, IpAddr::V4(_)) => 12,
-        (true, false, IpAddr::V4(_)) => 16,
-        (false, true, IpAddr::V6(_)) => 8,
-        (false, false, IpAddr::V6(_)) => 24,
-        _ => return Err(TranslationError::Family),
-    };
-    let address = address_bytes(address);
-    bytes[start..start + address.len()].copy_from_slice(&address);
-    if header.ipv4 {
-        // A quoted IPv4 header can end inside options. Updating its complete
-        // checksum word needs only the changed addresses, not the absent tail.
-        let old = address_bytes(if source {
-            header.source
-        } else {
-            header.destination
-        });
-        let value = adjusted(word(bytes, 10), &old, &address);
-        bytes[10..12].copy_from_slice(&value.to_be_bytes());
-    }
-    Ok(())
-}
-
 pub(crate) fn is_icmp_error(bytes: &[u8], header: &Header) -> bool {
     !header.non_initial
         && header.transport_known
-        && bytes.get(header.transport).is_some_and(|kind| {
-            (header.ipv4 && header.protocol == 1 && matches!(kind, 3 | 11 | 12))
-                || (!header.ipv4 && header.protocol == 58 && matches!(kind, 1..=4))
-        })
+        && header.transport < bytes.len().min(header.declared)
+        && ((header.ipv4
+            && header.protocol == 1
+            && matches!(bytes[header.transport], 3..=5 | 11 | 12))
+            || (!header.ipv4 && header.protocol == 58 && matches!(bytes[header.transport], 1..=4)))
 }
 
-pub(crate) fn checksum_field(
-    header: &Header,
-    bytes: &[u8],
-) -> Result<Option<usize>, TranslationError> {
-    if header.non_initial || !header.transport_known {
-        return Ok(None);
-    }
-    let offset = match header.protocol {
-        6 => 16,
-        17 => 6,
-        1 if header.ipv4 => 2,
-        58 if !header.ipv4 => 2,
-        // GRE checksums and SCTP CRC32c exclude the outer IP addresses.
-        47 | 132 => return Ok(None),
-        // Opaque passthrough (tunnel-mode IPsec works; transport mode without
-        // NAT-T is not supported). NAT-T UDP 4500 follows ordinary UDP.
-        50 => return Ok(None),
-        _ => return Err(TranslationError::UnsupportedTranslation),
-    };
-    Ok(
-        (header.transport + offset + 2 <= bytes.len().min(header.declared))
-            .then_some(header.transport + offset),
-    )
-}
-
-pub(crate) fn transport_checksum(bytes: &[u8], header: &Header) -> u16 {
-    let length = (bytes.len() - header.transport) as u32;
-    if header.ipv4 && header.protocol == 1 {
-        checksum(&[&bytes[header.transport..]])
-    } else if header.ipv4 {
-        checksum(&[
-            &bytes[12..20],
-            &[0, header.protocol],
-            &(length as u16).to_be_bytes(),
-            &bytes[header.transport..],
-        ])
-    } else {
-        checksum(&[
-            &bytes[8..40],
-            &length.to_be_bytes(),
-            &[0, 0, 0, header.protocol],
-            &bytes[header.transport..],
-        ])
-    }
-}
-
-pub(crate) fn validate_transport(bytes: &[u8], header: &Header) -> Result<(), TranslationError> {
-    // A tail has no upper-layer boundary or semantics to dispatch on.
-    if header.non_initial {
-        return Ok(());
-    }
-    let segment = &bytes[header.transport..];
-    let malformed = TranslationError::Malformed;
-    let short = if header.partial() {
-        TranslationError::ShortHeader
-    } else {
-        malformed
-    };
+/// Known address-dependent checksum layouts, not an admission allowlist.
+/// DCCP (RFC 4340), UDP-Lite (RFC 3828), Mobility (RFC 6275), HIP (RFC 7401).
+pub(crate) fn checksum_offset(header: &Header, bytes: &[u8]) -> Option<usize> {
     match header.protocol {
-        6 => {
-            if segment.len() < 20 {
-                return Err(short);
-            }
-            let length = usize::from(segment[12] >> 4) * 4;
-            if length < 20 {
-                return Err(malformed);
-            }
-            if length > segment.len() {
-                return Err(short);
-            }
+        6 => Some(16),
+        17 | 33 | 136 => Some(6),
+        135 | 139 => Some(4),
+        1 if header.ipv4 => Some(2),
+        58 if !header.ipv4 => Some(2),
+        89 if !header.ipv4 && bytes.get(header.transport) == Some(&3) => Some(12),
+        103 if !header.ipv4
+            && bytes
+                .get(header.transport)
+                .is_some_and(|byte| byte >> 4 == 2) =>
+        {
+            Some(2)
         }
-        17 => {
-            if segment.len() < 8 {
-                return Err(short);
-            }
-            if word(segment, 4) < 8
-                || (!header.partial() && usize::from(word(segment, 4)) != segment.len())
-            {
-                return Err(malformed);
-            }
-            if word(segment, 6) == 0 {
-                return if header.ipv4 {
-                    Ok(())
-                } else {
-                    Err(TranslationError::Checksum)
-                };
-            }
+        112 if bytes
+            .get(header.transport)
+            .is_some_and(|byte| byte >> 4 == 3) =>
+        {
+            Some(6)
         }
-        1 if header.ipv4 => {
-            if segment.len() < 8 {
-                return Err(short);
-            }
-            let minimum = match segment[0] {
-                0 | 8 | 15 | 16 => 8,
-                13 | 14 => 20,
-                17 | 18 => 12,
-                3 | 11 | 12 => 8,
-                _ => return Err(TranslationError::UnsupportedTranslation),
-            };
-            if segment.len() < minimum {
-                return Err(short);
-            }
-            if !is_icmp_error(bytes, header) && segment[1] != 0 {
-                return Err(malformed);
-            }
-        }
-        58 if !header.ipv4 => {
-            if segment.len() < 8 {
-                return Err(short);
-            }
-            if !matches!(segment[0], 1..=4 | 128 | 129) {
-                return Err(TranslationError::UnsupportedTranslation);
-            }
-            if matches!(segment[0], 128 | 129) && segment[1] != 0 {
-                return Err(malformed);
-            }
-        }
-        47 | 50 | 132 => {
-            let minimum = match header.protocol {
-                47 => 4,
-                50 => 8,
-                _ => 12,
-            };
-            return if segment.len() >= minimum {
-                Ok(())
-            } else {
-                Err(short)
-            };
-        }
-        _ => return Err(TranslationError::UnsupportedTranslation),
+        _ => None, // GRE/SCTP/ESP, encapsulation and opaque independent payloads.
     }
-    if !header.partial() && transport_checksum(bytes, header) != 0 {
-        return Err(TranslationError::Checksum);
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod fragment_tests;
+#[cfg(test)]
+mod parity_tests;
 #[cfg(test)]
 mod path_tests;
 #[cfg(test)]

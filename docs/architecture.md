@@ -318,6 +318,25 @@ through translation. Packets retain the exact target attempt through the final
 writer. The assigned source filter and separate private-control path remain
 unchanged.
 
+Translation discovers address and checksum locations once, without validating
+endpoint-owned checksums, flags, ICMP codes or complete TCP options. Native
+trailing bytes are retained. IPv4 checksum-bearing later fragments use their
+wire offsets; IPv6 tails stay opaque after the Fragment header. Real ICMP quotes
+are walked iteratively, rewriting matching endpoints only and propagating word
+deltas through enclosing checksums. Quotation-description allocations retain
+byte credit. Unique owned packet backing is rewritten without a second copy;
+retained immutable views require a separately credited copy and last-owner refund.
+
+Source routes, Home Address options and RH0/RH2/SRH final destinations use their
+present pseudo-endpoint fields. A changed AH endpoint cannot be authenticated
+without its key. An unknown active routing format, an absent required pseudo-
+endpoint or an incomplete required checksum word cannot be translated safely.
+These are swap limitations, not protocol admission policy: no-swap packets pass.
+Opaque/experimental payloads are not a promise to repair unspecified address-
+dependent formats. ESP remains opaque: tunnel mode is supported, encrypted
+transport-mode pseudoheaders cannot be repaired without the SA. Invalid IPv6
+UDP zero checksums remain zero for the endpoint to reject.
+
 Local is a receiver, not tunnel transit. It terminates connections using its
 stack and protected, physical-network-bound sockets. Its current pre-stack
 parser rejects IPv4/IPv6 fragments. Complete Local datagrams up to the actual

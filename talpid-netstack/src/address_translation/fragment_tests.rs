@@ -206,15 +206,9 @@ fn fragment_checksum_carry_and_udp_zero() {
             assert_eq!(rejoin(&output, 40), target);
             original[ip + 6..ip + 8].fill(0);
             let pieces = fragments(&original, 16, 40);
-            if v4 {
-                let output = map_pieces(&mut mapper, &pieces, direction);
-                assert_eq!(&output[0][ip + 6..ip + 8], &[0, 0]);
-            } else {
-                assert!(matches!(
-                    mapper.translate(&pieces[0], direction),
-                    Err(TranslationError::Checksum)
-                ));
-            }
+            let output = map_pieces(&mut mapper, &pieces, direction);
+            let transport = ip + if v4 { 0 } else { 8 };
+            assert_eq!(&output[0][transport + 6..transport + 8], &[0, 0]);
         }
     }
 }
@@ -233,8 +227,17 @@ fn fragment_noninitial_payload_is_opaque() {
                 }
                 let original = fragments(&packet(src, dst, protocol, &data), 32, 40);
                 let expected = fragments(&packet(new_src, new_dst, protocol, &data), 32, 40);
-                let output = mapper.translate(&original[1], direction).unwrap();
-                assert_eq!(output.view().bytes(), expected[1]);
+                if protocol == 51 {
+                    expect_refusal(
+                        &mut mapper,
+                        &original[1],
+                        direction,
+                        TranslationError::UnsupportedTranslation,
+                    );
+                } else {
+                    let output = mapper.translate(&original[1], direction).unwrap();
+                    assert_eq!(output.view().bytes(), expected[1]);
+                }
                 if matches!(protocol, 47 | 50 | 132) {
                     let output = mapper.translate(&original[0], direction).unwrap();
                     assert_eq!(output.view().bytes(), expected[0]);
@@ -242,10 +245,18 @@ fn fragment_noninitial_payload_is_opaque() {
             }
             for protocol in [51, 253] {
                 let original = fragments(&packet(src, dst, protocol, &[0; 64]), 32, 40);
-                assert!(matches!(
-                    mapper.translate(&original[0], direction),
-                    Err(TranslationError::UnsupportedTranslation)
-                ));
+                if protocol == 51 {
+                    expect_refusal(
+                        &mut mapper,
+                        &original[0],
+                        direction,
+                        TranslationError::UnsupportedTranslation,
+                    );
+                } else {
+                    let expected = fragments(&packet(new_src, new_dst, protocol, &[0; 64]), 32, 40);
+                    let output = mapper.translate(&original[0], direction).unwrap();
+                    assert_eq!(output.view().bytes(), expected[0]);
+                }
             }
         }
     }
@@ -263,7 +274,7 @@ fn expect_refusal(
 }
 
 #[test]
-fn fragment_tiny_initial_headers_drop() {
+fn fragment_initial_headers_require_only_present_rewrite_words() {
     let (mut mapper, _capture, _attempt, budget) = mapper();
     for v4 in [true, false] {
         for direction in [Direction::Outbound, Direction::Inbound] {
@@ -291,16 +302,22 @@ fn fragment_tiny_initial_headers_drop() {
                     first[4..6].copy_from_slice(&((start + count - 40) as u16).to_be_bytes());
                 }
                 let before = budget.used();
-                expect_refusal(
-                    &mut mapper,
-                    &first,
-                    direction,
-                    if protocol == 6 {
-                        TranslationError::ShortHeader
-                    } else {
-                        TranslationError::Malformed
-                    },
-                );
+                let required = match protocol {
+                    6 => 18,
+                    17 => 8,
+                    _ => 4,
+                };
+                if !v4 && count < required {
+                    expect_refusal(
+                        &mut mapper,
+                        &first,
+                        direction,
+                        TranslationError::ShortHeader,
+                    );
+                } else {
+                    let output = mapper.translate(&first, direction).unwrap();
+                    assert_eq!(output.view().bytes().len(), first.len());
+                }
                 assert_eq!(budget.used(), before, "short initial cannot retain data");
             }
             if !v4 {
@@ -327,18 +344,16 @@ fn fragment_tiny_initial_headers_drop() {
                     let mut body = segment(1);
                     body[0] = 13; // Timestamp's required header is 20 bytes.
                     let first = fragments(&packet(src, dst, 1, &body), count, 40)[0].clone();
-                    expect_refusal(
-                        &mut mapper,
-                        &first,
-                        direction,
-                        TranslationError::ShortHeader,
-                    );
+                    let output = mapper.translate(&first, direction).unwrap();
+                    assert_eq!(&output.view().bytes()[20..], &first[20..]);
                 }
             }
             let mut udp = segment(17);
             udp[4..6].copy_from_slice(&7u16.to_be_bytes());
             let first = fragments(&packet(src, dst, 17, &udp), 16, 40)[0].clone();
-            expect_refusal(&mut mapper, &first, direction, TranslationError::Malformed);
+            let output = mapper.translate(&first, direction).unwrap();
+            assert_eq!(output.view().bytes().len(), first.len());
+            drop(output);
             for overflow in [false, true] {
                 let mut first = fragments(&packet(src, dst, 6, &segment(6)), 32, 40)[0].clone();
                 if overflow {
@@ -359,7 +374,8 @@ fn fragment_tiny_initial_headers_drop() {
                         first[4..6].copy_from_slice(&size.to_be_bytes());
                     }
                 }
-                expect_refusal(&mut mapper, &first, direction, TranslationError::Malformed);
+                let output = mapper.translate(&first, direction).unwrap();
+                assert_eq!(output.view().bytes().len(), first.len());
             }
         }
     }
@@ -410,12 +426,8 @@ fn fragment_ipv6_extensions_and_atomic_headers() {
                     if quantum == 1024 {
                         let mut corrupt = pieces[0].clone();
                         *corrupt.last_mut().unwrap() ^= 1;
-                        expect_refusal(
-                            &mut mapper,
-                            &corrupt,
-                            direction,
-                            TranslationError::Checksum,
-                        );
+                        let output = mapper.translate(&corrupt, direction).unwrap();
+                        assert_ne!(wire_checksum(output.view().bytes(), transport + 8, 6), 0);
                     }
                 }
             }
@@ -428,30 +440,19 @@ fn fragment_ipv6_extensions_and_atomic_headers() {
         }
         let size = (too_many.len() - 40) as u16;
         too_many[4..6].copy_from_slice(&size.to_be_bytes());
-        expect_refusal(
-            &mut mapper,
-            &too_many,
-            direction,
-            TranslationError::Malformed,
-        );
+        let output = mapper.translate(&too_many, direction).unwrap();
+        assert_eq!(&output.view().bytes()[40..112], &too_many[40..112]);
+        assert_eq!(wire_checksum(output.view().bytes(), 112, 6), 0);
         let mut duplicate = fragments(&packet(src, dst, 6, &segment(6)), 1024, 40)[0].clone();
         duplicate[40] = 44;
-        expect_refusal(
-            &mut mapper,
-            &duplicate,
-            direction,
-            TranslationError::Malformed,
-        );
+        let output = mapper.translate(&duplicate, direction).unwrap();
+        assert_eq!(&output.view().bytes()[40..], &duplicate[40..]);
         let mut bad_alignment = fragments(&packet(src, dst, 6, &segment(6)), 32, 40)[0].clone();
         bad_alignment.pop();
         let size = (bad_alignment.len() - 40) as u16;
         bad_alignment[4..6].copy_from_slice(&size.to_be_bytes());
-        expect_refusal(
-            &mut mapper,
-            &bad_alignment,
-            direction,
-            TranslationError::Malformed,
-        );
+        let output = mapper.translate(&bad_alignment, direction).unwrap();
+        assert_eq!(output.view().bytes().len(), bad_alignment.len());
     }
 }
 
@@ -625,7 +626,11 @@ fn fragment_outer_icmp_incomplete_rewrite_drops() {
             let (src, dst, _, _) = quoted_endpoints(v4, direction);
             let quote = packet(src, dst, 6, &segment(6));
             let outer = error(&quote, v4, direction, if v4 { 3 } else { 2 });
-            for quantum in if v4 { vec![24, 40] } else { vec![24, 40, 64] } {
+            for quantum in if v4 {
+                vec![8, 16, 24, 40]
+            } else {
+                vec![8, 16, 24, 40, 64]
+            } {
                 let pieces = fragments(&outer, quantum, 40);
                 let before = budget.used();
                 expect_refusal(
@@ -647,13 +652,47 @@ fn fragment_outer_icmp_incomplete_rewrite_drops() {
                     direction,
                     TranslationError::ShortHeader,
                 );
+            } else {
+                // The quoted TCP checksum can live in a *later* IPv4 fragment.
+                // Its required offset is relative to that fragment, not byte 16
+                // of an absent reassembled transport header.
+                let mut with_options = packet(src, dst, 6, &segment(6));
+                with_options.splice(20..20, [148, 4, 0, 0]);
+                with_options[0] = 0x46;
+                let size = with_options.len() as u16;
+                with_options[2..4].copy_from_slice(&size.to_be_bytes());
+                fix_checksums(&mut with_options, 24, 6);
+                let quoted_tail = fragments(&with_options, 8, 40).remove(2);
+                let outer = error(&quoted_tail, true, direction, 3);
+                let first = fragments(&outer, 32, 40).remove(0);
+                expect_refusal(
+                    &mut mapper,
+                    &first,
+                    direction,
+                    TranslationError::ShortHeader,
+                );
             }
+            // The received outer fragment, not an inner quotation's own MF bit,
+            // determines whether absent nested rewrite words will arrive later.
+            let (outer_src, outer_dst, _, _) = endpoints(v4, direction);
+            let inner = packet(outer_src, outer_dst, 6, &segment(6));
+            let mut body = vec![if v4 { 11 } else { 3 }, 0, 0, 0, 0, 0, 0, 0];
+            body.extend_from_slice(&inner);
+            let middle = packet(outer_dst, outer_src, if v4 { 1 } else { 58 }, &body);
+            let outer = error(&middle, v4, direction, if v4 { 11 } else { 3 });
+            let first = fragments(&outer, if v4 { 72 } else { 112 }, 40).remove(0);
+            expect_refusal(
+                &mut mapper,
+                &first,
+                direction,
+                TranslationError::ShortHeader,
+            );
         }
     }
 }
 
 #[test]
-fn fragment_endpoint_and_attempt_refusals() {
+fn fragment_nonmatches_preserve_budget_and_exact_attempt_refusals() {
     let (mut mapper, capture, attempt, budget) = mapper();
     for v4 in [true, false] {
         for direction in [Direction::Outbound, Direction::Inbound] {
@@ -666,16 +705,25 @@ fn fragment_endpoint_and_attempt_refusals() {
             }
             let wrong = fragments(&packet(remote(v4), remote(v4), 6, &segment(6)), 32, 40);
             for piece in &wrong {
-                expect_refusal(&mut mapper, piece, direction, TranslationError::Endpoint);
+                expect_refusal(&mut mapper, piece, direction, TranslationError::Full);
+            }
+            drop(all);
+            for piece in &wrong {
+                let output = mapper.translate(piece, direction).unwrap();
+                assert_eq!(output.view().bytes(), piece);
             }
             if !v4 {
                 mapper.config.assigned.ipv6 = None;
                 for piece in &pieces {
-                    expect_refusal(&mut mapper, piece, direction, TranslationError::Family);
+                    if direction == Direction::Outbound {
+                        expect_refusal(&mut mapper, piece, direction, TranslationError::Family);
+                    } else {
+                        let output = mapper.translate(piece, direction).unwrap();
+                        assert_eq!(output.view().bytes(), piece);
+                    }
                 }
                 mapper.config.assigned = ASSIGNED;
             }
-            drop(all);
             assert_eq!(budget.used(), before);
         }
     }

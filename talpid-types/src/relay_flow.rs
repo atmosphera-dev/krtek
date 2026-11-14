@@ -789,6 +789,26 @@ pub enum RelayWriteOutcome {
 }
 
 impl RelayPacket {
+    /// Mutate only through the packet's exact live authority. Unique backing
+    /// stays in place; immutable views force a separately credited copy. No
+    /// naked buffer or replacement attempt escapes this conversion.
+    pub fn try_rewrite<E: From<RelayFlowError>>(
+        mut self,
+        expected: &RelayAttempt,
+        buffers: &dyn RelayBufferAllocator,
+        operation: impl FnOnce(&mut [u8]) -> Result<(), E>,
+    ) -> Result<Self, E> {
+        if self.consumed || !self.attempt.same_attempt(expected) || !self.attempt.current() {
+            return Err(RelayFlowError::Stale.into());
+        }
+        if Arc::get_mut(&mut self.storage).is_none() {
+            self.storage = Arc::new(RelayBuffer::copy_from(&self.storage, buffers)?);
+        }
+        operation(Arc::get_mut(&mut self.storage).expect("unique rewrite backing"))?;
+        self.attempt.with_current(|| ())?;
+        Ok(self)
+    }
+
     pub fn view(&self) -> RelayPacketView {
         RelayPacketView {
             storage: self.storage.clone(),

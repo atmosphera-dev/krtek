@@ -216,7 +216,7 @@ async fn translated_singlehop_and_multihop_consumers_see_both_address_domains() 
             .await
             .unwrap();
         for v6 in [false, true] {
-            for protocol in [6, 17, if v6 { 58 } else { 1 }, 47, 50, 132] {
+            for protocol in [6, 17, if v6 { 58 } else { 1 }, 47, 50, 132, 253] {
                 // SCTP's CRC is address independent, GRE/ESP stay opaque.
                 let app = packet(
                     &config,
@@ -561,8 +561,8 @@ async fn unavailable_family_and_translation_refusals_never_reach_crypto_consumer
         .try_send(&packet(
             &config,
             false,
-            253,
-            b"unknown-semantics",
+            51,
+            b"ah-needs-authentication-key",
             false,
             false,
         ))
@@ -582,6 +582,13 @@ async fn unavailable_family_and_translation_refusals_never_reach_crypto_consumer
         );
         assert_eq!(path.summary().refused(TranslationError::BackendRefused), 0);
     }
+    let opaque = packet(&config, false, 253, b"opaque-after-refusal", false, false);
+    capture.try_send(&opaque).unwrap();
+    assert_eq!(
+        observed(&mut observations).await,
+        packet(&config, false, 253, b"opaque-after-refusal", true, false)
+    );
+    assert_eq!(capture_bytes(&capture).await, application_reply(&opaque));
     let app = packet(&config, false, 17, b"supported-after-refusal", false, false);
     capture.try_send(&app).unwrap();
     observed(&mut observations).await;

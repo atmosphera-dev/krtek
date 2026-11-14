@@ -401,8 +401,12 @@ impl ManagedReceive {
     ) -> io::Result<talpid_types::relay_flow::RelayPacket> {
         loop {
             let packet = receive.recv().await.map_err(|_| unavailable())?;
-            let view = packet.view();
-            if let Ok(packet) = owner.translate(view.bytes(), Direction::Outbound) {
+            if let Ok(packet) = owner
+                .path
+                .lock()
+                .expect("target path")
+                .process_owned(packet, Direction::Outbound)
+            {
                 return Ok(packet);
             }
             tokio::task::yield_now().await;

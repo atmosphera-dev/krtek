@@ -224,7 +224,7 @@ fn only_complete_present_checksum_words_are_adjusted_in_short_quotes() {
 }
 
 #[test]
-fn partial_quotes_keep_endpoint_and_genuinely_invalid_or_unsupported_refusals() {
+fn partial_quotes_preserve_nonmatches_and_only_rewrite_present_fields() {
     let (mut mapper, _capture, _attempt, _) = mapper();
     let quote = long_extension(packet(
         address(ASSIGNED, false),
@@ -243,20 +243,24 @@ fn partial_quotes_keep_endpoint_and_genuinely_invalid_or_unsupported_refusals() 
     ));
     let mut wrong = quote[..42].to_vec();
     wrong[23] ^= 1;
-    assert!(matches!(
-        mapper.translate(
+    let output = mapper
+        .translate(
             &error(&wrong, false, Direction::Inbound),
-            Direction::Inbound
-        ),
-        Err(TranslationError::Endpoint)
-    ));
+            Direction::Inbound,
+        )
+        .unwrap();
+    assert_eq!(&output.view().bytes()[48..], &wrong);
+    assert_eq!(wire_checksum(output.view().bytes(), 40, 58), 0);
     let mut unsupported = quote[..43].to_vec();
     unsupported[42] = 201; // Home Address option has address-dependent semantics.
-    assert!(matches!(
-        mapper.translate(
-            &error(&unsupported, false, Direction::Inbound),
-            Direction::Inbound
-        ),
-        Err(TranslationError::UnsupportedTranslation)
-    ));
+    // There is no quoted transport checksum to fix in this legal short quote.
+    let mut expected = unsupported.clone();
+    expected[8..24].copy_from_slice(&address_bytes(address(FIXED, false)));
+    check_quote(
+        &mut mapper,
+        &unsupported,
+        &expected,
+        false,
+        Direction::Inbound,
+    );
 }

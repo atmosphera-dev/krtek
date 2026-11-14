@@ -63,6 +63,11 @@ Each issue in this document should provide, at least, the following:
   capture-only 1280 floor. This does not raise the target MTU or enable IPv6
   internet through that target. Necessary configuration handovers still have the
   route gap described above.
+* Fixed-address translation cannot regenerate AH authentication over a changed
+  endpoint without its key, or fix an encrypted ESP transport-mode pseudoheader.
+  ESP tunnel mode and UDP NAT-T retain their ordinary paths. Unknown active
+  routing formats and fragmented ICMP errors missing required rewrite fields
+  likewise cannot be mapped statelessly; no fragment state or reassembly is added.
 
 ### Potential leaks just after macOS boot
 
