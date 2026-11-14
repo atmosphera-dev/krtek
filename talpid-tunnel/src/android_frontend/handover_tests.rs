@@ -1043,13 +1043,27 @@ async fn actual_eagain_retains_mixed_local_and_target_output_across_handover_and
         checks,
         "blocked checked Local writer spun"
     );
+    let predecessor = receipt.generation() as i64;
+    let old_descriptor = platform.descriptors.lock().unwrap()[&predecessor].clone();
+    let pause = Arc::new(Pause::default());
+    let release_cleanup = Release(pause.clone());
+    *platform.close_pause.lock().unwrap() = Some(pause.clone());
     let (request, config) = secured(&broker, fixed_config("10.64.0.1"));
     owner.handover(config).unwrap();
     let next_peer = AsyncFd::new(bounded(peers.recv()).await.unwrap()).unwrap();
     bounded(owner.ready()).await.unwrap();
+    // Readiness and predecessor cleanup are independently scheduled. Hold the
+    // exact cleanup callback, not an assumed gap after the readiness ack.
+    bounded(pause.entered.notified()).await;
+    assert_ne!(
+        std::fs::read_link(&old_descriptor.0).ok(),
+        Some(old_descriptor.1)
+    );
     assert!(transport.control.current());
     assert!(platform.released.lock().unwrap().is_empty());
     let generation = broker.snapshot().capture_generation.unwrap() as i64;
+    let successor = platform.descriptors.lock().unwrap()[&generation].clone();
+    assert_eq!(std::fs::read_link(&successor.0).ok(), Some(successor.1));
     let filled = platform.filled.lock().unwrap()[&generation];
     for _ in 0..filled {
         assert_eq!(bounded(receive(&next_peer)).await, b"handover-sink-filler");
@@ -1075,6 +1089,13 @@ async fn actual_eagain_retains_mixed_local_and_target_output_across_handover_and
     }
     assert_eq!(local_nonces.len(), 12);
     assert_eq!(target_nonces.len(), 12);
+    drop(release_cleanup);
+    platform.finished(predecessor).await;
+    assert_eq!(*platform.released.lock().unwrap(), [predecessor]);
+    assert!(
+        transport.control.current(),
+        "predecessor release retired the target"
+    );
     transport.control.detach();
     old_request.transport_joined();
     bounded(owner.stop()).await.unwrap();
