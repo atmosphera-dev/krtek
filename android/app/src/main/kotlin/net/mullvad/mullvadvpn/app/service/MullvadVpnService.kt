@@ -10,6 +10,8 @@ import androidx.core.content.getSystemService
 import androidx.lifecycle.lifecycleScope
 import arrow.atomic.AtomicInt
 import co.touchlab.kermit.Logger
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.filterIsInstance
 import kotlinx.coroutines.launch
@@ -34,21 +36,17 @@ import org.koin.core.context.loadKoinModules
 
 private const val RELAY_LIST_ASSET_NAME = "relays.json"
 
-class MullvadVpnService : TalpidVpnService() {
+class MullvadVpnService : MullvadVpnServiceLifecycle() {
 
-    private lateinit var keyguardManager: KeyguardManager
+    override lateinit var keyguardManager: KeyguardManager
 
     private lateinit var managementService: ManagementService
     private lateinit var migrateSplitTunneling: MigrateSplitTunneling
     private lateinit var apiEndpointFromIntentHolder: ApiEndpointFromIntentHolder
-    private lateinit var connectionProxy: ConnectionProxy
+    override lateinit var connectionProxy: ConnectionProxy
     private lateinit var daemonConfig: DaemonConfig
 
-    private lateinit var foregroundNotificationHandler: ForegroundNotificationManager
-
-    // Count number of binds to know if the service is needed. If user actively using the VPN, a
-    // bind from the system, should always be present.
-    private val bindCount = AtomicInt()
+    override lateinit var foregroundNotificationHandler: ForegroundNotificationManager
 
     override fun onCreate() {
         super.onCreate()
@@ -91,16 +89,63 @@ class MullvadVpnService : TalpidVpnService() {
         Logger.i("Start management service")
         managementService.start()
 
-        lifecycleScope.launch {
-            // If the service is started with a connect command and a non-blocking error occur (e.g.
-            // unable to start the tunnel) then the service is demoted from foreground.
-            managementService.tunnelState
-                .filterIsInstance<TunnelState.Error>()
-                .filter { !it.errorState.isBlocking }
-                .collect {
-                    withoutLocalFrontend { foregroundNotificationHandler.stopForeground() }
-                }
+        observeNonblockingErrors(managementService.tunnelState)
+    }
+
+    private fun startDaemon(daemonConfig: DaemonConfig) =
+        with(daemonConfig) {
+            MullvadDaemon.initialize(
+                vpnService = this@MullvadVpnService,
+                rpcSocketPath = rpcSocket.absolutePath,
+                filesDirectory = filesDir.absolutePath,
+                cacheDirectory = cacheDir.absolutePath,
+                apiEndpointOverride = apiEndpointOverride,
+                extraMetadata = mapOf("flavor" to BuildConfig.FLAVOR),
+            )
+            Logger.i("MullvadVpnService: Daemon initialized")
         }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        Logger.i("MullvadVpnService: onDestroy")
+        managementService.stop()
+        Logger.i("Shutdown MullvadDaemon")
+        MullvadDaemon.shutdown()
+        Logger.i("Shutdown complete")
+    }
+
+    private fun Context.prepareFiles() {
+        extractAndOverwriteIfAssetMoreRecent(
+            RELAY_LIST_ASSET_NAME,
+            BuildConfig.REQUIRE_BUNDLED_RELAY_FILE,
+        )
+    }
+
+    companion object {
+        init {
+            System.loadLibrary("mullvad_jni")
+        }
+    }
+}
+
+/** The concrete Android service inherits this wiring; native startup stays in its subclass. */
+abstract class MullvadVpnServiceLifecycle : TalpidVpnService() {
+    protected abstract val keyguardManager: KeyguardManager
+    protected abstract val connectionProxy: ConnectionProxy
+    protected abstract val foregroundNotificationHandler: ForegroundNotificationManager
+    protected open val commandScope: CoroutineScope
+        get() = lifecycleScope
+
+    // The same service instance owns both bindings and capture lifetime.
+    private val bindCount = AtomicInt()
+
+    protected fun observeNonblockingErrors(states: Flow<TunnelState>) = commandScope.launch {
+        states
+            .filterIsInstance<TunnelState.Error>()
+            .filter { !it.errorState.isBlocking }
+            .collect {
+                withoutLocalFrontend { foregroundNotificationHandler.stopForeground() }
+            }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -108,46 +153,41 @@ class MullvadVpnService : TalpidVpnService() {
             "onStartCommand (intent=$intent, action=${intent?.action}, flags=$flags, startId=$startId)"
         )
 
-        val startResult = super.onStartCommand(intent, flags, startId)
+        val startResult = platformStartCommand { super.onStartCommand(intent, flags, startId) }
 
-        // Always promote to foreground if connect/disconnect actions are provided to mitigate cases
-        // where the service would potentially otherwise be too slow running `startForeground`.
-        when {
-            intent.isFromSystem() && isLocalFrontendActive() -> {
-                foregroundNotificationHandler.startForeground()
-            }
-
-            keyguardManager.isKeyguardLocked -> {
-                Logger.i("Keyguard is locked, ignoring command")
-            }
-
-            intent.isFromSystem() || intent?.action == connectAction(packageName) -> {
-                foregroundNotificationHandler.startForeground()
-                lifecycleScope.launch { connectionProxy.connectWithoutPermissionCheck() }
-            }
-
-            intent?.action == reconnectAction(packageName) -> {
-                foregroundNotificationHandler.startForeground()
-                lifecycleScope.launch { connectionProxy.reconnect() }
-            }
-
-            intent?.action == disconnectAction(packageName) -> {
-                // MullvadTileService might have launched this service with the expectancy of it
-                // being in the foreground, thus it must go into foreground to please the android
-                // system
-                // requirements.
-                foregroundNotificationHandler.startForeground()
-                lifecycleScope.launch {
-                    connectionProxy.disconnect(DisconnectReason.USER_INITIATED_NOTIFICATION_TILE)
-                }
-
-                // If disconnect intent is received and no one is using this service, simply stop
-                // foreground and let system stop service when it deems it not to be necessary.
-                if (bindCount.get() == 0) {
-                    withoutLocalFrontend { foregroundNotificationHandler.stopForeground() }
-                }
-            }
-        }
+        dispatchVpnServiceCommand(
+            action = intent?.action,
+            packageName = packageName,
+            keyguardLocked = keyguardManager.isKeyguardLocked,
+            actions =
+                VpnServiceCommandActions(
+                    startForeground = foregroundNotificationHandler::startForeground,
+                    connect = {
+                        commandScope.launch {
+                            val changed =
+                                connectionProxy
+                                    .connectWithoutPermissionCheck()
+                                    .fold({ "error" }, { it.toString() })
+                            Logger.i(
+                                "VPN command completed action=${intent?.action} startId=$startId changed=$changed"
+                            )
+                        }
+                    },
+                    reconnect = { commandScope.launch { connectionProxy.reconnect() } },
+                    disconnect = {
+                        commandScope.launch {
+                            connectionProxy.disconnect(
+                                DisconnectReason.USER_INITIATED_NOTIFICATION_TILE
+                            )
+                        }
+                    },
+                    stopUnboundForeground = {
+                        if (bindCount.get() == 0) {
+                            withoutLocalFrontend { foregroundNotificationHandler.stopForeground() }
+                        }
+                    },
+                ),
+        )
 
         return startResult
     }
@@ -164,7 +204,7 @@ class MullvadVpnService : TalpidVpnService() {
         // We always need to return a binder. If the system binds to our VPN service, VpnService
         // will return a binder that shall be user, otherwise we return an empty dummy binder to
         // keep connection service alive since the actual communication happens over gRPC.
-        return super.onBind(intent) ?: emptyBinder()
+        return platformBind { super.onBind(intent) } ?: emptyBinder()
     }
 
     override fun onRebind(intent: Intent?) {
@@ -178,18 +218,9 @@ class MullvadVpnService : TalpidVpnService() {
         }
     }
 
-    private fun startDaemon(daemonConfig: DaemonConfig) =
-        with(daemonConfig) {
-            MullvadDaemon.initialize(
-                vpnService = this@MullvadVpnService,
-                rpcSocketPath = rpcSocket.absolutePath,
-                filesDirectory = filesDir.absolutePath,
-                cacheDirectory = cacheDir.absolutePath,
-                apiEndpointOverride = apiEndpointOverride,
-                extraMetadata = mapOf("flavor" to BuildConfig.FLAVOR),
-            )
-            Logger.i("MullvadVpnService: Daemon initialized")
-        }
+    protected open fun platformStartCommand(call: () -> Int): Int = call()
+
+    protected open fun platformBind(call: () -> IBinder?): IBinder? = call()
 
     private fun emptyBinder() =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -217,18 +248,6 @@ class MullvadVpnService : TalpidVpnService() {
         return true
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        Logger.i("MullvadVpnService: onDestroy")
-        // Shutting down the daemon gracefully
-        managementService.stop()
-
-        Logger.i("Shutdown MullvadDaemon")
-        MullvadDaemon.shutdown()
-
-        Logger.i("Shutdown complete")
-    }
-
     override fun onLocalFrontendChanged(active: Boolean) {
         if (active) foregroundNotificationHandler.startForeground()
         else if (bindCount.get() == 0 && !hasOpenTun()) {
@@ -240,17 +259,41 @@ class MullvadVpnService : TalpidVpnService() {
     private fun Intent?.isFromSystem(): Boolean {
         return this?.action == SERVICE_INTERFACE
     }
+}
 
-    private fun Context.prepareFiles() {
-        extractAndOverwriteIfAssetMoreRecent(
-            RELAY_LIST_ASSET_NAME,
-            BuildConfig.REQUIRE_BUNDLED_RELAY_FILE,
-        )
-    }
-
-    companion object {
-        init {
-            System.loadLibrary("mullvad_jni")
+// Keep the upstream command order independent of capture lifetime. The callbacks
+// are the service's effects; this seam also avoids loading JNI in command tests.
+internal fun TalpidVpnService.dispatchVpnServiceCommand(
+    action: String?,
+    packageName: String,
+    keyguardLocked: Boolean,
+    actions: VpnServiceCommandActions,
+) =
+    with(actions) {
+        when {
+            keyguardLocked -> Logger.i("Keyguard is locked, ignoring command")
+            action == android.net.VpnService.SERVICE_INTERFACE ||
+                action == connectAction(packageName) -> {
+                startForeground()
+                connect()
+            }
+            action == reconnectAction(packageName) -> {
+                startForeground()
+                reconnect()
+            }
+            action == disconnectAction(packageName) -> {
+                startForeground()
+                disconnect()
+                stopUnboundForeground()
+            }
+            else -> Unit
         }
     }
-}
+
+internal class VpnServiceCommandActions(
+    val startForeground: () -> Unit,
+    val connect: () -> Unit,
+    val reconnect: () -> Unit,
+    val disconnect: () -> Unit,
+    val stopUnboundForeground: () -> Unit,
+)

@@ -20,6 +20,7 @@ struct PacketPlatform {
     feed: Arc<CaptureNetworkFeed>,
     expected: Mutex<Option<CaptureExpectation>>,
     opened: Mutex<Vec<talpid_tunnel::tun_provider::TunConfig>>,
+    application_coverage: Mutex<Vec<Vec<String>>>,
     peer: Mutex<Option<std::os::unix::net::UnixDatagram>>,
     descriptors: Mutex<Vec<DescriptorEpoch>>,
     starts: AtomicUsize,
@@ -106,6 +107,13 @@ impl FrontendPlatform for PacketPlatform {
         talpid_tunnel::android_frontend::CaptureFormat::from_flags(0x1001)
     }
     fn open(&self, generation: i64, config: &CaptureConfig) -> io::Result<OwnedFd> {
+        self.application_coverage
+            .lock()
+            .unwrap()
+            .push(match config {
+                CaptureConfig::Partial(config) => config.excluded_packages.clone(),
+                _ => config.secured_config().unwrap().excluded_packages.clone(),
+            });
         if let Some(config) = config.secured_config() {
             self.opened.lock().unwrap().push(config.clone());
         }
@@ -351,6 +359,7 @@ async fn daemon_route_handover_retains_the_partial_grant_and_same_physical_tcp_s
         feed: CaptureNetworkFeed::new(43),
         expected: Mutex::new(None),
         opened: Mutex::new(Vec::new()),
+        application_coverage: Mutex::new(Vec::new()),
         peer: Mutex::new(None),
         descriptors: Mutex::new(Vec::new()),
         starts: AtomicUsize::new(0),
@@ -556,6 +565,7 @@ async fn managed_capture_delivers_local_nonces_and_never_relays_denied_local() {
         feed: CaptureNetworkFeed::new(41),
         expected: Mutex::new(None),
         opened: Mutex::new(Vec::new()),
+        application_coverage: Mutex::new(Vec::new()),
         peer: Mutex::new(None),
         descriptors: Mutex::new(Vec::new()),
         starts: AtomicUsize::new(0),
@@ -739,6 +749,7 @@ async fn assigned_config_handover_retains_local_sources_and_joined_shutdown() {
         feed: CaptureNetworkFeed::new(42),
         expected: Mutex::new(None),
         opened: Mutex::new(Vec::new()),
+        application_coverage: Mutex::new(Vec::new()),
         peer: Mutex::new(None),
         descriptors: Mutex::new(Vec::new()),
         starts: AtomicUsize::new(0),
@@ -925,6 +936,7 @@ fn release_fixture() -> (
         feed: CaptureNetworkFeed::new(44),
         expected: Mutex::new(None),
         opened: Mutex::new(Vec::new()),
+        application_coverage: Mutex::new(Vec::new()),
         peer: Mutex::new(None),
         descriptors: Mutex::new(Vec::new()),
         starts: AtomicUsize::new(0),
@@ -1583,6 +1595,184 @@ async fn connect_dispatch_does_not_wait_for_capture_or_parameters() {
 }
 
 #[tokio::test]
+async fn reconnect_from_unsecured_error_and_failed_close_is_not_latched() {
+    for local in [false, true] {
+        let mut configured = policy();
+        configured.enabled = local;
+        let mut h = Handover::new(configured);
+        h.target = TargetState::Unsecured;
+        h.observe(TunnelPhase::Error);
+        h.continuation.connect();
+        assert_eq!(h.advance().await.unwrap(), Some("Connect"));
+        assert_eq!(h.target, TargetState::Unsecured);
+        let pending = h.connect_endpoint_with(assigned_config()).await;
+        let broker = h.runtime.broker();
+        let old = h.transport.take().unwrap();
+        let mut request = h.request.take().unwrap();
+        let receipt = bounded(request.configured()).await.unwrap();
+        let attempt = old.control.capability();
+        let cleanup = broker.transport_cleanup();
+        h.continuation.connect();
+        assert_eq!(h.advance().await.unwrap(), Some("Connect"));
+        h.observe(TunnelPhase::Disconnecting);
+        old.control.detach();
+        drop(old);
+        request.transport_joined();
+        assert!(!pending.release_ready(), "TSM close has not joined yet");
+        // The real TSM's joined close can publish Error, not Disconnected.
+        h.observe(TunnelPhase::Error);
+        assert!(!attempt.current());
+        assert!(
+            pending.release_ready(),
+            "Error must acknowledge the joined close"
+        );
+        assert!(
+            receipt.current(),
+            "Local may retain the same observed capture"
+        );
+        assert!(!h.continuation.joined(), "Error is not public Disconnected");
+        h.continuation.connect();
+        assert_eq!(h.advance().await.unwrap(), Some("Connect"));
+        h.connect_endpoint().await;
+        cleanup.cancel();
+        drop(request);
+        assert!(h.transport.as_ref().unwrap().control.current());
+        assert_eq!(h.commands, vec!["Connect", "Connect", "Connect"]);
+        h.close().await;
+    }
+}
+
+#[tokio::test]
+async fn exclusion_change_establishes_one_effective_capture() {
+    for settings_first in [false, true] {
+        let mut h = Handover::new(policy());
+        h.runtime.set_excluded_packages(vec![]);
+        h.continuation.connect();
+        assert_eq!(h.admit().await, Some("Connect"));
+        h.connect_endpoint().await;
+        let broker = h.runtime.broker();
+        let session = broker.snapshot().session_generation;
+        let authority = h.platform.authority.lock().unwrap().clone().unwrap();
+        let grant = authority.authorize(flow(Transport::Udp, 45996)).unwrap();
+        let old = h.transport.take().unwrap();
+        let old_request = h.request.take().unwrap();
+        let attempt = old.control.capability();
+        let mut stale = attempt
+            .packet(
+                talpid_types::relay_flow::RelayBuffer::copy_from(
+                    b"stale-exclusion",
+                    broker.application_buffers().as_ref(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let before = h.platform.starts.load(SeqCst);
+        let packages = vec![
+            "missing.package".to_owned(),
+            "later.installed.package".to_owned(),
+        ];
+        if settings_first {
+            h.runtime.set_excluded_packages(packages.clone());
+            h.runtime.update(&h.policy, h.target, h.phase).await;
+        }
+        h.observe(TunnelPhase::Disconnecting);
+        old.control.detach();
+        drop(old);
+        old_request.transport_joined();
+        h.observe(TunnelPhase::Connecting);
+        h.runtime.update(&h.policy, h.target, h.phase).await;
+        let mut config = assigned_config();
+        config.excluded_packages = packages.clone();
+        h.connect_endpoint_with(config.clone()).await;
+        // The TSM can configure its new request before the asynchronous settings
+        // acknowledgement reaches the daemon. Old persisted app coverage must
+        // not independently hand that new capture back to the old projection.
+        if !settings_first {
+            h.runtime.set_excluded_packages(packages.clone());
+            h.runtime.update(&h.policy, h.target, h.phase).await;
+            h.settle_capture().await;
+        }
+        assert_eq!(
+            h.platform.starts.load(SeqCst),
+            before + 1,
+            "one effective coverage change"
+        );
+        assert_eq!(
+            h.platform
+                .opened
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .excluded_packages,
+            packages
+        );
+        assert_eq!(broker.snapshot().session_generation, session);
+        assert!(matches!(
+            stale.write(|_| panic!("stale writer")),
+            talpid_types::relay_flow::RelayWriteOutcome::Stale
+        ));
+        drop(old_request);
+        let generation = broker.snapshot().capture_generation;
+        config.excluded_packages.reverse();
+        config.excluded_packages.push("missing.package".to_owned());
+        h.runtime
+            .set_excluded_packages(config.excluded_packages.clone());
+        let request = h.request.take().unwrap();
+        h.transport.take();
+        request.transport_joined();
+        h.observe(TunnelPhase::Disconnecting);
+        h.observe(TunnelPhase::Connecting);
+        h.connect_endpoint_with(config).await;
+        assert_eq!(
+            h.platform.starts.load(SeqCst),
+            before + 1,
+            "equivalent coverage must reuse capture"
+        );
+        assert_eq!(broker.snapshot().capture_generation, generation);
+        assert_eq!(broker.snapshot().session_generation, session);
+        drop(request);
+        assert!(authority.current(&grant));
+        h.user_disconnect();
+        h.observe(TunnelPhase::Disconnecting);
+        h.acknowledge_transport_close();
+        h.advance().await.unwrap();
+        h.settle_capture().await;
+        assert_eq!(
+            h.platform
+                .application_coverage
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap(),
+            &vec![
+                "later.installed.package".to_owned(),
+                "missing.package".to_owned(),
+                "missing.package".to_owned()
+            ],
+            "Partial uses the stored current exclusions, including missing names"
+        );
+        assert_eq!(broker.snapshot().session_generation, session);
+        h.close().await;
+    }
+    let mut h = Handover::new(policy());
+    let packages = vec![
+        "missing.package".to_owned(),
+        "later.installed.package".to_owned(),
+    ];
+    h.runtime.set_excluded_packages(packages.clone());
+    h.observe(TunnelPhase::Error);
+    h.runtime.update(&h.policy, h.target, h.phase).await;
+    h.settle_capture().await;
+    assert_eq!(
+        h.platform.application_coverage.lock().unwrap().last(),
+        Some(&packages),
+        "Error before any target uses current exclusions"
+    );
+    h.close().await;
+}
+
+#[tokio::test]
 async fn continuation_leaves_off_status_for_the_daemon_notification_boundary() {
     for off in [
         LocalNetworkAccess::default(),
@@ -2009,6 +2199,7 @@ impl Handover {
             feed: CaptureNetworkFeed::new(43),
             expected: Mutex::new(None),
             opened: Mutex::new(Vec::new()),
+            application_coverage: Mutex::new(Vec::new()),
             peer: Mutex::new(None),
             descriptors: Mutex::new(Vec::new()),
             starts: AtomicUsize::new(0),
@@ -2082,15 +2273,20 @@ impl Handover {
         self.connect_endpoint_with(assigned_config()).await;
     }
 
-    async fn connect_endpoint_with(&mut self, config: talpid_tunnel::tun_provider::TunConfig) {
+    async fn connect_endpoint_with(
+        &mut self,
+        config: talpid_tunnel::tun_provider::TunConfig,
+    ) -> talpid_tunnel::packet_attachment::PendingCaptureRequest {
         self.observe(TunnelPhase::Connecting);
         let broker = self.runtime.broker();
+        let mut configured_request = None;
         if broker.snapshot().mode == AttachmentMode::ManagedRequired {
             let projected = talpid_tunnel::tun_provider::transport::router_config(
                 &config,
                 broker.local_routes(),
             );
             let mut request = broker.request_target_capture(config, projected).unwrap();
+            configured_request = broker.pending_request();
             self.runtime
                 .update(&self.policy, self.target, self.phase)
                 .await;
@@ -2132,6 +2328,7 @@ impl Handover {
                 ForwardingAvailability::Active
             }
         );
+        configured_request.expect("Handover fixture uses managed requests")
     }
 
     async fn settle_capture(&mut self) {

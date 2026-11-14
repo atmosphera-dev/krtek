@@ -17,6 +17,9 @@ import android.os.ParcelFileDescriptor
 import android.os.Process
 import android.os.SystemClock
 import androidx.test.platform.app.InstrumentationRegistry
+import co.touchlab.kermit.LogWriter
+import co.touchlab.kermit.Logger
+import co.touchlab.kermit.Severity
 import com.squareup.wire.GrpcClient
 import java.io.File
 import java.io.RandomAccessFile
@@ -32,11 +35,15 @@ import kotlin.test.assertTrue
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
@@ -47,6 +54,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import mullvad_daemon.management_interface.ManagementServiceClient
+import mullvad_daemon.management_interface.TunnelState as RpcTunnelState
 import net.mullvad.mullvadvpn.app.MullvadApplication
 import net.mullvad.mullvadvpn.lib.common.constant.GRPC_SOCKET_FILE_NAMED_ARGUMENT
 import net.mullvad.mullvadvpn.lib.grpc.ManagementService
@@ -280,6 +288,339 @@ class LocalNetworkDeliveryInstrumentedTest {
     }
 
     @Test fun consumerRunsAsAnotherApp() = withConsumer(null) { _, _, _ -> }
+
+    // B1 supplies the ordered raw-event consumer and command baseline. B2-B6
+    // extend this same method before the final clean-pair B7 campaign.
+    @Test
+    fun rulesOffMatchesUpstream() =
+        withConsumer(null, testTimeout = 8.minutes) { consumer, repository, connection ->
+            withPolicy(repository, LocalNetworkAccess()) {
+                withOrderedTunnelEvents { events ->
+                    var failure: Throwable? = null
+                    var terminalStart = 0
+                    var terminalEventExpected = false
+                    try {
+                        disconnect(connection)
+                        appliedConfiguration(
+                            LocalNetworkAccess(),
+                            ForwardingAvailability.Off,
+                            "Disconnected",
+                        )
+                        val initialConnect = events.cursor()
+                        connect(connection)
+                        awaitOrderedConnected(events, initialConnect)
+                        val before =
+                            appliedConfiguration(
+                                LocalNetworkAccess(),
+                                ForwardingAvailability.Off,
+                                "Connected",
+                            )
+                        runBlocking { assertTrue(connection.connect().isRight()) }
+                        val duplicate =
+                            appliedConfiguration(
+                                LocalNetworkAccess(),
+                                ForwardingAvailability.Off,
+                                "Connected",
+                            )
+                        assertEquals(
+                            before,
+                            duplicate,
+                            "duplicate Secured retains the same fd/configuration",
+                        )
+                        val reconnectStart = events.cursor()
+                        connect(connection, reconnect = true)
+                        awaitOrderedConnected(events, reconnectStart)
+                        assertTrue(
+                            events.since(reconnectStart).none {
+                                it is RpcTunnelState.State.Disconnected
+                            },
+                            "Reconnect must not publish Disconnected",
+                        )
+                        probeExit(consumer, "mullvad")
+                        val down = events.cursor()
+                        disconnect(connection)
+                        awaitOrderedEvent(events, down, 60_000) {
+                            it is RpcTunnelState.State.Disconnected
+                        }
+                        appliedConfiguration(
+                            LocalNetworkAccess(),
+                            ForwardingAvailability.Off,
+                            "Disconnected",
+                        )
+                        val start = events.cursor()
+                        val system = systemConnectAcknowledged()
+                        assertEquals(
+                            "true",
+                            system.changed,
+                            "System Connect must initiate the unsecured target",
+                        )
+                        awaitOrderedConnected(events, start)
+                        assertEquals(
+                            listOf("Connecting", "Connected"),
+                            events.since(start).map { it.javaClass.simpleName },
+                        )
+                        val systemCapture =
+                            appliedConfiguration(
+                                LocalNetworkAccess(),
+                                ForwardingAvailability.Off,
+                                "Connected",
+                            )
+                        val duplicateStart = events.cursor()
+                        val systemDuplicate = systemConnectAcknowledged()
+                        assertTrue(systemDuplicate.startId > system.startId)
+                        assertEquals(
+                            "false",
+                            systemDuplicate.changed,
+                            "Healthy system Connect is acknowledged as an upstream no-op",
+                        )
+                        val afterDuplicate =
+                            appliedConfiguration(
+                                LocalNetworkAccess(),
+                                ForwardingAvailability.Off,
+                                "Connected",
+                            )
+                        assertEquals(
+                            systemCapture,
+                            afterDuplicate,
+                            "Healthy system Connect retains the exact capture",
+                        )
+                        assertTrue(
+                            events.since(duplicateStart).isEmpty(),
+                            "Acknowledged healthy system Connect must publish no transition",
+                        )
+                        report(
+                            "system_connect_ack",
+                            "${system.startId}:true,${systemDuplicate.startId}:false",
+                        )
+                        report("rules_off_command_baseline", "complete")
+                        terminalStart = events.cursor()
+                        terminalEventExpected = runBlocking {
+                            connection.tunnelState.first() !is TunnelState.Disconnected
+                        }
+                    } catch (error: Throwable) {
+                        failure = error
+                        throw error
+                    } finally {
+                        restoreTunnelAfterCase(
+                            failure,
+                            { disconnect(connection) },
+                            {
+                                appliedConfiguration(
+                                    LocalNetworkAccess(),
+                                    ForwardingAvailability.Off,
+                                    "Disconnected",
+                                )
+                            },
+                            {
+                                if (failure == null && terminalEventExpected)
+                                    awaitOrderedEvent(events, terminalStart, 60_000) {
+                                        it is RpcTunnelState.State.Disconnected
+                                    }
+                            },
+                        )
+                    }
+                }
+            }
+        }
+
+    private fun restoreTunnelAfterCase(
+        originalFailure: Throwable?,
+        disconnect: () -> Unit,
+        verifyAbsent: () -> Unit,
+        verifyEvents: () -> Unit,
+    ) {
+        var failure = originalFailure
+        for (step in listOf(disconnect, verifyAbsent, verifyEvents)) {
+            try {
+                step()
+            } catch (error: Throwable) {
+                if (failure == null) failure = error
+                else if (failure !== error) failure.addSuppressed(error)
+            }
+        }
+        failure?.let { throw it }
+    }
+
+    private fun awaitOrderedConnected(events: OrderedTunnelEvents, start: Int) = run {
+        awaitOrderedEvent(events, start, 90_000) { it is RpcTunnelState.State.Connected }
+        assertTrue(
+            events.since(start).any { it is RpcTunnelState.State.Connecting },
+            "Command must reach Connecting",
+        )
+    }
+
+    private fun awaitOrderedEvent(
+        events: OrderedTunnelEvents,
+        start: Int,
+        timeoutMillis: Long,
+        matches: (RpcTunnelState.State) -> Boolean,
+    ) = runBlocking {
+        withTimeout(timeoutMillis) { events.await(start, matches) }
+    }
+
+    private class OrderedTunnelEvents {
+        private val records = mutableListOf<RpcTunnelState.State>()
+        private val changed = Channel<Unit>(Channel.CONFLATED)
+        private var failure: Throwable? = null
+
+        @Synchronized
+        fun cursor(): Int {
+            failure?.let { throw it }
+            return records.size
+        }
+
+        @Synchronized
+        fun since(start: Int): List<RpcTunnelState.State> {
+            failure?.let { throw it }
+            return records.drop(start)
+        }
+
+        fun append(state: RpcTunnelState.State): Int {
+            val index =
+                synchronized(this) {
+                    records.add(state)
+                    records.lastIndex
+                }
+            changed.trySend(Unit)
+            return index
+        }
+
+        fun fail(error: Throwable) {
+            synchronized(this) { if (failure == null) failure = error }
+            changed.close(error)
+        }
+
+        suspend fun await(start: Int, matches: (RpcTunnelState.State) -> Boolean) {
+            while (since(start).none(matches)) changed.receive()
+        }
+    }
+
+    private data class SystemConnectReceipt(val startId: Int, val changed: String)
+
+    private fun systemConnectAcknowledged(): SystemConnectReceipt {
+        val receipts = Channel<SystemConnectReceipt>(Channel.UNLIMITED)
+        val pattern =
+            Regex(
+                "^VPN command completed action=${Regex.escape(android.net.VpnService.SERVICE_INTERFACE)} startId=(\\d+) changed=(true|false|error)$"
+            )
+        val writer =
+            object : LogWriter() {
+                override fun log(
+                    severity: Severity,
+                    message: String,
+                    tag: String,
+                    throwable: Throwable?,
+                ) {
+                    val match = pattern.matchEntire(message) ?: return
+                    receipts.trySend(
+                        SystemConnectReceipt(match.groupValues[1].toInt(), match.groupValues[2])
+                    )
+                }
+            }
+        Logger.addLogWriter(writer)
+        try {
+            target.startService(
+                Intent(android.net.VpnService.SERVICE_INTERFACE)
+                    .setClassName(
+                        target.packageName,
+                        "net.mullvad.mullvadvpn.app.service.MullvadVpnService",
+                    )
+            )
+            return runBlocking { withTimeout(10_000) { receipts.receive() } }
+        } finally {
+            Logger.setLogWriters(Logger.config.logWriterList.filterNot { it === writer })
+            receipts.cancel()
+        }
+    }
+
+    private fun withOrderedTunnelEvents(block: (OrderedTunnelEvents) -> Unit) {
+        val subscribed = CompletableDeferred<Unit>()
+        val socket =
+            (target.applicationContext as MullvadApplication)
+                .getKoin()
+                .get<File>(named(GRPC_SOCKET_FILE_NAMED_ARGUMENT))
+        val client =
+            OkHttpClient.Builder()
+                .socketFactory(UnixDomainSocketFactory(socket))
+                .readTimeout(0, TimeUnit.MILLISECONDS)
+                .protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE))
+                .proxy(Proxy.NO_PROXY)
+                .eventListener(
+                    object : okhttp3.EventListener() {
+                        override fun responseHeadersEnd(
+                            call: okhttp3.Call,
+                            response: okhttp3.Response,
+                        ) {
+                            // events_listen registers the subscription before returning its
+                            // response.
+                            if (response.isSuccessful) subscribed.complete(Unit)
+                            else
+                                subscribed.completeExceptionally(
+                                    java.io.IOException("EventsListen HTTP ${response.code}")
+                                )
+                        }
+
+                        override fun callFailed(call: okhttp3.Call, ioe: java.io.IOException) {
+                            subscribed.completeExceptionally(ioe)
+                        }
+                    }
+                )
+                .build()
+        val rpc =
+            GrpcClient.Builder()
+                .client(client)
+                .baseUrl("http://localhost/")
+                .minMessageToCompress(Long.MAX_VALUE)
+                .build()
+                .create(ManagementServiceClient::class)
+        val scope = CoroutineScope(Dispatchers.IO)
+        val events = OrderedTunnelEvents()
+        var collector: Deferred<Unit>? = null
+        try {
+            val channel = runBlocking {
+                withTimeout(10_000) { rpc.EventsListen().executeIn(scope, Unit) }
+            }
+            collector =
+                scope.async(start = CoroutineStart.UNDISPATCHED) {
+                    try {
+                        for (event in channel) {
+                            val state =
+                                event.event
+                                    as?
+                                    mullvad_daemon.management_interface.DaemonEvent.Event.TunnelState
+                                    ?: continue
+                            val index = events.append(checkNotNull(state.value.state))
+                            report(
+                                "ordered_tunnel_event",
+                                JSONObject()
+                                    .put("index", index)
+                                    .put("time_ns", SystemClock.elapsedRealtimeNanos())
+                                    .put("state", state.value.toString()),
+                            )
+                        }
+                    } catch (error: Throwable) {
+                        events.fail(error)
+                        throw error
+                    } finally {
+                        events.fail(IllegalStateException("Raw tunnel event reader closed"))
+                    }
+                }
+            runBlocking { withTimeout(10_000) { subscribed.await() } }
+            block(events)
+        } finally {
+            collector?.cancel()
+            scope.cancel()
+            client.connectionPool.evictAll()
+            client.dispatcher.executorService.shutdown()
+            runBlocking {
+                try {
+                    collector?.await()
+                } catch (_: CancellationException) {
+                    /* Own reader cancellation. */
+                }
+            }
+        }
+    }
 
     /** Stable baselines are separate from the same-lifetime transition smoke. */
     @Test fun persistentLocalSessionWhileDisconnected() = stableSession("Disconnected")

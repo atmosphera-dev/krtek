@@ -309,9 +309,14 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
                     ),
                     None => talpid_tunnel::tun_provider::transport::router_blocking_config(routes),
                 };
-                // Startup/Error have no provider request to carry current app
-                // coverage. Keep the actor's normal settings projection here.
-                if let Some(packages) = &self.excluded_packages {
+                // A live target request owns full-capture app coverage. Its TSM
+                // update can precede the settings acknowledgement; projecting
+                // those old settings here would hand the new capture back.
+                // Startup/Error still need the actor's current settings when no
+                // new target configuration operation supplies their coverage.
+                if (phase == TunnelPhase::Error || self.target_config.is_none())
+                    && let Some(packages) = &self.excluded_packages
+                {
                     config.excluded_packages.clone_from(packages);
                 }
                 let applied = self.delivery.pending_or_applied_config();

@@ -312,6 +312,9 @@ they neither pause target admission nor wait for a blocking capture. A pending
 target request owns capture configuration/readiness. Explicit Disconnect and
 shutdown still revoke Mullvad admission, with exact-request cleanup and joined
 descriptor release; eligible Local sessions remain independent.
+Android system Connect follows the same upstream keyguard and command order even
+while a Partial, full or failed capture is retained. Capture ownership extends
+foreground service lifetime only; it never substitutes for dispatching Connect.
 
 Capture admission and classification select Local, a tunnel target or Drop.
 Tunnel targets translate each received packet or fragment immediately, using
