@@ -155,7 +155,6 @@ impl RelaySources {
 pub struct RelayCaptureIdentity {
     pub generation: RelayCaptureGeneration,
     pub sources: RelaySources,
-    pub mtu: u16,
 }
 
 /// One actual descriptor epoch. Partial captures have no NetworkCallback handle;
@@ -164,6 +163,8 @@ pub struct RelaySinkIdentity {
     pub generation: u64,
     pub interface: String,
     pub network_handle: Option<u64>,
+    pub sources: RelaySources,
+    pub mtu: u16,
     _charge: Arc<dyn RelayBufferReservation>,
 }
 
@@ -173,6 +174,8 @@ impl fmt::Debug for RelaySinkIdentity {
             .field("generation", &self.generation)
             .field("interface", &self.interface)
             .field("network_handle", &self.network_handle)
+            .field("sources", &self.sources)
+            .field("mtu", &self.mtu)
             .finish_non_exhaustive()
     }
 }
@@ -298,11 +301,47 @@ impl RelayCaptureOwner {
         mtu: u16,
         buffers: &dyn RelayBufferAllocator,
     ) -> Result<Self, RelayFlowError> {
+        Self::with_sink_identity(
+            generation,
+            interface,
+            network_handle,
+            sources,
+            sources,
+            mtu,
+            buffers,
+        )
+    }
+
+    pub fn with_sink_identity(
+        generation: RelayCaptureGeneration,
+        interface: &str,
+        network_handle: Option<u64>,
+        logical_sources: RelaySources,
+        sources: RelaySources,
+        mtu: u16,
+        buffers: &dyn RelayBufferAllocator,
+    ) -> Result<Self, RelayFlowError> {
+        if sources
+            .ipv4
+            .is_some_and(|ip| logical_sources.ipv4 != Some(ip))
+            || sources
+                .ipv6
+                .is_some_and(|ip| logical_sources.ipv6 != Some(ip))
+        {
+            return Err(RelayFlowError::Invalid);
+        }
         let epoch = generation.get();
-        let owner = Self::session(generation, sources, mtu, buffers)?;
+        let owner = Self::session(generation, logical_sources, buffers)?;
         // The initial owner reservation covers its fixed metadata and first sink.
         // Every later sink has its own reservation, retained by old receipts too.
-        let sink = Self::checked_sink(epoch, interface, network_handle, owner.0._charge.clone())?;
+        let sink = Self::checked_sink(
+            epoch,
+            interface,
+            network_handle,
+            sources,
+            mtu,
+            owner.0._charge.clone(),
+        )?;
         {
             let mut state = owner.0.state.lock().expect("capture state");
             state.last_sink = epoch;
@@ -314,10 +353,9 @@ impl RelayCaptureOwner {
     pub fn session(
         generation: RelayCaptureGeneration,
         sources: RelaySources,
-        mtu: u16,
         buffers: &dyn RelayBufferAllocator,
     ) -> Result<Self, RelayFlowError> {
-        if (sources.ipv4.is_none() && sources.ipv6.is_none()) || mtu == 0 {
+        if sources.ipv4.is_none() && sources.ipv6.is_none() {
             return Err(RelayFlowError::Invalid);
         }
         let charge = buffers.try_reserve(BUFFER_OVERHEAD)?;
@@ -325,7 +363,6 @@ impl RelayCaptureOwner {
             identity: RelayCaptureIdentity {
                 generation,
                 sources,
-                mtu,
             },
             state: Mutex::new(CaptureState {
                 live: true,
@@ -345,6 +382,8 @@ impl RelayCaptureOwner {
         generation: u64,
         interface: &str,
         network_handle: Option<u64>,
+        sources: RelaySources,
+        mtu: u16,
         charge: Arc<dyn RelayBufferReservation>,
     ) -> Result<RelaySink, RelayFlowError> {
         if generation == 0
@@ -354,6 +393,8 @@ impl RelayCaptureOwner {
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
             || network_handle == Some(0)
+            || mtu == 0
+            || (sources.ipv4.is_none() && sources.ipv6.is_none())
         {
             return Err(RelayFlowError::Invalid);
         }
@@ -361,6 +402,8 @@ impl RelayCaptureOwner {
             generation,
             interface: interface.to_owned(),
             network_handle,
+            sources,
+            mtu,
             _charge: charge,
         })))
     }
@@ -380,13 +423,21 @@ impl RelayCaptureOwner {
         if !state.live || state.sink.is_some() || generation.get() <= state.last_sink {
             return Err(RelayFlowError::Stale);
         }
-        if self.identity().sources != sources || self.identity().mtu != mtu {
+        if sources
+            .ipv4
+            .is_some_and(|ip| self.identity().sources.ipv4 != Some(ip))
+            || sources
+                .ipv6
+                .is_some_and(|ip| self.identity().sources.ipv6 != Some(ip))
+        {
             return Err(RelayFlowError::Invalid);
         }
         let sink = Self::checked_sink(
             generation.get(),
             interface,
             network_handle,
+            sources,
+            mtu,
             buffers.try_reserve(BUFFER_OVERHEAD)?,
         )?;
         state.last_sink = generation.get();
@@ -456,10 +507,11 @@ impl RelayCaptureOwner {
         &self,
         buffers: &dyn RelayBufferAllocator,
     ) -> Result<RelayAttemptOwner, RelayFlowError> {
+        let sink = self.capability().sink().ok_or(RelayFlowError::Stale)?;
         self.open_target(
             RelayTargetId::MULLVAD,
-            self.0.identity.sources,
-            self.0.identity.mtu,
+            sink.identity().sources,
+            sink.identity().mtu,
             buffers,
         )
     }

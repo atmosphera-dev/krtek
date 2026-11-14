@@ -1,7 +1,6 @@
-use super::{SOCKS_PROXIES, TunConfig};
+use super::{AndroidTunConfig, TunConfig};
 
 pub mod local_network;
-use ipnetwork::IpNetwork;
 use jnix::{
     FromJava, IntoJava, JnixEnv,
     jni::{
@@ -20,8 +19,6 @@ use std::{
 };
 use talpid_error::ErrorExt;
 use talpid_routing::Route;
-use talpid_types::net::ipnetwork_sub::IpNetworkSub;
-use talpid_types::net::{ALLOWED_LAN_MULTICAST_NETS, ALLOWED_LAN_NETS};
 use talpid_types::{android::AndroidContext, android::InetNetwork};
 
 /// Errors that occur while setting up VpnService tunnel.
@@ -336,91 +333,14 @@ pub struct VpnServiceConfig {
 
 impl VpnServiceConfig {
     pub fn new(tun_config: TunConfig) -> VpnServiceConfig {
-        let dns_servers = Self::resolve_dns_servers(&tun_config);
-        let routes = Self::resolve_routes(&tun_config);
-
+        let config = AndroidTunConfig::new(&tun_config);
         VpnServiceConfig {
-            addresses: tun_config.addresses,
-            dns_servers,
-            routes,
-            excluded_packages: tun_config.excluded_packages,
-            mtu: tun_config.mtu,
+            addresses: config.addresses,
+            dns_servers: config.dns_servers,
+            routes: config.routes.into_iter().map(InetNetwork::from).collect(),
+            excluded_packages: config.excluded_packages,
+            mtu: config.mtu,
         }
-    }
-
-    /// Return a list of custom DNS servers. If not specified, gateway addresses are used for DNS.
-    /// Note that `Some(vec![])` is different from `None`. `Some(vec![])` disables DNS.
-    fn resolve_dns_servers(config: &TunConfig) -> Vec<IpAddr> {
-        // If IPv6 is not available we need to disable all IPv6 DNS servers as setting any ipv6
-        // setting while ipv6 is disabled will cause leaks.
-        let want_ipv6 = |ip: &IpAddr| config.ipv6_gateway.is_some() || !ip.is_ipv6();
-        config
-            .dns_servers
-            .clone()
-            .unwrap_or_else(|| config.gateways())
-            .into_iter()
-            .filter(want_ipv6)
-            .collect()
-    }
-
-    /// Returns a vector representing all networks from the routes in the given config,
-    /// minus ALLOWED_LAN_NETS and ALLOWED_LAN_MULTICAST_NETS from the routes if allow lan
-    /// is true. This will prevent LAN traffic going in the tunnel. The gateway addresses are always
-    /// kept in the vector as well as SOCKS_PROXIES, the latter to support using SOCKS proxies
-    /// on Mullvad relays.
-    fn resolve_routes(config: &TunConfig) -> Vec<InetNetwork> {
-        if !config.allow_lan {
-            return config
-                .routes
-                .iter()
-                .cloned()
-                .map(InetNetwork::from)
-                .collect();
-        }
-
-        let required_ipv4_routes = vec![
-            IpNetwork::from(IpAddr::from(config.ipv4_gateway)),
-            // We want to keep the socks proxies subnet so that users can use those to multihop when lan sharing is active
-            SOCKS_PROXIES,
-        ];
-        let required_ipv6_routes = config
-            .ipv6_gateway
-            .map(|addr| IpNetwork::from(IpAddr::from(addr)))
-            .into_iter()
-            .collect::<Vec<IpNetwork>>();
-
-        let (original_lan_ipv4_networks, original_lan_ipv6_networks) = Self::allowed_lan_networks()
-            .cloned()
-            .partition::<Vec<_>, _>(|network| network.is_ipv4());
-
-        let lan_ipv4_networks = original_lan_ipv4_networks
-            .into_iter()
-            .flat_map(|network| network.sub_all(required_ipv4_routes.clone()))
-            .collect::<Vec<_>>();
-
-        let lan_ipv6_networks = original_lan_ipv6_networks
-            .into_iter()
-            .flat_map(|network| network.sub_all(required_ipv6_routes.clone()))
-            .collect::<Vec<_>>();
-
-        config
-            .routes
-            .iter()
-            .flat_map(|&route| {
-                if route.is_ipv4() {
-                    route.sub_all(lan_ipv4_networks.clone())
-                } else {
-                    route.sub_all(lan_ipv6_networks.clone())
-                }
-            })
-            .map(InetNetwork::from)
-            .collect()
-    }
-
-    fn allowed_lan_networks() -> impl Iterator<Item = &'static IpNetwork> {
-        ALLOWED_LAN_NETS
-            .iter()
-            .chain(ALLOWED_LAN_MULTICAST_NETS.iter())
     }
 }
 

@@ -1,7 +1,10 @@
 //! Bounded IP device and the application-facing TCP state machine.
 
 use super::{OUTPUT_PACKETS, STREAM_BUFFER};
-use crate::packet::{self, Flow};
+use crate::{
+    Refused,
+    packet::{self, Flow},
+};
 use smoltcp::{
     iface::{Config, Interface, SocketHandle, SocketSet},
     phy::{self, Device, DeviceCapabilities, Medium},
@@ -36,10 +39,27 @@ impl Stack {
             mtu,
             input,
             output,
+            refused: None,
         };
+        let interface = Self::interface(&mut device);
+        Self {
+            interface,
+            sockets: SocketSet::new(Vec::with_capacity(super::TCP_FLOWS)),
+            device,
+        }
+    }
+
+    // smoltcp caches capabilities in Interface. Rebuild only that stateless
+    // IP-device metadata; SocketSet, sequence state and both queues stay owned.
+    pub fn set_mtu(&mut self, mtu: usize) {
+        self.device.mtu = mtu;
+        self.interface = Self::interface(&mut self.device);
+    }
+
+    fn interface(device: &mut PacketDevice) -> Interface {
         let mut config = Config::new(HardwareAddress::Ip);
         config.random_seed = RandomState::new().hash_one("local TCP sequence seed");
-        let mut interface = Interface::new(config, &mut device, Instant::ZERO);
+        let mut interface = Interface::new(config, device, Instant::ZERO);
         let v4 = "192.0.2.1".parse().expect("internal IPv4");
         let v6 = "2001:db8::1".parse().expect("internal IPv6");
         interface.update_ip_addrs(|addrs| {
@@ -59,11 +79,7 @@ impl Stack {
             .routes_mut()
             .add_default_ipv6_route(v6)
             .expect("IPv6 route slot");
-        Self {
-            interface,
-            sockets: SocketSet::new(Vec::with_capacity(super::TCP_FLOWS)),
-            device,
-        }
+        interface
     }
 
     // Never expose a destination-only listener to the owner. Installation is a
@@ -180,12 +196,14 @@ pub(super) struct PacketDevice {
     mtu: usize,
     input: Arc<dyn RelayBufferAllocator>,
     output: Arc<dyn RelayBufferAllocator>,
+    pub refused: Option<Refused>,
 }
 pub(super) struct Rx(RelayBuffer);
 pub(super) struct Tx<'a> {
     outgoing: &'a mut VecDeque<RelayBuffer>,
     charge: Arc<dyn RelayBufferReservation>,
     mtu: usize,
+    refused: &'a mut Option<Refused>,
 }
 impl phy::RxToken for Rx {
     fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
@@ -194,12 +212,16 @@ impl phy::RxToken for Rx {
 }
 impl phy::TxToken for Tx<'_> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
-        assert!(len <= self.mtu, "stack output exceeds advertised MTU");
         let mut bytes = vec![0; len];
         let result = f(&mut bytes);
-        let bytes =
-            RelayBuffer::from_reservation(bytes, self.charge).expect("precharged stack output");
-        self.outgoing.push_back(bytes);
+        if len > self.mtu {
+            *self.refused = Some(Refused::UnsupportedMtu);
+            return result;
+        }
+        match RelayBuffer::from_reservation(bytes, self.charge) {
+            Ok(bytes) => self.outgoing.push_back(bytes),
+            Err(_) => *self.refused = Some(Refused::Full),
+        }
         result
     }
 }
@@ -217,6 +239,7 @@ impl Device for PacketDevice {
                 outgoing: &mut self.outgoing,
                 charge,
                 mtu: self.mtu,
+                refused: &mut self.refused,
             },
         ))
     }
@@ -229,6 +252,7 @@ impl Device for PacketDevice {
             outgoing: &mut self.outgoing,
             charge,
             mtu: self.mtu,
+            refused: &mut self.refused,
         })
     }
     fn capabilities(&self) -> DeviceCapabilities {

@@ -347,6 +347,239 @@ fn secured(broker: &AttachmentBroker, config: TunConfig) -> (ConfigurationReques
 }
 
 #[tokio::test]
+async fn effective_android_config_reuses_equal_routes_but_rebuilds_real_changes() {
+    let (platform, mut peers) = EpochPlatform::new();
+    let broker = managed::broker();
+    broker.set_mode(AttachmentMode::ManagedRequired).unwrap();
+    let mut base = fixed_config("1.1.1.1");
+    base.dns_servers
+        .as_mut()
+        .unwrap()
+        .push("9.9.9.9".parse().unwrap());
+    let (mut request, config) = secured(&broker, base.clone());
+    let (_, updates) = watch::channel(0);
+    let mut owner = FrontendOwner::start(
+        platform.clone(),
+        config,
+        test_forwarder(Arc::new(Authority::default())),
+        updates,
+        broker.clone(),
+    )
+    .unwrap();
+    bounded(owner.ready()).await.unwrap();
+    let mut peer = bounded(peers.recv()).await.unwrap();
+    let session = broker.snapshot().session_generation;
+    let mut state = owner.state();
+    let mut expected_opens = 1;
+    for case in [
+        "covered",
+        "order-duplicate",
+        "target-only",
+        "route",
+        "dns",
+        "dns-order",
+        "app",
+        "family",
+        "mtu",
+    ] {
+        let mut config = base.clone();
+        let changed = match case {
+            "covered" => {
+                config.routes.push("10.0.2.53/32".parse().unwrap());
+                false
+            }
+            "order-duplicate" => {
+                config.routes.reverse();
+                config.routes.push(config.routes[0]);
+                config.addresses.reverse();
+                config.addresses.push(config.addresses[0]);
+                false
+            }
+            "target-only" => {
+                config.ipv4_gateway = "10.64.9.1".parse().unwrap();
+                false
+            }
+            "route" => {
+                config.routes = vec!["0.0.0.0/1".parse().unwrap(), "::/0".parse().unwrap()];
+                true
+            }
+            "dns" => {
+                config.dns_servers = Some(vec!["9.9.9.9".parse().unwrap()]);
+                true
+            }
+            "dns-order" => {
+                config.dns_servers.as_mut().unwrap().reverse();
+                true
+            }
+            "app" => {
+                config.excluded_packages.push("example.excluded".into());
+                true
+            }
+            "family" => {
+                config.addresses.truncate(1);
+                config.routes.retain(ipnetwork::IpNetwork::is_ipv4);
+                true
+            }
+            "mtu" => {
+                config.mtu = 1420;
+                true
+            }
+            _ => unreachable!(),
+        };
+        // Reset genuine changes to the baseline too, observing exactly one
+        // establishment in each direction rather than accumulating differences.
+        for config in if changed {
+            vec![config, base.clone()]
+        } else {
+            vec![config]
+        } {
+            let old_epoch = broker.snapshot().capture_generation.unwrap();
+            let old_receipt = bounded(request.configured()).await.unwrap();
+            let (next_request, next_config) = secured(&broker, config);
+            owner.handover(next_config).unwrap();
+            bounded(owner.ready()).await.unwrap();
+            if changed {
+                expected_opens += 1;
+                peer = bounded(peers.recv()).await.unwrap();
+                platform.finished(old_epoch as i64).await;
+                bounded(state.changed()).await.unwrap();
+                assert!(
+                    !old_receipt.current(),
+                    "{case}: predecessor receipt revived"
+                );
+            } else {
+                assert_eq!(
+                    broker.snapshot().capture_generation,
+                    Some(old_epoch),
+                    "{case}"
+                );
+                assert!(peers.try_recv().is_err(), "{case}: redundant establish");
+            }
+            request = next_request;
+            assert_eq!(broker.snapshot().session_generation, session, "{case}");
+            assert_eq!(platform.format_calls.load(SeqCst), expected_opens, "{case}");
+        }
+    }
+    drop(peer);
+    bounded(owner.stop()).await.unwrap();
+    assert_eq!(platform.released.lock().unwrap().len(), expected_opens);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sink_mtu_changes_preserve_local_session_and_retire_only_stale_writes() {
+    let (platform, mut peers) = EpochPlatform::new();
+    let broker = managed::broker();
+    broker.set_mode(AttachmentMode::ManagedRequired).unwrap();
+    let authority = Arc::new(Authority::default());
+    let mut original = fixed_config("1.1.1.1");
+    original.mtu = 1380;
+    let (mut request, config) = secured(&broker, original.clone());
+    let (_, updates) = watch::channel(0);
+    let mut owner = FrontendOwner::start(
+        platform.clone(),
+        config,
+        test_forwarder(authority.clone()),
+        updates,
+        broker.clone(),
+    )
+    .unwrap();
+    bounded(owner.ready()).await.unwrap();
+    let mut peer = AsyncFd::new(bounded(peers.recv()).await.unwrap()).unwrap();
+    let session = broker.snapshot().session_generation;
+    let (tcp, mut accepts, server) = tcp_echo(false).await;
+    let mut state = owner.state();
+    let mut app = App::new(flow(tcp, Transport::Tcp, 49200));
+    app.nonce(&peer, b"before-mtu-change").await;
+    bounded(accepts.recv()).await.unwrap();
+    let (address, mut hits, echo) = udp_echo(false).await;
+    let local = flow(address, Transport::Udp, 49201);
+    send(&peer, &udp(local, b"before-mtu-change")).await;
+    assert_eq!(bounded(hits.recv()).await.unwrap(), b"before-mtu-change");
+    assert_eq!(
+        packet::parse(&bounded(receive(&peer)).await)
+            .unwrap()
+            .payload,
+        b"before-mtu-change"
+    );
+    for (stage, (mtu, dual)) in [(1420, true), (576, false), (1280, true), (1380, true)]
+        .into_iter()
+        .enumerate()
+    {
+        let old_receipt = bounded(request.configured()).await.unwrap();
+        let old = broker.snapshot().capture_generation.unwrap();
+        let mut config = original.clone();
+        config.mtu = mtu;
+        if !dual {
+            config.addresses.truncate(1);
+            config.routes.retain(ipnetwork::IpNetwork::is_ipv4);
+        }
+        let (next_request, next_config) = secured(&broker, config.clone());
+        // A failed pre-establish observation cannot mutate current sink metadata
+        // or retire the independent Local connection/socket.
+        platform.fail_before.store(true, SeqCst);
+        owner.handover(next_config.clone()).unwrap();
+        assert!(bounded(owner.ready()).await.is_err());
+        assert!(old_receipt.current());
+        app.nonce(&peer, b"after-mtu-rollback").await;
+        platform.fail_before.store(false, SeqCst);
+        owner.handover(next_config).unwrap();
+        bounded(owner.ready()).await.unwrap();
+        peer = AsyncFd::new(bounded(peers.recv()).await.unwrap()).unwrap();
+        platform.finished(old as i64).await;
+        bounded(state.changed()).await.unwrap();
+        assert!(!old_receipt.current());
+        assert!(
+            broker.acquire(&old_receipt).is_err(),
+            "old sink authorized a new writer"
+        );
+        let observed = platform
+            .observed(broker.snapshot().capture_generation.unwrap() as i64)
+            .unwrap();
+        assert_eq!(observed.mtu, Some(i32::from(mtu)));
+        assert_eq!(observed.addresses.len(), if dual { 2 } else { 1 });
+        assert_eq!(broker.snapshot().session_generation, session);
+        let nonce = format!("same-tcp-udp-mtu-{stage}");
+        app.nonce(&peer, nonce.as_bytes()).await;
+        let mut datagram = nonce.as_bytes().to_vec();
+        datagram.resize(usize::from(mtu) - 28, b'u');
+        send(&peer, &udp(local, &datagram)).await;
+        assert_eq!(bounded(hits.recv()).await.unwrap(), datagram);
+        assert_eq!(
+            packet::parse(&bounded(receive(&peer)).await)
+                .unwrap()
+                .payload,
+            datagram
+        );
+        assert!(
+            accepts.try_recv().is_err(),
+            "MTU/family change reopened TCP"
+        );
+        assert_eq!(
+            authority.prepares.load(SeqCst),
+            2,
+            "MTU/family change reopened a Local socket"
+        );
+        request = next_request;
+    }
+    let restored = platform
+        .observed(broker.snapshot().capture_generation.unwrap() as i64)
+        .unwrap();
+    assert_eq!(restored.mtu, Some(i32::from(original.mtu)));
+    assert_eq!(
+        restored
+            .addresses
+            .iter()
+            .map(|p| p.address)
+            .collect::<Vec<_>>(),
+        original.addresses
+    );
+    bounded(owner.stop()).await.unwrap();
+    assert!(broker.snapshot().session_generation.is_none());
+    server.abort();
+    echo.abort();
+}
+
+#[tokio::test]
 async fn observed_router_epoch_lends_equal_projection_to_rotating_targets_without_reopen() {
     let (platform, mut peers) = EpochPlatform::new();
     let broker = managed::broker();
@@ -810,7 +1043,7 @@ async fn invalid_handover_requests_leave_the_same_local_stream_and_epoch_untouch
             config.addresses[0] = "10.64.0.2".parse().unwrap();
         }
         if fault == "mtu" {
-            config.mtu = 1420;
+            config.mtu = 0;
         }
         let (request, config) = secured(&selected, config);
         if fault == "cancelled-request" {

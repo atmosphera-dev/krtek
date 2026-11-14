@@ -278,12 +278,33 @@ See the [split tunneling documentation](split-tunneling.md).
 
 ### Android
 
-Krtek's Android router uses the fixed private IPv4 address `172.27.1.1/32` and
-RFC 4193 ULA `fdf0:ce4a:801d::172:27:1:1/128`, with MTU 1280. These app-facing
-addresses are independent of Mullvad login, key rotation and tunnel assignment.
+Krtek's logical Android identity uses the fixed private IPv4 address `172.27.1.1/32`
+and RFC 4193 ULA `fdf0:ce4a:801d::172:27:1:1/128`. Actual capture families and MTU
+follow Mullvad's upstream effective configuration, with only the enabled Local
+route/family union added afterward. A missing target family is not advertised
+unless Local needs it; that extra family captures and drops non-Local traffic,
+never enabling a physical internet fallback. For an IPv4-only target below 1280,
+Local IPv6 requires a capture-only MTU floor of 1280; the target/carrier MTU is
+unchanged. Local-only capture uses MTU 1280, enabled CIDRs only and no DNS. The
+upstream safe blocking MTU is separately 1380. These app-facing address values
+are independent of Mullvad login, key rotation and tunnel assignment.
 Tunnel targets translate to their own assigned addresses; Local uses protected,
 physical-network-bound sockets. Private networks can still collide with this
 fixed pair; private-use addressing does not guarantee collision-free routing.
+
+Descriptor MTU and exposed-family configuration belong to the checked sink epoch,
+not the immutable logical session. Necessary sink handovers retain eligible Local
+connections; old receipts never authorize writes to a successor. Equal effective
+Builder fields reuse the observed sink, including redundant/covered Local routes.
+Local updates its IP-device MTU metadata in place, retaining TCP socket state,
+physical sockets, grants and queued output. Its protocol-sized ingress scratch
+and byte-credited egress arena already fund maximum-sized packet peaks; a change
+does not allocate a new session or depend on fresh root credit. Unsupported MTU
+configuration returns a typed refusal. A superseded target cannot acquire
+readiness, but does not invalidate an exactly observed Local capture epoch.
+DNS and LAN subtraction use the upstream projection once; DNS resolvers are not
+globally recaptured or reserved from an explicit Local rule. Mullvad's real gateway
+and SOCKS exceptions remain reserved.
 
 Capture admission and classification select Local, a tunnel target or Drop.
 Tunnel targets translate each received packet or fragment immediately, using
@@ -299,7 +320,8 @@ unchanged.
 
 Local is a receiver, not tunnel transit. It terminates connections using its
 stack and protected, physical-network-bound sockets. Its current pre-stack
-parser rejects IPv4/IPv6 fragments; large Local UDP is not supported yet.
+parser rejects IPv4/IPv6 fragments. Complete Local datagrams up to the actual
+capture MTU are supported; fragmented Local UDP still requires future receiver work.
 
 ### iOS
 

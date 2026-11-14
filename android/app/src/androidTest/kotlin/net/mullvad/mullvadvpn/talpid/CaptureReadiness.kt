@@ -1,10 +1,37 @@
 package net.mullvad.mullvadvpn.talpid
 
+import java.net.InetAddress
+
 /** Samples from Android and the daemon log converge independently within the caller's deadline. */
 internal object CaptureReadiness {
+    fun routePrefix(text: String): String =
+        checkNotNull(
+                Regex(
+                        "^\\s*([0-9a-fA-F:.]+/\\d+)(?:\\s+->.*|\\s+unreachable(?:\\s+mtu\\s+\\d+)?)?$"
+                    )
+                    .matchEntire(text)
+            ) {
+                "Malformed Android route"
+            }
+            .groupValues[1]
+
     data class Receipt(val generation: String, val handle: String, val text: String)
 
     data class PartialReceipt(val generation: String, val session: String, val format: String)
+
+    enum class DnsExpectation {
+        Present,
+        Absent,
+    }
+
+    /** Receives the decoded contents of DnsAddresses, never a bracketed display value. */
+    fun dnsMatches(dns: String, expectation: DnsExpectation): Boolean {
+        if ('[' in dns || ']' in dns) return false
+        return when (expectation) {
+            DnsExpectation.Present -> dns.isNotBlank()
+            DnsExpectation.Absent -> dns.isBlank()
+        }
+    }
 
     fun configurationReady(
         addressesReady: Boolean,
@@ -13,12 +40,39 @@ internal object CaptureReadiness {
         routes: Set<String>,
         expectedRoutes: Set<String>,
         requiredMtu: Int? = null,
+        exposesIpv6: Boolean = false,
+        dnsExpectation: DnsExpectation = DnsExpectation.Present,
     ): Boolean =
         addressesReady &&
-            dns.isNotEmpty() &&
-            mtu >= 1280 &&
+            dnsMatches(dns, dnsExpectation) &&
+            mtu >= (if (exposesIpv6) 1280 else 1) &&
             (requiredMtu == null || mtu == requiredMtu) &&
-            routes.containsAll(expectedRoutes)
+            expectedRoutes.all { expected -> routes.any { covers(it, expected) } }
+
+    fun covers(route: String, destination: String): Boolean {
+        val network = InetAddress.getByName(route.substringBefore('/')).address
+        val address = InetAddress.getByName(destination.substringBefore('/')).address
+        val prefix = route.substringAfter('/').toInt()
+        if (
+            network.size != address.size ||
+                prefix !in 0..network.size * 8 ||
+                prefix > destination.substringAfter('/').toInt()
+        )
+            return false
+        if (
+            (prefix until network.size * 8).any { bit ->
+                network[bit / 8].toInt() and (1 shl (7 - bit % 8)) != 0
+            }
+        )
+            return false
+        return (0 until prefix).all { bit ->
+            val mask = 1 shl (7 - bit % 8)
+            network[bit / 8].toInt() and mask == address[bit / 8].toInt() and mask
+        }
+    }
+
+    fun minimalRoutes(routes: Set<String>): Set<String> =
+        routes.filter { route -> routes.none { it != route && covers(it, route) } }.toSet()
 
     fun partialReceipt(tail: String, previousGeneration: String?): PartialReceipt? {
         val current =

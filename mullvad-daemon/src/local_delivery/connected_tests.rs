@@ -725,7 +725,7 @@ async fn managed_capture_delivers_local_nonces_and_never_relays_denied_local() {
 }
 
 #[tokio::test]
-async fn assigned_config_replacement_and_shutdown_retain_release_and_revoke_old_sources() {
+async fn assigned_config_handover_retains_local_sources_and_joined_shutdown() {
     let platform = Arc::new(PacketPlatform {
         feed: CaptureNetworkFeed::new(42),
         expected: Mutex::new(None),
@@ -755,18 +755,22 @@ async fn assigned_config_replacement_and_shutdown_retain_release_and_revoke_old_
     );
     let broker = runtime.broker();
     broker.set_mode(AttachmentMode::ManagedRequired).unwrap();
-    let mut first_request = broker.request_capture(assigned_config()).unwrap();
+    let target = assigned_config();
+    let projected =
+        talpid_tunnel::tun_provider::transport::router_config(&target, broker.local_routes());
+    let mut first_request = broker.request_target_capture(target, projected).unwrap();
     runtime
         .update(&policy(), TargetState::Secured, TunnelPhase::Connecting)
         .await;
     bounded(runtime.notifications().1).await;
     let first = bounded(first_request.configured()).await.unwrap();
+    let session = broker.snapshot().session_generation;
     let first_pair = broker.acquire(&first).unwrap();
     first_pair.control.activate().unwrap();
     runtime.owner_changed(&policy(), TargetState::Secured, TunnelPhase::Connected);
     let authority = platform.authority.lock().unwrap().clone().unwrap();
     let mut old_flow = flow(Transport::Udp, 45010);
-    old_flow.source.set_ip(assigned_config().addresses[0]);
+    old_flow.source.set_ip(fixed_config().addresses[0]);
     let old_grant = authority.authorize(old_flow).unwrap();
 
     let mut replacement = assigned_config();
@@ -781,16 +785,37 @@ async fn assigned_config_replacement_and_shutdown_retain_release_and_revoke_old_
     platform.fail_release.store(true, SeqCst);
     first_pair.control.detach();
     first_request.transport_joined();
-    let mut second_request = broker.request_capture(replacement.clone()).unwrap();
+    let projected =
+        talpid_tunnel::tun_provider::transport::router_config(&replacement, broker.local_routes());
+    let mut second_request = broker
+        .request_target_capture(replacement.clone(), projected.clone())
+        .unwrap();
     runtime
         .update(&policy(), TargetState::Secured, TunnelPhase::Connected)
         .await;
+    bounded(runtime.notifications().1).await;
+    let second = bounded(second_request.configured()).await.unwrap();
+    assert_ne!(first.generation(), second.generation());
+    assert!(!first.current(), "old sink receipt must stay stale");
+    let second_pair = broker.acquire(&second).unwrap();
+    second_pair.control.activate().unwrap();
+    bounded(async {
+        while !runtime.failed() {
+            runtime.notifications().1.await;
+        }
+    })
+    .await;
+    runtime.owner_changed(&policy(), TargetState::Secured, TunnelPhase::Connected);
     assert!(runtime.has_owner());
     assert_eq!(runtime.status().forwarding, ForwardingAvailability::Failed);
-    assert!(!authority.current(&old_grant));
+    assert!(
+        authority.current(&old_grant),
+        "sink cleanup does not retire eligible Local authority"
+    );
     assert!(!first_pair.control.current());
-    assert_eq!(platform.starts.load(SeqCst), 1);
-    assert!(broker.pending_request().is_some());
+    assert_eq!(broker.snapshot().session_generation, session);
+    assert_eq!(platform.starts.load(SeqCst), 2);
+    assert!(broker.pending_request().is_none());
     let release_count = platform.releases.load(SeqCst);
     runtime
         .internal_update(&policy(), TargetState::Secured, TunnelPhase::Connected)
@@ -801,26 +826,44 @@ async fn assigned_config_replacement_and_shutdown_retain_release_and_revoke_old_
         "internal wake cannot retry release"
     );
     assert!(
-        tokio::time::timeout(Duration::from_millis(20), second_request.configured())
-            .await
-            .is_err()
+        second_pair.control.current(),
+        "cleanup failure retains the configured successor"
+    );
+    assert!(
+        !platform
+            .completed_releases
+            .lock()
+            .unwrap()
+            .contains(&(first.generation() as i64))
     );
     platform.fail_release.store(false, SeqCst);
     runtime
         .update(&policy(), TargetState::Secured, TunnelPhase::Connected)
         .await;
     bounded(runtime.notifications().1).await;
-    let second = bounded(second_request.configured()).await.unwrap();
-    assert_ne!(first.generation(), second.generation());
-    let second_pair = broker.acquire(&second).unwrap();
-    second_pair.control.activate().unwrap();
     runtime.owner_changed(&policy(), TargetState::Secured, TunnelPhase::Connected);
     assert_eq!(runtime.status().forwarding, ForwardingAvailability::Active);
-    assert!(!authority.current(&old_grant));
-    assert!(authority.authorize(old_flow).is_err());
+    assert!(authority.current(&old_grant));
+    assert_eq!(broker.snapshot().session_generation, session);
+    assert_eq!(
+        platform.starts.load(SeqCst),
+        2,
+        "release retry cannot reopen the sink"
+    );
+    assert!(
+        platform
+            .completed_releases
+            .lock()
+            .unwrap()
+            .contains(&(first.generation() as i64))
+    );
     let mut new_flow = old_flow;
     new_flow.source.set_ip(replacement.addresses[0]);
-    let new_grant = authority.authorize(new_flow).unwrap();
+    assert!(
+        authority.authorize(new_flow).is_err(),
+        "target assignment cannot become a Local source"
+    );
+    let new_grant = authority.authorize(old_flow).unwrap();
     let observed = platform.expected.lock().unwrap().clone().unwrap();
     assert_eq!(
         observed
@@ -828,7 +871,7 @@ async fn assigned_config_replacement_and_shutdown_retain_release_and_revoke_old_
             .iter()
             .map(|p| p.address)
             .collect::<Vec<_>>(),
-        replacement.addresses
+        projected.addresses
     );
     assert_eq!(
         observed.dns_servers,
@@ -837,7 +880,7 @@ async fn assigned_config_replacement_and_shutdown_retain_release_and_revoke_old_
     assert_eq!(observed.mtu, Some(1420));
     assert_eq!(
         platform.opened.lock().unwrap().last(),
-        Some(&replacement),
+        Some(&projected),
         "exact config including routes/exclusions reaches platform"
     );
     drop(first_request);
@@ -906,6 +949,159 @@ fn fixed_config() -> talpid_tunnel::tun_provider::TunConfig {
     ];
     config.mtu = 1280;
     config
+}
+
+#[tokio::test]
+async fn production_factory_mtu_changes_preserve_local_session_and_cancelled_target_is_not_loss() {
+    use talpid_tunnel::android_frontend::{CaptureFormat, CaptureHandover};
+    struct Deferred {
+        platform: Arc<PacketPlatform>,
+        defer: AtomicBool,
+        entered: tokio::sync::Notify,
+    }
+    impl FrontendPlatform for Deferred {
+        fn open(&self, g: i64, c: &CaptureConfig) -> io::Result<OwnedFd> {
+            self.platform.open(g, c)
+        }
+        fn handover(&self, old: i64, g: i64, c: &CaptureConfig) -> CaptureHandover {
+            self.platform.handover(old, g, c)
+        }
+        fn capture_format(&self, fd: BorrowedFd<'_>) -> io::Result<CaptureFormat> {
+            self.platform.capture_format(fd)
+        }
+        fn capture_feed(&self) -> Arc<CaptureNetworkFeed> {
+            self.platform.capture_feed()
+        }
+        fn interface_name(&self, fd: BorrowedFd<'_>) -> io::Result<String> {
+            self.platform.interface_name(fd)
+        }
+        fn expectation(&self, c: &CaptureConfig, i: String) -> io::Result<CaptureExpectation> {
+            self.platform.expectation(c, i)
+        }
+        fn bind(&self, g: i64, i: &str) -> io::Result<bool> {
+            if self.defer.load(SeqCst) {
+                self.entered.notify_one();
+                Ok(true)
+            } else {
+                self.platform.bind(g, i)
+            }
+        }
+        fn closed(&self, g: i64) -> io::Result<()> {
+            self.platform.closed(g)
+        }
+    }
+    let (_, platform, broker) = release_fixture();
+    let deferred = Arc::new(Deferred {
+        platform: platform.clone(),
+        defer: AtomicBool::new(false),
+        entered: tokio::sync::Notify::new(),
+    });
+    let factory = super::super::managed_platform::PlatformFactory(deferred.clone());
+    let buffers = DeliveryBuffers::new();
+    let auth = authority();
+    auth.update(
+        &policy(),
+        Some(NetworkObservation::from(&physical_snapshot())),
+    );
+    let mut delivery = Delivery::new(factory, auth.clone(), buffers.local.clone(), broker.clone());
+    let projected = |mtu: u16, dual: bool| {
+        let mut target = assigned_config();
+        target.mtu = mtu;
+        if !dual {
+            target.addresses.truncate(1);
+            target.ipv6_gateway = None;
+            target.routes.retain(ipnetwork::IpNetwork::is_ipv4);
+        }
+        talpid_tunnel::tun_provider::transport::router_config(
+            &target,
+            vec!["10.0.2.2/32".parse().unwrap()],
+        )
+    };
+    let mut session = None;
+    let mut grant = None;
+    for (mtu, dual) in [
+        (576, false),
+        (1380, true),
+        (1220, false),
+        (u16::MAX, true),
+        (68, false),
+        (1280, true),
+    ] {
+        let old = broker.snapshot().capture_generation;
+        delivery
+            .maintain_config(Some(DeliveryConfig::Router(projected(mtu, dual))))
+            .await;
+        bounded(delivery.changed()).await;
+        auth.endpoint(true);
+        if let Some(expected) = session {
+            assert_eq!(broker.snapshot().session_generation, Some(expected));
+        } else {
+            session = broker.snapshot().session_generation;
+            grant = Some(auth.authorize(flow(Transport::Udp, 45980)).unwrap());
+        }
+        assert!(broker.snapshot().capture_ready && auth.current(grant.as_ref().unwrap()));
+        assert_eq!(
+            platform.expected.lock().unwrap().as_ref().unwrap().mtu,
+            Some(i32::from(mtu))
+        );
+        if let Some(old) = old {
+            bounded(async {
+                loop {
+                    let changed = platform.released.notified();
+                    if platform
+                        .completed_releases
+                        .lock()
+                        .unwrap()
+                        .contains(&(old as i64))
+                    {
+                        break;
+                    }
+                    changed.await;
+                }
+            })
+            .await;
+            bounded(delivery.changed()).await;
+        }
+    }
+    deferred.defer.store(true, SeqCst);
+    let mut cancelled = broker.request_capture(projected(1220, false)).unwrap();
+    delivery
+        .maintain_config(Some(DeliveryConfig::Secured {
+            broker: broker.clone(),
+            request: broker.pending_request().unwrap(),
+        }))
+        .await;
+    bounded(deferred.entered.notified()).await;
+    cancelled.cancel();
+    let generation = platform.generation.load(SeqCst);
+    assert!(platform.bind(generation, "tun-owned").unwrap());
+    bounded(delivery.changed()).await;
+    assert!(
+        cancelled.configured().await.is_err(),
+        "cancelled target acquired readiness"
+    );
+    assert_eq!(broker.snapshot().session_generation, session);
+    assert!(broker.snapshot().capture_ready && auth.current(grant.as_ref().unwrap()));
+    cancelled.transport_joined();
+    deferred.defer.store(false, SeqCst);
+    delivery.stop().await.unwrap();
+    assert!(broker.snapshot().session_generation.is_none());
+    for invalid in [0, 67] {
+        let factory = super::super::managed_platform::PlatformFactory(deferred.clone());
+        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            factory.start(
+                DeliveryConfig::Router(projected(invalid, false)),
+                authority(),
+                buffers.local.clone(),
+                broker.clone(),
+            )
+        }));
+        assert!(attempt.is_ok(), "configuration panicked");
+        assert_eq!(
+            attempt.unwrap().err().unwrap().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
 }
 
 #[tokio::test]
@@ -1548,10 +1744,13 @@ impl Handover {
     }
 
     async fn connect_endpoint(&mut self) {
+        self.connect_endpoint_with(assigned_config()).await;
+    }
+
+    async fn connect_endpoint_with(&mut self, config: talpid_tunnel::tun_provider::TunConfig) {
         self.observe(TunnelPhase::Connecting);
         let broker = self.runtime.broker();
         if broker.snapshot().mode == AttachmentMode::ManagedRequired {
-            let config = assigned_config();
             let projected = talpid_tunnel::tun_provider::transport::router_config(
                 &config,
                 broker.local_routes(),
@@ -1814,17 +2013,26 @@ async fn managed_teardown_revokes_now_but_releases_only_after_transport_join() {
         platform.closed(1).unwrap();
         assert!(platform.peer_closed(&peer));
     }
-    for trigger in ["disconnect", "rules-off", "routes", "shutdown"] {
+    for (trigger, allow_lan) in [
+        ("disconnect", false),
+        ("rules-off", false),
+        ("routes", false),
+        ("rules-off", true),
+        ("routes", true),
+        ("shutdown", false),
+    ] {
         for fail_release in [false, true] {
             let mut h = Handover::new(policy());
             h.continuation.connect();
             assert_eq!(h.admit().await, Some("Connect"));
             let initial_generation = h.platform.generation.load(SeqCst);
-            h.connect_endpoint().await;
+            let mut target = assigned_config();
+            target.allow_lan = allow_lan;
+            h.connect_endpoint_with(target).await;
             bounded(h.runtime.notifications().1).await;
             h.wait_for_capture_release(initial_generation).await;
             if trigger != "shutdown" {
-                verify_live_router_change(h, trigger, fail_release).await;
+                verify_live_router_change(h, trigger, fail_release, allow_lan).await;
                 continue;
             }
             h.commands.clear();
@@ -1972,7 +2180,12 @@ async fn managed_teardown_revokes_now_but_releases_only_after_transport_join() {
     assert_eq!(h.platform.releases.load(SeqCst), 4);
 }
 
-async fn verify_live_router_change(mut h: Handover, trigger: &str, fail_release: bool) {
+async fn verify_live_router_change(
+    mut h: Handover,
+    trigger: &str,
+    fail_release: bool,
+    allow_lan: bool,
+) {
     h.commands.clear();
     let old_generation = h.platform.generation.load(SeqCst);
     let broker = h.runtime.broker();
@@ -1989,6 +2202,7 @@ async fn verify_live_router_change(mut h: Handover, trigger: &str, fail_release:
         .try_clone()
         .unwrap();
     let before = h.platform.releases.load(SeqCst);
+    let opens = h.platform.starts.load(SeqCst);
     h.platform.fail_release.store(fail_release, SeqCst);
     if trigger == "disconnect" {
         h.user_disconnect();
@@ -2029,6 +2243,32 @@ async fn verify_live_router_change(mut h: Handover, trigger: &str, fail_release:
             "Local policy retired ordinary VPN"
         );
         assert!(h.commands.is_empty());
+    }
+    if trigger != "disconnect" && !allow_lan {
+        assert_eq!(
+            h.platform.starts.load(SeqCst),
+            opens,
+            "default-covered route change reopened the sink"
+        );
+        assert_eq!(h.platform.releases.load(SeqCst), before);
+        assert_eq!(h.platform.generation.load(SeqCst), old_generation);
+        assert_eq!(broker.snapshot().session_generation, session);
+        assert!(h.runtime.capture_configuration_ready());
+        assert!(!h.platform.peer_closed(&old_peer));
+        let mut public = flow(Transport::Udp, 45913);
+        public.destination = "1.1.1.1:443".parse().unwrap();
+        let bytes = udp_packet(public, b"ordinary-vpn-survives-covered-local-change");
+        old_peer.send(&bytes).unwrap();
+        bounded(h.transport.as_mut().unwrap().receive.recv())
+            .await
+            .unwrap()
+            .handoff(|actual| assert_eq!(actual, bytes))
+            .unwrap();
+        assert_eq!(h.platform.starts.load(SeqCst), opens);
+        assert_eq!(h.platform.releases.load(SeqCst), before);
+        h.platform.fail_release.store(false, SeqCst);
+        h.close().await;
+        return;
     }
     bounded(h.runtime.notifications().1).await;
     bounded(async {

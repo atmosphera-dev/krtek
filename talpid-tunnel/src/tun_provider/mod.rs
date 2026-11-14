@@ -4,7 +4,9 @@ use cfg_if::cfg_if;
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+mod android_config;
 pub mod transport;
+pub use android_config::AndroidTunConfig;
 
 /// SOCKS5 control destinations on Mullvad relays, retained by LAN subtraction
 /// and reserved from daemon-owned local delivery.
@@ -63,6 +65,29 @@ impl From<Vec<String>> for PartialConfig {
     }
 }
 
+impl PartialConfig {
+    pub fn same_android_config(&self, other: &Self) -> bool {
+        let fields = |config: &Self| -> Option<AndroidTunConfig> {
+            Some(
+                AndroidTunConfig {
+                    addresses: vec![transport::ROUTER_IPV4.into(), transport::ROUTER_IPV6.into()],
+                    dns_servers: vec![],
+                    routes: config
+                        .routes
+                        .iter()
+                        .map(|route| route.parse())
+                        .collect::<Result<_, _>>()
+                        .ok()?,
+                    excluded_packages: config.excluded_packages.clone(),
+                    mtu: transport::LOCAL_ONLY_MTU,
+                }
+                .normalized(),
+            )
+        };
+        fields(self).zip(fields(other)).is_some_and(|(a, b)| a == b)
+    }
+}
+
 /// Configuration for creating a tunnel device.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TunConfig {
@@ -105,6 +130,10 @@ pub struct TunConfig {
 }
 
 impl TunConfig {
+    pub fn same_android_config(&self, other: &Self) -> bool {
+        AndroidTunConfig::new(self).normalized() == AndroidTunConfig::new(other).normalized()
+    }
+
     /// Return a copy of all gateway addresses
     pub fn gateways(&self) -> Vec<IpAddr> {
         let mut servers = vec![self.ipv4_gateway.into()];

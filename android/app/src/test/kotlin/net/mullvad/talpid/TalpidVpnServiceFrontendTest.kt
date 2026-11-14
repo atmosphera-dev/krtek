@@ -1,6 +1,8 @@
 package net.mullvad.talpid
 
+import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Looper
 import android.os.ParcelFileDescriptor
@@ -72,6 +74,106 @@ class TalpidVpnServiceFrontendTest {
     }
 
     @AfterEach fun cleanup() = unmockkAll()
+
+    private fun enableCaptureObservation() {
+        TalpidVpnService::class.java.getDeclaredField("captureRegistration").apply {
+            isAccessible = true
+            setLong(service, 1L)
+        }
+        val connectivity = mockk<ConnectivityManager>(relaxed = true)
+        every { service.getSystemService(ConnectivityManager::class.java) } returns connectivity
+        every { service.getSystemService(android.content.Context.CONNECTIVITY_SERVICE) } returns
+            connectivity
+        every { anyConstructed<VpnService.Builder>().addDnsServer(any<InetAddress>()) } returns
+            mockk(relaxed = true)
+        mockkConstructor(NetworkRequest.Builder::class)
+        val request = mockk<NetworkRequest.Builder>()
+        every { anyConstructed<NetworkRequest.Builder>().removeCapability(any()) } returns request
+        every { request.addTransportType(any()) } returns request
+        every { request.build() } returns mockk()
+    }
+
+    @Test
+    fun `should pass supplied Mullvad mtu to initial and handover builders`() {
+        enableCaptureObservation()
+        for ((index, mtu) in listOf(576, 1280, 1380, 1420).withIndex()) {
+            val first = 100L + index * 2
+            val config =
+                TalpidVpnServiceFallbackDnsTest.baseTunConfig.copy(
+                    mtu = mtu,
+                    dnsServers = arrayListOf(InetAddress.getByName("1.1.1.1")),
+                )
+            assertEquals(CreateTunResult.Success(7), service.openSecuredFrontend(first, config))
+            assertEquals(
+                CreateTunResult.Success(7),
+                service.handoverSecuredFrontend(first, first + 1, config).result,
+            )
+            verify(exactly = 2) { anyConstructed<VpnService.Builder>().setMtu(mtu) }
+            service.finishLocalFrontend(first)
+            service.finishLocalFrontend(first + 1)
+        }
+        verify(exactly = 8) { anyConstructed<VpnService.Builder>().establish() }
+        verify(exactly = 0) { anyConstructed<VpnService.Builder>().allowBypass() }
+    }
+
+    @Test
+    fun `should preserve Local only no DNS and exclusions across mtu handover`() {
+        enableCaptureObservation()
+        val routes = arrayOf("10.0.2.53/32", "fd42::/64")
+        val excluded = arrayOf("com.android.deskclock", "com.android.calendar")
+        val config =
+            TalpidVpnServiceFallbackDnsTest.baseTunConfig.copy(
+                mtu = 1380,
+                dnsServers = arrayListOf(InetAddress.getByName("1.1.1.1")),
+                excludedPackages = ArrayList(excluded.toList()),
+            )
+        assertEquals(CreateTunResult.Success(7), service.openLocalFrontend(201, routes, excluded))
+        assertEquals(
+            CreateTunResult.Success(7),
+            service.handoverSecuredFrontend(201, 202, config).result,
+        )
+        service.finishLocalFrontend(201)
+        assertEquals(
+            CreateTunResult.Success(7),
+            service.handoverSecuredFrontend(202, 203, config.copy(mtu = 576)).result,
+        )
+        service.finishLocalFrontend(202)
+        assertEquals(
+            CreateTunResult.Success(7),
+            service.handoverLocalFrontend(203, 204, routes, excluded).result,
+        )
+        service.finishLocalFrontend(203)
+        service.finishLocalFrontend(204)
+        verify(exactly = 2) { anyConstructed<VpnService.Builder>().setMtu(1280) }
+        verify(exactly = 1) { anyConstructed<VpnService.Builder>().setMtu(1380) }
+        verify(exactly = 1) { anyConstructed<VpnService.Builder>().setMtu(576) }
+        for (app in excluded) {
+            verify(exactly = 4) {
+                anyConstructed<VpnService.Builder>().addDisallowedApplication(app)
+            }
+        }
+        for (route in routes) {
+            verify(exactly = 2) {
+                anyConstructed<VpnService.Builder>()
+                    .addRoute(
+                        InetAddress.getByName(route.substringBefore('/')),
+                        route.substringAfter('/').toInt(),
+                    )
+            }
+        }
+        verify(exactly = 2) {
+            anyConstructed<VpnService.Builder>().addRoute(InetAddress.getByName("0.0.0.0"), 0)
+        }
+        verify(exactly = 2) {
+            anyConstructed<VpnService.Builder>().addDnsServer(InetAddress.getByName("1.1.1.1"))
+        }
+        verify(exactly = 2) {
+            anyConstructed<VpnService.Builder>().addDnsServer(any<InetAddress>())
+        }
+        verify(exactly = 0) { anyConstructed<VpnService.Builder>().addDnsServer(any<String>()) }
+        verify(exactly = 0) { anyConstructed<VpnService.Builder>().allowBypass() }
+        verify(exactly = 4) { anyConstructed<VpnService.Builder>().establish() }
+    }
 
     @Test
     fun `should configure zero DNS servers on initial and replacement frontends without a watcher`() {

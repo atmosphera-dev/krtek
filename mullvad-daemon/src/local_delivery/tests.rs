@@ -141,6 +141,147 @@ fn assigned_config() -> talpid_tunnel::tun_provider::TunConfig {
     config
 }
 
+#[test]
+fn local_route_union_preserves_upstream_exceptions_and_family_scope() {
+    use talpid_tunnel::tun_provider::{
+        AndroidTunConfig,
+        transport::{ROUTER_SOURCES, router_config},
+    };
+    for mtu in [576, 1280, 1380, 1420] {
+        for dual in [false, true] {
+            let mut target = assigned_config();
+            target.mtu = mtu;
+            target.allow_lan = true;
+            target.dns_servers = Some(vec!["10.0.2.53".parse().unwrap()]);
+            if !dual {
+                target.addresses.truncate(1);
+                target.ipv6_gateway = None;
+                target.routes.retain(ipnetwork::IpNetwork::is_ipv4);
+            }
+            for extra in [false, true] {
+                let mut routes = vec!["10.0.2.53/32".parse().unwrap()];
+                if extra {
+                    routes.push("fd42::/64".parse().unwrap());
+                }
+                let capture = router_config(&target, routes);
+                let fields = AndroidTunConfig::new(&capture);
+                assert_eq!(fields.mtu, if extra && !dual { mtu.max(1280) } else { mtu });
+                assert_eq!(
+                    fields.addresses.contains(&ROUTER_IPV6.into()),
+                    dual || extra
+                );
+                assert_eq!(target.addresses.iter().any(IpAddr::is_ipv6), dual);
+                assert_eq!(target.mtu, mtu);
+                assert!(
+                    fields
+                        .routes
+                        .iter()
+                        .any(|route| route.contains("10.0.2.53".parse().unwrap()))
+                );
+                assert!(
+                    !fields
+                        .routes
+                        .iter()
+                        .any(|route| route.contains("10.0.2.54".parse().unwrap()))
+                );
+                assert_eq!(
+                    fields.routes.contains(&"::/0".parse().unwrap()),
+                    extra && !dual
+                );
+                let broker = broker();
+                let authority = authority();
+                let mut policy = policy();
+                policy.rules[0].cidrs =
+                    vec!["10.0.0.0/8".parse().unwrap(), "fd42::/64".parse().unwrap()];
+                authority.update(&policy, Some(observation()));
+                authority.install(DeliveryConfig::Router(capture.clone()).authority(&broker));
+                assert_eq!(
+                    authority.disposition("10.0.2.53".parse().unwrap()),
+                    Disposition::Local
+                );
+                for reserved in ["10.64.0.1", "10.124.0.5"] {
+                    assert_eq!(
+                        authority.disposition(reserved.parse().unwrap()),
+                        Disposition::Drop
+                    );
+                }
+                assert_eq!(
+                    DeliveryConfig::Router(capture).authority(&broker).sources,
+                    vec![IpAddr::from(ROUTER_IPV4), IpAddr::from(ROUTER_IPV6)]
+                );
+                assert!(ROUTER_SOURCES.ipv6.is_some());
+                if !dual {
+                    use talpid_netstack::{
+                        address_translation::{
+                            AddressTranslator, Direction, TargetConfig, TranslationError,
+                        },
+                        buffer_budget::BufferBudget,
+                    };
+                    use talpid_types::relay_flow::{
+                        RelayCaptureGeneration, RelayCaptureOwner, RelaySources, RelayTargetId,
+                    };
+                    let buffers = Arc::new(BufferBudget::new(1024 * 1024));
+                    let owner = RelayCaptureOwner::new(
+                        RelayCaptureGeneration::fresh().unwrap(),
+                        "tun-local",
+                        99,
+                        ROUTER_SOURCES,
+                        mtu.max(1280),
+                        buffers.as_ref(),
+                    )
+                    .unwrap();
+                    let assigned = RelaySources {
+                        ipv4: Some("10.64.2.3".parse().unwrap()),
+                        ipv6: None,
+                    };
+                    let attempt = owner
+                        .open_target(RelayTargetId::MULLVAD, assigned, mtu, buffers.as_ref())
+                        .unwrap();
+                    attempt.activate().unwrap();
+                    let mut mapper = AddressTranslator::new(
+                        TargetConfig {
+                            target_id: 1,
+                            fixed: ROUTER_SOURCES,
+                            assigned,
+                            mtu,
+                        },
+                        attempt.capability(),
+                        buffers.clone(),
+                    )
+                    .unwrap();
+                    let public = udp_packet(
+                        Flow {
+                            source: SocketAddr::new(ROUTER_IPV6.into(), 49350),
+                            destination: "[2001:4860:4860::8888]:443".parse().unwrap(),
+                            transport: Transport::Udp,
+                        },
+                        b"no-physical-family-fallback",
+                    );
+                    assert!(matches!(
+                        mapper.translate(&public, Direction::Outbound),
+                        Err(TranslationError::Family)
+                    ));
+                    drop(mapper);
+                    drop(attempt);
+                    drop(owner);
+                    assert_eq!(buffers.used(), 0);
+                }
+            }
+        }
+    }
+    let partial = DeliveryConfig::Partial(vec!["10.0.2.53/32".into(), "fd42::/64".into()].into());
+    assert!(
+        partial.router_config().is_none(),
+        "Local-only acquired DNS/default routes"
+    );
+    let talpid_tunnel::android_frontend::CaptureConfig::Partial(config) =
+        partial.into_frontend(authority())
+    else {
+        panic!("Local-only")
+    };
+    assert_eq!(config.routes, ["10.0.2.53/32", "fd42::/64"]);
+}
+
 #[tokio::test]
 async fn intentional_handover_is_paused_but_an_unacknowledged_release_is_failed() {
     use crate::local_network::TunnelPhase;
@@ -199,7 +340,10 @@ async fn assigned_sources_and_capture_identity_are_required_at_prepare_and_outpu
     let broker = broker();
     let mut config = assigned_config();
     config.dns_servers = Some(vec!["10.0.2.53".parse().unwrap()]);
-    let mut request = broker.request_capture(config.clone()).unwrap();
+    let capture_config = talpid_tunnel::tun_provider::transport::router_config(&config, vec![]);
+    let mut request = broker
+        .request_target_capture(config.clone(), capture_config)
+        .unwrap();
     let pending = broker.pending_request().unwrap();
     authority.install(
         DeliveryConfig::Secured {
@@ -212,10 +356,7 @@ async fn assigned_sources_and_capture_identity_are_required_at_prepare_and_outpu
     assigned.source.set_ip(config.addresses[0]);
     assert!(authority.authorize(assigned).is_err());
     let lease = broker.open_capture(Some(&pending)).unwrap();
-    let sources = talpid_types::relay_flow::RelaySources {
-        ipv4: Some("10.64.2.3".parse().unwrap()),
-        ipv6: Some("fc00:bbbb:bbbb:bb01::3".parse().unwrap()),
-    };
+    let sources = talpid_tunnel::tun_provider::transport::ROUTER_SOURCES;
     let receipt = lease
         .bind_observed_identity("tun-owned", 101_u64 << 32, sources, config.mtu)
         .unwrap();
@@ -225,6 +366,11 @@ async fn assigned_sources_and_capture_identity_are_required_at_prepare_and_outpu
         receipt.generation()
     );
     let pair = broker.acquire(&receipt).unwrap();
+    assert!(
+        authority.authorize(assigned).is_err(),
+        "target assignment became Local source authority"
+    );
+    assigned.source.set_ip(ROUTER_IPV4.into());
     let before_target = authority.authorize(assigned).unwrap();
     assert!(
         authority.current(&before_target),
@@ -254,8 +400,10 @@ async fn assigned_sources_and_capture_identity_are_required_at_prepare_and_outpu
         "target replacement revoked Local grant"
     );
     assert_eq!(grant.generation, Some(receipt.generation()));
-    assert!(authority.authorize(flow(Transport::Udp, 40102)).is_err());
-    assigned.source.set_ip(config.addresses[1]);
+    let mut wrong = flow(Transport::Udp, 40102);
+    wrong.source.set_ip(config.addresses[0]);
+    assert!(authority.authorize(wrong).is_err());
+    assigned.source.set_ip(ROUTER_IPV6.into());
     assert!(authority.authorize(assigned).is_ok());
     let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).unwrap();
     authority.prepare(&socket, &grant).unwrap();
@@ -264,12 +412,16 @@ async fn assigned_sources_and_capture_identity_are_required_at_prepare_and_outpu
     let mut broad = policy();
     broad.rules[0].cidrs = vec!["10.0.0.0/8".parse().unwrap()];
     authority.update(&broad, Some(observation()));
-    for destination in ["10.64.0.1", "10.124.0.5", "10.0.2.53"] {
+    for destination in ["10.64.0.1", "10.124.0.5"] {
         assert_eq!(
             authority.disposition(destination.parse().unwrap()),
             Disposition::Drop
         );
     }
+    assert_eq!(
+        authority.disposition("10.0.2.53".parse().unwrap()),
+        Disposition::Local
+    );
     assert_eq!(
         authority.disposition("10.0.2.2".parse().unwrap()),
         Disposition::Local
@@ -299,7 +451,13 @@ async fn connected_status_requires_the_current_capture_and_activated_attempt() {
     let mut runtime = make_runtime(None, control.clone());
     let broker = runtime.broker();
     broker.set_mode(AttachmentMode::ManagedRequired).unwrap();
-    let mut request = broker.request_capture(assigned_config()).unwrap();
+    let target = assigned_config();
+    let mut request = broker
+        .request_target_capture(
+            target.clone(),
+            talpid_tunnel::tun_provider::transport::router_config(&target, vec![]),
+        )
+        .unwrap();
     let pending = broker.pending_request().unwrap();
     runtime
         .update(&policy(), TargetState::Secured, TunnelPhase::Connecting)
@@ -313,10 +471,7 @@ async fn connected_status_requires_the_current_capture_and_activated_attempt() {
         .bind_observed_identity(
             "tun-owned",
             102_u64 << 32,
-            talpid_types::relay_flow::RelaySources {
-                ipv4: Some("10.64.2.3".parse().unwrap()),
-                ipv6: Some("fc00:bbbb:bbbb:bb01::3".parse().unwrap()),
-            },
+            talpid_tunnel::tun_provider::transport::ROUTER_SOURCES,
             1380,
         )
         .unwrap();

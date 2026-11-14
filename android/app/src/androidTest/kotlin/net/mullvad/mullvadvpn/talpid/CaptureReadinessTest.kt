@@ -22,6 +22,33 @@ class CaptureReadinessTest {
 
     @Test
     fun incompleteConfigurationIsNotReady() {
+        // Raw DnsAddresses contents must reach the profile check without a display sentinel.
+        for (missing in listOf("", " ", "[]", " [ ] ")) {
+            assertFalse(CaptureReadiness.configurationReady(true, missing, 1380, routes, routes))
+            assertFalse(
+                CaptureReadiness.configurationReady(
+                    true,
+                    missing.ifEmpty { "[]" },
+                    1380,
+                    routes,
+                    routes,
+                )
+            )
+        }
+        for ((observed, accepted) in
+            listOf("" to true, " " to true, "[]" to false, "/1.1.1.1" to false)) {
+            assertEquals(
+                accepted,
+                CaptureReadiness.configurationReady(
+                    true,
+                    observed,
+                    1380,
+                    routes,
+                    routes,
+                    dnsExpectation = CaptureReadiness.DnsExpectation.Absent,
+                ),
+            )
+        }
         assertFalse(CaptureReadiness.configurationReady(false, "1.1.1.1", 1380, routes, routes))
         assertFalse(CaptureReadiness.configurationReady(true, "", 1380, routes, routes))
         assertFalse(CaptureReadiness.configurationReady(true, "1.1.1.1", 0, routes, routes))
@@ -31,6 +58,40 @@ class CaptureReadinessTest {
             CaptureReadiness.configurationReady(true, "1.1.1.1", 1380, routes, routes, 1280)
         )
         assertTrue(CaptureReadiness.configurationReady(true, "1.1.1.1", 1280, routes, routes, 1280))
+        assertTrue(CaptureReadiness.configurationReady(true, "1.1.1.1", 576, routes, routes))
+        assertFalse(
+            CaptureReadiness.configurationReady(
+                true,
+                "1.1.1.1",
+                576,
+                routes,
+                routes,
+                exposesIpv6 = true,
+            )
+        )
+        assertTrue(
+            CaptureReadiness.configurationReady(
+                true,
+                "1.1.1.1",
+                1280,
+                routes,
+                routes,
+                exposesIpv6 = true,
+            )
+        )
+        assertTrue(
+            CaptureReadiness.configurationReady(true, "1.1.1.1", 1380, setOf("0.0.0.0/0"), routes)
+        )
+        assertFalse(
+            CaptureReadiness.configurationReady(true, "1.1.1.1", 1380, setOf("::/0"), routes)
+        )
+        assertFalse(
+            CaptureReadiness.configurationReady(true, "1.1.1.1", 1380, setOf("10.0.2.3/32"), routes)
+        )
+        assertEquals(
+            setOf("0.0.0.0/0", "::/0"),
+            CaptureReadiness.minimalRoutes(routes + setOf("0.0.0.0/0", "::/0")),
+        )
     }
 
     private fun partial(generation: String = "12"): String =
@@ -136,6 +197,9 @@ class CaptureReadinessTest {
 
     @Test
     fun realCaptureRouteReceiptIsAcceptedExactly() {
+        assertEquals("::/0", CaptureReadiness.routePrefix("::/0 unreachable mtu 0"))
+        assertEquals("0.0.0.0/0", CaptureReadiness.routePrefix("0.0.0.0/0 -> 0.0.0.0 tun1 mtu 0"))
+        assertFails { CaptureReadiness.routePrefix("::/0 unknown mtu 0") }
         val receipt = assertNotNull(actual())
         assertEquals("3", receipt.generation)
         assertEquals("789384712205", receipt.handle)

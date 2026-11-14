@@ -11,6 +11,7 @@ pub enum Disposition {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Refused {
+    UnsupportedMtu,
     Denied,
     Stale,
     Full,

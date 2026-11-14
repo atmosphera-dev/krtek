@@ -101,11 +101,14 @@ struct Retained {
 pub(super) fn start<A: LocalAuthority>(
     platform: Arc<dyn FrontendPlatform>,
     config: CaptureConfig,
-    forwarder: Forwarder<A>,
+    mut forwarder: Forwarder<A>,
     revalidate: watch::Receiver<u64>,
     broker: AttachmentBroker,
 ) -> io::Result<FrontendOwner> {
     validate(&config, &broker)?;
+    forwarder
+        .set_mtu(usize::from(config.mtu()))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Unsupported Local MTU"))?;
     let lease = Arc::new(broker.open_capture(config.request()).map_err(failure)?);
     let observation = Observation::begin(platform.as_ref(), &config, lease.clone(), None, None)?;
     let epoch = Epoch {
@@ -143,6 +146,14 @@ pub(super) fn start<A: LocalAuthority>(
 }
 
 fn validate(config: &CaptureConfig, broker: &AttachmentBroker) -> io::Result<()> {
+    talpid_lan_forwarder::validate_mtu(usize::from(config.mtu()))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Unsupported capture MTU"))?;
+    if config.sources().ipv6.is_some() && config.mtu() < crate::MIN_IPV6_MTU {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "IPv6 capture MTU below minimum",
+        ));
+    }
     match config {
         CaptureConfig::Partial(config) if config.routes.is_empty() => {
             Err(io::ErrorKind::InvalidInput.into())
@@ -301,7 +312,7 @@ async fn run<A: LocalAuthority>(actor: Actor<A>) -> io::Result<()> {
         let event = {
             let capture = reactor(&epoch);
             if let Some(ready) = ready.take() {
-                let result = if cancelled {
+                let mut result = if cancelled {
                     Err(io::ErrorKind::Interrupted.into())
                 } else if bound.is_err() {
                     std::mem::replace(&mut bound, Ok(()))
@@ -328,6 +339,13 @@ async fn run<A: LocalAuthority>(actor: Actor<A>) -> io::Result<()> {
                         }
                     }
                 };
+                if result.is_ok() {
+                    result = forwarder
+                        .set_mtu(usize::from(epoch.config.mtu()))
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "Unsupported Local MTU")
+                        });
+                }
                 let failed = result.is_err();
                 let stopped = result
                     .as_ref()
@@ -450,16 +468,23 @@ async fn run<A: LocalAuthority>(actor: Actor<A>) -> io::Result<()> {
                     };
                     *slot = Some(request.clone());
                 }
-                // Assigned address/MTU rotation belongs to the target mapper.
+                // Target assignment rotation belongs to the target mapper.
                 // An equal app-side projection reuses the exact observed sink.
                 if config.secured_config().is_some()
-                    && config.secured_config() == epoch.config.secured_config()
-                    && let Some(request) = config.request()
+                    && config
+                        .secured_config()
+                        .zip(epoch.config.secured_config())
+                        .is_some_and(|(a, b)| a.same_android_config(b))
                 {
                     let result = epoch
                         .observation
                         .checked(|| {
-                            lease.acknowledge_router_request(request, epoch.config.secured_config())
+                            config.request().map_or(Ok(()), |request| {
+                                lease.acknowledge_router_request(
+                                    request,
+                                    epoch.config.secured_config(),
+                                )
+                            })
                         })
                         .unwrap_or(Err(
                             crate::packet_attachment::AttachmentError::CaptureUnready,

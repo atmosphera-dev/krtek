@@ -114,7 +114,16 @@ async fn assigned_target_configuration_is_not_the_capture_projection() {
         config.tunnel_ipv4()
     );
     assert_eq!(pair.owner.control.capability().mtu(), config.mtu);
-    assert_eq!(pair.owner.control.capability().identity().mtu, 1280);
+    assert_eq!(
+        pair.owner
+            .control
+            .capability()
+            .sink()
+            .unwrap()
+            .identity()
+            .mtu,
+        1280
+    );
     pair.owner.stop().await;
     drop(pair);
     assert_eq!(control.used(), 0);
@@ -677,20 +686,17 @@ async fn installed_managed_target_crosses_fd_epochs_without_reusing_the_old_rece
                 successor = Some(broker.request_capture(config).unwrap());
                 let pending = broker.pending_request().unwrap();
                 let capability = owner.control.capability();
+                let sink = capability.sink().unwrap();
                 let handover = capture
-                    .begin_handover(
-                        Some(&pending),
-                        capability.identity().sources,
-                        capability.identity().mtu,
-                    )
+                    .begin_handover(Some(&pending), sink.identity().sources, sink.identity().mtu)
                     .unwrap();
                 assert!(!receipt.current());
                 let next = handover
                     .bind_identity(
                         "tun18",
                         Some(0xf123_4567_0000_0064),
-                        capability.identity().sources,
-                        capability.identity().mtu,
+                        sink.identity().sources,
+                        sink.identity().mtu,
                     )
                     .unwrap();
                 broker.acknowledge(&pending, &next).unwrap();

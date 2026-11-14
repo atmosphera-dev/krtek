@@ -20,7 +20,7 @@ use talpid_netstack::buffer_budget::BufferBudget;
 #[cfg(test)]
 use talpid_tunnel::packet_attachment::AttachmentMode;
 use talpid_tunnel::packet_attachment::{AttachmentBroker, PendingCaptureRequest};
-use talpid_tunnel::tun_provider::transport::{ROUTER_IPV4, ROUTER_IPV6, ROUTER_MTU};
+use talpid_tunnel::tun_provider::transport::{ROUTER_IPV4, ROUTER_IPV6};
 use talpid_types::relay_flow::{RelayBufferAllocator, RelayBufferReservation};
 use tokio::sync::watch;
 
@@ -372,8 +372,8 @@ pub enum DeliveryConfig {
 impl DeliveryConfig {
     fn same_capture(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Partial(a), Self::Partial(b)) => a == b,
-            (Self::Router(a), Self::Router(b)) => a == b,
+            (Self::Partial(a), Self::Partial(b)) => a.same_android_config(b),
+            (Self::Router(a), Self::Router(b)) => a.same_android_config(b),
             (Self::Secured { request: a, .. }, Self::Secured { request: b, .. }) => {
                 a.id() == b.id()
             }
@@ -394,17 +394,13 @@ impl DeliveryConfig {
                     .gateways()
                     .into_iter()
                     .map(ipnetwork::IpNetwork::from)
-                    .chain(
-                        config
-                            .dns_servers
-                            .iter()
-                            .flatten()
-                            .copied()
-                            .map(ipnetwork::IpNetwork::from),
-                    )
                     .chain([talpid_tunnel::tun_provider::SOCKS_PROXIES])
                     .collect();
-                CaptureAuthority::new(config.addresses.clone(), Some(broker.clone()), reserved)
+                CaptureAuthority::new(
+                    vec![ROUTER_IPV4.into(), ROUTER_IPV6.into()],
+                    Some(broker.clone()),
+                    reserved,
+                )
             }
         }
     }
@@ -421,18 +417,14 @@ impl DeliveryConfig {
                 broker: selected, ..
             } => broker.same_broker(selected),
         };
-        own_broker(self)
-            && own_broker(other)
-            && sources(self) == sources(other)
-            && self.mtu() == other.mtu()
+        own_broker(self) && own_broker(other) && sources(self) == sources(other)
     }
 
     fn mtu(&self) -> u16 {
-        match self {
-            Self::Partial(_) => ROUTER_MTU,
-            Self::Router(config) => config.mtu,
-            Self::Secured { request, .. } => request.config().mtu,
-        }
+        self.router_config().map_or(
+            talpid_tunnel::tun_provider::transport::LOCAL_ONLY_MTU,
+            |config| config.mtu,
+        )
     }
 
     pub fn router_config(&self) -> Option<&talpid_tunnel::tun_provider::TunConfig> {
@@ -808,6 +800,12 @@ impl<F: FrontendFactory> Delivery<F> {
                             predecessor,
                         });
                     }
+                } else {
+                    // Equal Builder fields can still carry new relay metadata.
+                    // Refresh reservations without establishing another sink.
+                    self.authority
+                        .reconcile_capture(wanted.as_ref().unwrap().authority(&self.broker), false);
+                    self.applied = wanted.clone();
                 }
                 if self.pending.is_some()
                     && let Some(result) = self.owner.as_mut().unwrap().ready().now_or_never()
@@ -983,23 +981,15 @@ impl<F: FrontendFactory> Delivery<F> {
     }
 }
 
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+mod managed_platform;
+
 #[cfg(target_os = "android")]
 mod platform {
+    pub use super::managed_platform::PlatformFactory;
     use super::*;
     use std::os::fd::AsRawFd;
-    use talpid_lan_forwarder::Forwarder;
-    use talpid_tunnel::{
-        android_frontend::{FrontendOwner, FrontendState},
-        tun_provider::local_network::{LocalNetworkPlatform, PrepareError},
-    };
-
-    pub struct PlatformFactory(pub Arc<LocalNetworkPlatform>);
-    pub struct PlatformOwner {
-        owner: FrontendOwner,
-        authority: Arc<DeliveryAuthority>,
-        receiver: watch::Receiver<FrontendState>,
-        open: bool,
-    }
+    use talpid_tunnel::tun_provider::local_network::{LocalNetworkPlatform, PrepareError};
 
     pub fn preparer(platform: Arc<LocalNetworkPlatform>) -> Arc<SocketPreparer> {
         Arc::new(move |socket, lease| {
@@ -1015,73 +1005,6 @@ mod platform {
                     _ => Refused::PreparationFailed,
                 })
         })
-    }
-
-    impl FrontendFactory for PlatformFactory {
-        type Owner = PlatformOwner;
-        fn supported(&self) -> bool {
-            true
-        }
-        fn start(
-            &self,
-            config: DeliveryConfig,
-            authority: Arc<DeliveryAuthority>,
-            buffers: Arc<dyn RelayBufferAllocator>,
-            broker: AttachmentBroker,
-        ) -> io::Result<PlatformOwner> {
-            let updates = authority.subscribe();
-            let mtu = config.mtu();
-            let classifier = authority.clone();
-            let forwarder = Forwarder::with_mtu(authority.clone(), buffers, usize::from(mtu))
-                .map_err(|_| io::Error::other("Local storage budget full"))?;
-            let config = config.into_frontend(classifier);
-            let owner = FrontendOwner::start(self.0.clone(), config, forwarder, updates, broker)?;
-            let receiver = owner.state();
-            Ok(PlatformOwner {
-                owner,
-                authority,
-                receiver,
-                open: true,
-            })
-        }
-    }
-
-    impl DeliveryOwner for PlatformOwner {
-        fn handover(&mut self, config: DeliveryConfig) -> io::Result<()> {
-            self.owner
-                .handover(config.into_frontend(self.authority.clone()))
-        }
-        fn retry_handover_release(&mut self) -> io::Result<()> {
-            self.owner.retry_handover_release()
-        }
-        async fn ready(&mut self) -> io::Result<()> {
-            self.owner.ready().await
-        }
-        async fn stop(&mut self) -> io::Result<()> {
-            self.owner.stop().await
-        }
-        fn retry_release(&mut self) -> io::Result<()> {
-            self.owner.retry_release()
-        }
-        fn state(&self) -> OwnerState {
-            match *self.receiver.borrow() {
-                FrontendState::Running => OwnerState::Running,
-                FrontendState::Stopped => OwnerState::Stopped,
-                FrontendState::Failed => OwnerState::Failed,
-            }
-        }
-        fn release_failed(&self) -> bool {
-            self.owner.release_failed()
-        }
-        async fn changed(&mut self) {
-            if self.open {
-                if self.receiver.changed().await.is_err() {
-                    self.open = false;
-                }
-            } else {
-                std::future::pending().await
-            }
-        }
     }
 }
 

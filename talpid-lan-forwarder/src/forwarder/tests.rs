@@ -320,6 +320,75 @@ async fn tcp_echo(ipv6: bool) {
 async fn tcp_nonce_reaches_application_and_both_sockets_close() {
     tcp_echo(false).await;
 }
+
+#[tokio::test]
+async fn mtu_values_outside_upstream_interface_range_are_refused_without_panicking() {
+    use talpid_netstack::buffer_budget::BufferBudget;
+    for ipv6 in [false, true] {
+        let budget = BufferBudget::new(32 * 1024 * 1024);
+        let authority = Arc::new(Authority::default());
+        let mut forwarder = Forwarder::with_mtu(
+            authority.clone(),
+            Arc::new(budget.clone()),
+            if ipv6 { 1280 } else { 68 },
+        )
+        .unwrap();
+        let peer = UdpSocket::bind(loopback(ipv6)).await.unwrap();
+        let flow = target(peer.local_addr().unwrap(), Transport::Udp);
+        let mut physical = None;
+        let mut pressure = None;
+        let mut received = vec![0; 65535];
+        let mtus: &[usize] = if ipv6 {
+            &[1280, 1380, 1420, 9000, 65535, 1280]
+        } else {
+            &[68, 576, 1220, 1280, 1380, 1420, 9000, 65535, 1280]
+        };
+        for &mtu in mtus {
+            forwarder.set_mtu(mtu).unwrap();
+            let payload = vec![0x39; mtu - if ipv6 { 48 } else { 28 }];
+            forwarder.ingest(&udp_packet(flow, &payload));
+            until(&mut forwarder, settled).await;
+            if pressure.is_none() {
+                pressure = Some(budget.reserve(budget.limit() - budget.used()).unwrap());
+            }
+            let (n, source) =
+                tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut received))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(&received[..n], payload);
+            if let Some(old) = physical {
+                assert_eq!(source, old, "MTU update replaced UDP socket");
+            } else {
+                physical = Some(source);
+            }
+            peer.send_to(&payload, source).await.unwrap();
+            until(&mut forwarder, Forwarder::has_output).await;
+            let reply = forwarder.next_output().unwrap();
+            assert_eq!(reply.len(), mtu);
+            assert_eq!(packet::parse(&reply).unwrap().payload, payload);
+            assert_eq!(authority.preparations.load(Ordering::SeqCst), 1);
+        }
+        forwarder.close_all().await;
+        drop(pressure);
+        drop(forwarder);
+        assert_eq!(budget.used(), 0);
+    }
+    for mtu in [0, 67, usize::from(u16::MAX) + 1, usize::MAX] {
+        let budget = BufferBudget::new(32 * 1024 * 1024);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Forwarder::with_mtu(
+                Arc::new(Authority::default()),
+                Arc::new(budget.clone()),
+                mtu,
+            )
+        }));
+        assert!(result.is_ok(), "unsupported MTU {mtu} panicked");
+        let error = result.unwrap().err().expect("unsupported MTU accepted");
+        assert_eq!(error, Refused::UnsupportedMtu);
+        assert_eq!(budget.used(), 0);
+    }
+}
 #[tokio::test]
 async fn ipv6_tcp_nonce_reaches_application() {
     tcp_echo(true).await;

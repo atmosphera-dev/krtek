@@ -119,17 +119,9 @@ impl Observation {
                         "Capture epoch retired before acknowledgement",
                     ));
                 }
-                if let CaptureConfig::Secured {
-                    broker, request, ..
-                } = config
-                {
-                    let snapshot = broker.snapshot();
-                    if snapshot.capture_generation != Some(self.generation as u64)
-                        || snapshot.request != Some(request.id())
-                    {
-                        return Err(io::Error::other("Capture request cancelled or replaced"));
-                    }
-                }
+                // A target's cancellation is not loss of this owned, exact
+                // descriptor. Adoption still requires the complete observed
+                // configuration, while obsolete targets never receive an ack.
                 match updates
                     .as_mut()
                     .map(|updates| updates.borrow_and_update().clone())
@@ -164,25 +156,21 @@ impl Observation {
                 Some(change) => {
                     change.bind_identity(&self.interface, handle, self.sources, self.mtu)
                 }
-                None => match handle {
-                    Some(handle) => self.lease.bind_observed_identity(
-                        &self.interface,
-                        handle,
-                        self.sources,
-                        self.mtu,
-                    ),
-                    None => {
-                        self.lease
-                            .bind_partial_identity(&self.interface, self.sources, self.mtu)
-                    }
-                },
+                None => self.lease.bind_frontend_identity(
+                    &self.interface,
+                    handle,
+                    self.sources,
+                    self.mtu,
+                ),
             }
             .map_err(failure)?;
             if let CaptureConfig::Secured {
                 broker, request, ..
             } = config
             {
-                broker.acknowledge(request, &receipt).map_err(failure)?;
+                broker
+                    .acknowledge_current_capture_request(request, &receipt)
+                    .map_err(failure)?;
             }
             *self.sink.lock().expect("capture sink") =
                 self.lease.capability().and_then(|session| session.sink());

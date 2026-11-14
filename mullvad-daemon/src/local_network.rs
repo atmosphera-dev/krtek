@@ -342,7 +342,13 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
                 }
                 let applied = self.delivery.pending_or_applied_config();
                 Some(match applied {
-                    Some(applied) if applied.router_config() == Some(&config) => applied,
+                    Some(applied)
+                        if applied
+                            .router_config()
+                            .is_some_and(|current| current.same_android_config(&config)) =>
+                    {
+                        applied
+                    }
                     _ => DeliveryConfig::Router(config),
                 })
             }

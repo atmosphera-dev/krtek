@@ -62,6 +62,7 @@ import net.mullvad.mullvadvpn.lib.model.LocalNetworkAccess
 import net.mullvad.mullvadvpn.lib.model.LocalNetworkStatus
 import net.mullvad.mullvadvpn.lib.model.LocalRuleInactiveReason
 import net.mullvad.mullvadvpn.lib.model.LocalRuleState
+import net.mullvad.mullvadvpn.lib.model.Mtu
 import net.mullvad.mullvadvpn.lib.model.MultihopMode
 import net.mullvad.mullvadvpn.lib.model.PackageName
 import net.mullvad.mullvadvpn.lib.model.ParameterGenerationError
@@ -491,7 +492,8 @@ class LocalNetworkDeliveryInstrumentedTest {
     fun localStreamSurvivesAllTunnelStates() =
         continuityCase { consumer, repository, connection, session ->
             connect(connection)
-            continuityConnected(consumer, repository, connection, session, "connected")
+            val before = continuityConnected(consumer, repository, connection, session, "connected")
+            continuitySinkConfiguration(repository, connection, session, before)
             connect(connection, reconnect = true)
             continuityConnected(consumer, repository, connection, session, "reconnected")
             parameterError(repository, connection, session)
@@ -506,6 +508,108 @@ class LocalNetworkDeliveryInstrumentedTest {
             connect(connection)
             continuityConnected(consumer, repository, connection, session, "first-target-recovery")
         }
+
+    private fun continuitySinkConfiguration(
+        repository: SettingsRepository,
+        connection: ConnectionProxy,
+        session: LocalSession,
+        before: AppliedCapture,
+    ) {
+        val original = checkNotNull(repository.settingsUpdates.value).tunnelOptions
+        val changedMtu = if (before.mtu == 1280) Mtu(1380) else Mtu(1280)
+        var lastGeneration = before.generation
+        fun record(stage: String, config: AppliedCapture) {
+            report(
+                "sink_configuration",
+                JSONObject()
+                    .put("stage", stage)
+                    .put("session_id", session.id)
+                    .put("generation", config.generation)
+                    .put("handle", config.handle)
+                    .put("mtu", config.mtu)
+                    .put("addresses", config.addresses.sorted().joinToString(","))
+                    .put("interface", config.interfaceName)
+                    .put("net_id", config.netId),
+            )
+        }
+        record("before", before)
+        try {
+            continuityIntent("sink-configuration")
+            runBlocking {
+                assertTrue(repository.setWireguardMtu(changedMtu).isRight())
+                assertTrue(repository.setIpv6Enabled(!original.enableIpv6).isRight())
+                withTimeout(10_000) {
+                    repository.settingsUpdates.first {
+                        it?.tunnelOptions?.let { options ->
+                            options.mtu == changedMtu && options.enableIpv6 != original.enableIpv6
+                        } == true
+                    }
+                }
+            }
+            awaitState(
+                repository,
+                connection,
+                ForwardingAvailability.Active,
+                LocalRuleState.Forwarding,
+                "Connected",
+            )
+            val changed =
+                appliedConfiguration(
+                    peerPolicy(),
+                    ForwardingAvailability.Active,
+                    "Connected",
+                    before.generation,
+                    requiredMtu = changedMtu.value,
+                )
+            lastGeneration = changed.generation
+            assertNotEquals(before.mtu, changed.mtu)
+            assertNotEquals(
+                before.addresses,
+                changed.addresses,
+                "IPv4-only Local does not pin the target's IPv6 exposure",
+            )
+            record("changed", changed)
+            session.burst()
+            session.dwell("sink-mtu-family-changed")
+        } finally {
+            continuityIntent("sink-configuration-restore")
+            runBlocking {
+                assertTrue(
+                    (original.mtu?.let { repository.setWireguardMtu(it) }
+                            ?: repository.resetWireguardMtu())
+                        .isRight()
+                )
+                assertTrue(repository.setIpv6Enabled(original.enableIpv6).isRight())
+                withTimeout(10_000) {
+                    repository.settingsUpdates.first { it?.tunnelOptions == original }
+                }
+            }
+            awaitState(
+                repository,
+                connection,
+                ForwardingAvailability.Active,
+                LocalRuleState.Forwarding,
+                "Connected",
+            )
+            val restored =
+                appliedConfiguration(
+                    peerPolicy(),
+                    ForwardingAvailability.Active,
+                    "Connected",
+                    lastGeneration,
+                    requiredMtu = before.mtu,
+                )
+            assertEquals(before.addresses, restored.addresses)
+            assertEquals(before.routes, restored.routes)
+            assertEquals(before.dns, restored.dns)
+            assertEquals(before.mtu, restored.mtu)
+            assertEquals(before.uids, restored.uids)
+            record("restored", restored)
+            session.burst()
+            session.dwell("sink-mtu-family-restored")
+            report("sink_configuration_restored", true)
+        }
+    }
 
     @Test
     fun localRevocationDoesNotFallThroughDuringReconnect() =
@@ -1732,7 +1836,7 @@ class LocalNetworkDeliveryInstrumentedTest {
     ) {
         assertEquals(native.addresses, managed.addresses, "Local off retains fixed capture sources")
         assertEquals(native.dns, managed.dns, "Local off retains ordinary target DNS")
-        assertEquals(native.mtu, managed.mtu, "Local off retains fixed capture MTU")
+        assertEquals(native.mtu, managed.mtu, "Local off retains upstream capture MTU")
         val local =
             policy.rules
                 .filter { policy.enabled && it.enabled }
@@ -1740,7 +1844,8 @@ class LocalNetworkDeliveryInstrumentedTest {
                 .map { canonicalPrefix(it.toString()) }
                 .toSet()
         assertEquals(
-            native.routes + local,
+            CaptureReadiness.minimalRoutes(native.routes + local) +
+                (managed.routes intersect managed.addresses),
             managed.routes,
             "Only announced local routes augment the ordinary router projection",
         )
@@ -2172,6 +2277,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         expectedTunnel: String = args.getString("krtek_expect_tunnel", "Disconnected"),
         previousGeneration: String? = null,
         fixedCapture: Boolean = true,
+        requiredMtu: Int? = null,
     ): AppliedCapture = runBlocking {
         val expected =
             policy.rules
@@ -2234,14 +2340,31 @@ class LocalNetworkDeliveryInstrumentedTest {
                             canonicalPrefix("172.27.1.1/32"),
                             canonicalPrefix("fdf0:ce4a:801d::172:27:1:1/128"),
                         )
-                    val frontend = addresses == bookkeeping
+                    val options =
+                        (target.applicationContext as MullvadApplication)
+                            .getKoin()
+                            .get<SettingsRepository>()
+                            .settingsUpdates
+                            .value
+                            ?.tunnelOptions
+                    val connectedFamilies =
+                        if (expectedTunnel == "Connected")
+                            bookkeeping
+                                .filter {
+                                    ':' !in it ||
+                                        options?.enableIpv6 == true ||
+                                        expected.any { route -> ':' in route }
+                                }
+                                .toSet()
+                        else bookkeeping
+                    val frontend = addresses == connectedFamilies
                     val routeText = checkNotNull(delimitedField(agent, "Routes: [", ']'))
                     val dns = checkNotNull(delimitedField(agent, "DnsAddresses: [", ']')).trim()
                     val allRoutes =
                         routeText
                             .split(',')
                             .filter { it.isNotBlank() }
-                            .map { canonicalPrefix(it.substringBefore(" ->").trim()) }
+                            .map { canonicalPrefix(CaptureReadiness.routePrefix(it)) }
                             .toSet()
                     val routes = allRoutes - bookkeeping
                     val iface = tokenField(agent, "InterfaceName: ")
@@ -2260,7 +2383,10 @@ class LocalNetworkDeliveryInstrumentedTest {
                                     mtu,
                                     allRoutes,
                                     expected,
-                                    if (fixedCapture) 1280 else null,
+                                    requiredMtu
+                                        ?: if (expectedTunnel == "Connected") options?.mtu?.value
+                                        else null,
+                                    addresses.any { ':' in it },
                                 )
                         ) {
                             delay(100)
@@ -2304,7 +2430,10 @@ class LocalNetworkDeliveryInstrumentedTest {
                     if (
                         frontend &&
                             routes == expected &&
-                            dns.isEmpty() &&
+                            CaptureReadiness.dnsMatches(
+                                dns,
+                                CaptureReadiness.DnsExpectation.Absent,
+                            ) &&
                             iface != null &&
                             netId != null
                     ) {

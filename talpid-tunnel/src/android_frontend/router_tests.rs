@@ -33,12 +33,12 @@ async fn one_local_tcp_and_udp_engine_outlives_target_cancel_detach_and_replacem
     let (tcp, mut accepts, server) = tcp_echo(false).await;
     let (address, mut hits, echo) = udp_echo(false).await;
     let local = Flow {
-        source: "10.64.42.2:48700".parse().unwrap(),
+        source: "172.27.1.1:48700".parse().unwrap(),
         destination: address,
         transport: Transport::Udp,
     };
     let mut app = App::new(Flow {
-        source: "10.64.42.2:48701".parse().unwrap(),
+        source: "172.27.1.1:48701".parse().unwrap(),
         destination: tcp,
         transport: Transport::Tcp,
     });
@@ -103,7 +103,13 @@ async fn one_local_tcp_and_udp_engine_outlives_target_cancel_detach_and_replacem
                 assert!(!first.as_ref().unwrap().control.current());
             }
             "replacement" => {
-                let mut next = broker.request_capture(assigned()).unwrap();
+                let target = assigned();
+                let mut next = broker
+                    .request_target_capture(
+                        target.clone(),
+                        crate::tun_provider::transport::router_config(&target, vec![]),
+                    )
+                    .unwrap();
                 receipt
                     .acknowledge(&broker.pending_request().unwrap())
                     .unwrap();

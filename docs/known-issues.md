@@ -57,7 +57,12 @@ Each issue in this document should provide, at least, the following:
   does not add fragment reception to Local or promise public-network delivery.
   The capture uses `172.27.1.1/32` and `fdf0:ce4a:801d::172:27:1:1/128`
   independently of Mullvad's assignment. These private addresses can still
-  collide with a real private network.
+   collide with a real private network.
+* Mullvad capture uses its upstream-selected MTU and families. When an IPv4-only
+  target uses MTU below 1280 and a Local rule needs IPv6, Android requires a
+  capture-only 1280 floor. This does not raise the target MTU or enable IPv6
+  internet through that target. Necessary configuration handovers still have the
+  route gap described above.
 
 ### Potential leaks just after macOS boot
 

@@ -109,7 +109,8 @@ fn capture_identity_is_immutable_full_width_and_replacement_is_distinct() {
     let sink = first.capability().sink().unwrap();
     assert_eq!(sink.identity().interface, "tun0");
     assert_eq!(sink.identity().network_handle, Some(0x1234_5678_0000_0063));
-    assert_eq!(first.identity().mtu, 1420);
+    assert_eq!(sink.identity().mtu, 1420);
+    assert_eq!(sink.identity().sources, first.identity().sources);
     assert!(
         first
             .identity()
@@ -166,7 +167,7 @@ fn sink_handover_preserves_session_and_exact_target_but_never_old_sink_authority
     assert!(attempt.current());
     owner.suspend_sink(&first).unwrap();
     let invalid_sources = RelaySources {
-        ipv4: None,
+        ipv4: Some("10.64.0.9".parse().unwrap()),
         ipv6: sources.ipv6,
     };
     assert!(
@@ -188,7 +189,7 @@ fn sink_handover_preserves_session_and_exact_target_but_never_old_sink_authority
                 "tun1",
                 Some(42),
                 sources,
-                1280,
+                0,
                 &budget
             )
             .is_err()
@@ -211,12 +212,13 @@ fn sink_handover_preserves_session_and_exact_target_but_never_old_sink_authority
             "tun1",
             Some(0x8765_4321_0000_0042),
             sources,
-            1420,
+            1280,
             &budget,
         )
         .unwrap();
     assert_eq!(owner.identity().generation.get(), session);
     assert_eq!(owner.identity().sources, sources);
+    assert_eq!(next.identity().mtu, 1280);
     assert!(attempt.current());
     assert_eq!(attempt.sink().unwrap().identity().interface, "tun1");
     assert_eq!(next.identity().network_handle, Some(0x8765_4321_0000_0042));
@@ -277,13 +279,9 @@ fn partial_sink_has_no_managed_handle_and_sink_reservations_are_bounded() {
         ipv4: Some("172.27.1.1".parse().unwrap()),
         ipv6: None,
     };
-    let owner = RelayCaptureOwner::session(
-        RelayCaptureGeneration::fresh().unwrap(),
-        sources,
-        1280,
-        &budget,
-    )
-    .unwrap();
+    let owner =
+        RelayCaptureOwner::session(RelayCaptureGeneration::fresh().unwrap(), sources, &budget)
+            .unwrap();
     let local = owner.capability();
     assert!(local.current());
     assert!(local.sink().is_none());

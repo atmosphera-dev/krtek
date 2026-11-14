@@ -304,6 +304,8 @@ pub struct CaptureEpochChange {
     generation: u64,
     predecessor: RelaySink,
     previous_config: Option<Arc<Configuration>>,
+    sources: RelaySources,
+    mtu: u16,
     unbound: Mutex<Option<RelayCaptureGeneration>>,
     completed: bool,
 }
@@ -566,6 +568,7 @@ impl AttachmentBroker {
         lease: &CaptureLease,
         interface: &str,
         network_handle: Option<u64>,
+        logical_sources: RelaySources,
         sources: RelaySources,
         mtu: u16,
     ) -> Result<CaptureReceipt, AttachmentError> {
@@ -602,10 +605,11 @@ impl AttachmentBroker {
             .expect("capture generation")
             .take()
             .ok_or(AttachmentError::Stale)?;
-        let owner = RelayCaptureOwner::with_identity(
+        let owner = RelayCaptureOwner::with_sink_identity(
             generation,
             interface,
             network_handle,
+            logical_sources,
             sources,
             mtu,
             self.inner.capture.as_ref(),
@@ -632,12 +636,34 @@ impl AttachmentBroker {
         self.acknowledge_projection(request, receipt, None)
     }
 
+    /// Capture observation belongs to the frontend, not to a target's request.
+    /// Superseding/cancelling a target can leave a fully checked sink useful to
+    /// Local. Never grant readiness to that obsolete target in that case.
+    pub(crate) fn acknowledge_current_capture_request(
+        &self,
+        request: &PendingCaptureRequest,
+        receipt: &CaptureReceipt,
+    ) -> Result<bool, AttachmentError> {
+        self.acknowledge_projection_inner(request, receipt, None, true)
+    }
+
     fn acknowledge_projection(
         &self,
         request: &PendingCaptureRequest,
         receipt: &CaptureReceipt,
         observed_projection: Option<&TunConfig>,
     ) -> Result<(), AttachmentError> {
+        self.acknowledge_projection_inner(request, receipt, observed_projection, false)
+            .map(|_| ())
+    }
+
+    fn acknowledge_projection_inner(
+        &self,
+        request: &PendingCaptureRequest,
+        receipt: &CaptureReceipt,
+        observed_projection: Option<&TunConfig>,
+        allow_superseded: bool,
+    ) -> Result<bool, AttachmentError> {
         let mut state = self.inner.state.lock().expect("attachment state");
         if !receipt.matches_capture(&self.inner, &state)
             || (observed_projection.is_none() && !receipt.matches(&self.inner, &state))
@@ -648,12 +674,20 @@ impl AttachmentBroker {
             .request
             .as_ref()
             .is_some_and(|r| Arc::ptr_eq(r, &request.0))
-            || (!state
-                .capture
-                .as_ref()
-                .and_then(|c| c.config.as_ref())
-                .is_some_and(|r| r.config == request.0.config)
-                && observed_projection != Some(&request.0.config))
+        {
+            return if allow_superseded {
+                Ok(false)
+            } else {
+                Err(AttachmentError::Stale)
+            };
+        }
+        if !state
+            .capture
+            .as_ref()
+            .and_then(|c| c.config.as_ref())
+            .is_some_and(|r| r.config.same_android_config(&request.0.config))
+            && !observed_projection
+                .is_some_and(|config| config.same_android_config(&request.0.config))
         {
             return Err(AttachmentError::Stale);
         }
@@ -666,7 +700,7 @@ impl AttachmentBroker {
         state.capture.as_mut().expect("matching receipt").config = Some(request.0.clone());
         state.request.take();
         self.inner.publish(&state);
-        Ok(())
+        Ok(true)
     }
 
     pub fn acquire(&self, receipt: &CaptureReceipt) -> Result<TransportPair, AttachmentError> {
@@ -997,8 +1031,8 @@ impl CaptureLease {
         self.generation
     }
 
-    /// Allocate the successor epoch before platform work. Sources/MTU are the
-    /// session's immutable app-side identity; a change requires a new session.
+    /// Allocate the successor epoch before platform work. Actual MTU and exposed
+    /// sources belong to the sink, not the fixed logical Local session.
     pub fn begin_handover(
         &self,
         request: Option<&PendingCaptureRequest>,
@@ -1031,8 +1065,14 @@ impl CaptureLease {
             .owner
             .as_ref()
             .ok_or(AttachmentError::CaptureUnready)?;
-        if owner.identity().sources != sources
-            || owner.identity().mtu != mtu
+        if sources
+            .ipv4
+            .is_some_and(|ip| owner.identity().sources.ipv4 != Some(ip))
+            || sources
+                .ipv6
+                .is_some_and(|ip| owner.identity().sources.ipv6 != Some(ip))
+            || mtu == 0
+            || (sources.ipv4.is_none() && sources.ipv6.is_none())
             || request.is_some_and(|request| {
                 request.config().mtu != mtu
                     || request.config().addresses.len()
@@ -1061,6 +1101,8 @@ impl CaptureLease {
             generation: generation.get(),
             predecessor,
             previous_config,
+            sources,
+            mtu,
             unbound: Mutex::new(Some(generation)),
             completed: false,
         };
@@ -1121,7 +1163,7 @@ impl CaptureLease {
         AttachmentBroker {
             inner: self.inner.clone(),
         }
-        .observed_capture(self, interface, Some(network_handle), sources, mtu)
+        .observed_capture(self, interface, Some(network_handle), sources, sources, mtu)
     }
     /// Partial uses the same logical lease and checked sink without acquiring a
     /// NetworkCallback dependency. The fd name and plain-IP format are native.
@@ -1134,7 +1176,30 @@ impl CaptureLease {
         AttachmentBroker {
             inner: self.inner.clone(),
         }
-        .observed_capture(self, interface, None, sources, mtu)
+        .observed_capture(self, interface, None, sources, sources, mtu)
+    }
+
+    /// The frontend owns the fixed logical pair independently of the families
+    /// exposed by this actual descriptor. Generic broker clients retain their
+    /// supplied logical identity instead.
+    pub(crate) fn bind_frontend_identity(
+        &self,
+        interface: &str,
+        network_handle: Option<u64>,
+        sources: RelaySources,
+        mtu: u16,
+    ) -> Result<CaptureReceipt, AttachmentError> {
+        AttachmentBroker {
+            inner: self.inner.clone(),
+        }
+        .observed_capture(
+            self,
+            interface,
+            network_handle,
+            crate::tun_provider::transport::ROUTER_SOURCES,
+            sources,
+            mtu,
+        )
     }
     pub fn retire(&self) {
         let mut state = self.inner.state.lock().expect("attachment state");
@@ -1276,8 +1341,18 @@ impl CaptureEpochChange {
             .ok_or(AttachmentError::CaptureUnready)?;
         // Validate before consuming the one-shot token so an invalid observation
         // cannot be mistaken for an already adopted descriptor.
-        if owner.identity().sources != sources
-            || owner.identity().mtu != mtu
+        if sources != self.sources
+            || mtu != self.mtu
+            || capture.config.as_ref().is_some_and(|request| {
+                request.config.mtu != mtu
+                    || request.config.addresses.len()
+                        != usize::from(sources.ipv4.is_some()) + usize::from(sources.ipv6.is_some())
+                    || request
+                        .config
+                        .addresses
+                        .iter()
+                        .any(|ip| !sources.contains(*ip))
+            })
             || (capture.config.is_some() && network_handle.is_none())
         {
             return Err(AttachmentError::Invalid);

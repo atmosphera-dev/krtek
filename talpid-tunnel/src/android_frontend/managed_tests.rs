@@ -37,7 +37,7 @@ async fn unsupported_capture_formats_never_admit_packets_and_retain_failed_relea
             let (address, mut hits, echo) = udp_echo(false).await;
             let request = Flow {
                 source: if secured {
-                    "10.64.42.2:48500"
+                    "172.27.1.1:48500"
                 } else {
                     "172.27.1.1:48500"
                 }
@@ -167,7 +167,13 @@ pub(super) fn broker() -> AttachmentBroker {
 
 fn managed(broker: &AttachmentBroker) -> (ConfigurationRequest, CaptureConfig) {
     broker.set_mode(AttachmentMode::ManagedRequired).unwrap();
-    let request = broker.request_capture(assigned()).unwrap();
+    let target = assigned();
+    let request = broker
+        .request_target_capture(
+            target.clone(),
+            crate::tun_provider::transport::router_config(&target, vec![]),
+        )
+        .unwrap();
     let config = CaptureConfig::Secured {
         broker: broker.clone(),
         request: broker.pending_request().unwrap(),
@@ -209,7 +215,7 @@ fn raw(protocol: u8, nonce: &[u8]) -> Vec<u8> {
     let mut bytes = vec![0x9c; 20 + nonce.len()];
     bytes[0] = 0x45;
     bytes[9] = protocol;
-    bytes[12..16].copy_from_slice(&[10, 64, 42, 2]);
+    bytes[12..16].copy_from_slice(&[172, 27, 1, 1]);
     bytes[16..20].copy_from_slice(&[1, 1, 1, 1]);
     bytes[20..].copy_from_slice(nonce);
     bytes
@@ -219,7 +225,7 @@ fn raw_ipv6(protocol: u8, nonce: &[u8]) -> Vec<u8> {
     let mut bytes = vec![0xb3; 40 + nonce.len()];
     bytes[0] = 0x60;
     bytes[6] = protocol;
-    bytes[8..24].copy_from_slice(&"fc00:42::2".parse::<std::net::Ipv6Addr>().unwrap().octets());
+    bytes[8..24].copy_from_slice(&crate::tun_provider::transport::ROUTER_IPV6.octets());
     bytes[24..40].copy_from_slice(
         &"2001:4860:4860::8888"
             .parse::<std::net::Ipv6Addr>()
@@ -315,7 +321,7 @@ async fn local_and_raw_consumers_share_capture_without_denied_local_fallback() {
     transport.control.activate().unwrap();
     let (address, mut hits, echo) = udp_echo(false).await;
     let local = Flow {
-        source: "10.64.42.2:48000".parse().unwrap(),
+        source: "172.27.1.1:48000".parse().unwrap(),
         destination: address,
         transport: Transport::Udp,
     };
@@ -328,7 +334,7 @@ async fn local_and_raw_consumers_share_capture_without_denied_local_fallback() {
     assert_eq!(reply.flow.destination, local.source);
     let (tcp, mut accepts, tcp_server) = tcp_echo(false).await;
     let mut app = App::new(Flow {
-        source: "10.64.42.2:48001".parse().unwrap(),
+        source: "172.27.1.1:48001".parse().unwrap(),
         destination: tcp,
         transport: Transport::Tcp,
     });
@@ -379,7 +385,7 @@ async fn raw_fatal_sink_joins_physical_work_and_retains_failed_release() {
     let (address, mut hits, echo) = udp_echo(false).await;
     forwarder.ingest(&udp(
         Flow {
-            source: "10.64.42.2:48010".parse().unwrap(),
+            source: "172.27.1.1:48010".parse().unwrap(),
             destination: address,
             transport: Transport::Udp,
         },
@@ -442,7 +448,7 @@ async fn secured_local_output_never_uses_partial_guard_while_transport_is_pendin
     let mut forwarder = managed_forwarder(authority.clone());
     let (address, mut hits, echo) = udp_echo(false).await;
     let local = Flow {
-        source: "10.64.42.2:48011".parse().unwrap(),
+        source: "172.27.1.1:48011".parse().unwrap(),
         destination: address,
         transport: Transport::Udp,
     };
@@ -696,7 +702,7 @@ async fn mixed_backpressure_rotates_both_consumers_and_revokes_only_blocked_loca
     let mut forwarder = managed_forwarder(authority.clone());
     let (address, mut hits, echo) = udp_echo(false).await;
     let local = Flow {
-        source: "10.64.42.2:48600".parse().unwrap(),
+        source: "172.27.1.1:48600".parse().unwrap(),
         destination: address,
         transport: Transport::Udp,
     };
@@ -831,7 +837,7 @@ async fn cancelled_config_or_readiness_joins_and_never_certifies_identical_repla
         let (platform, peer) = Platform::new();
         platform.manual.store(true, SeqCst);
         let broker = broker();
-        let (request, config) = managed(&broker);
+        let (mut request, config) = managed(&broker);
         let (_updates, updates) = watch::channel(0);
         let mut owner = FrontendOwner::start(
             platform.clone(),
@@ -844,7 +850,20 @@ async fn cancelled_config_or_readiness_joins_and_never_certifies_identical_repla
         let generation = wait_bound(&platform).await;
         if cancel_request {
             request.cancel();
-            assert!(bounded(owner.ready()).await.is_err());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), owner.ready())
+                    .await
+                    .is_err(),
+                "unobserved capture was certified"
+            );
+            assert!(platform.publish(generation, false));
+            bounded(owner.ready()).await.unwrap();
+            assert!(
+                request.configured().await.is_err(),
+                "cancelled target received readiness"
+            );
+            assert!(broker.snapshot().capture_ready);
+            assert!(!broker.snapshot().ordinary_ready);
         }
         bounded(owner.stop()).await.unwrap();
         drop(request);

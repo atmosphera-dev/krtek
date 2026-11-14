@@ -177,7 +177,21 @@ class LocalContinuityWindowsTest {
         )
         assertEquals(emptyList(), measured(peer = peer))
         assertEquals(emptyList(), measured(text = alternateLog))
-        for (wrong in listOf("192x168x50x7/32", "$peer/24", "192.168.50.70/32")) {
+        for (covered in listOf("192.168.50.0/24", "0.0.0.0/0")) {
+            assertEquals(
+                windows,
+                measured(text = alternateLog.replace("$peer/32", covered), peer = peer),
+            )
+        }
+        for (wrong in
+            listOf(
+                "192x168x50x7/32",
+                "$peer/24",
+                "192.168.50.70/32",
+                "192.168.51.0/24",
+                "::/0",
+                "0.0.0.0/1",
+            )) {
             assertEquals(
                 emptyList(),
                 measured(text = alternateLog.replace("$peer/32", wrong), peer = peer),

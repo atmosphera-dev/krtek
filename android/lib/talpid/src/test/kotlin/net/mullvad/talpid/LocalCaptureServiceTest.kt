@@ -374,7 +374,8 @@ class LocalCaptureServiceTest {
                 config.copy(addresses = arrayListOf(ip("0.0.0.0"))),
                 config.copy(routes = arrayListOf()),
                 config.copy(dnsServers = arrayListOf()),
-                config.copy(mtu = 1279),
+                config.copy(mtu = 0),
+                config.copy(mtu = -1),
                 config.copy(addresses = arrayListOf(ip("10.64.0.2"))),
             )) {
             assertEquals(CreateTunResult.EstablishError, service.openSecuredFrontend(11, invalid))

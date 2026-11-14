@@ -36,6 +36,23 @@ const TCP_TOMBSTONES: usize = 256;
 const _: () = assert!(TCP_TOMBSTONES >= TCP_FLOWS);
 const UDP_FLOWS: usize = 256;
 const OUTPUT_PACKETS: usize = 256;
+/// TUN's IPv4 interface minimum and the upstream u16 MTU parameter range.
+pub const MIN_SUPPORTED_MTU: usize = 68;
+pub const MAX_SUPPORTED_MTU: usize = u16::MAX as usize;
+const DEFAULT_LOCAL_MTU: usize = 1280;
+// Byte-credited queues are ceilings, not an arena per maximum-sized packet.
+// Keep the existing startup footprint, with enough prepaid credit for both
+// maximum-sized producer peaks even when the root is otherwise exhausted.
+const REPLY_STORAGE_BYTES: usize = (2 * OUTPUT_PACKETS + 2) * (DEFAULT_LOCAL_MTU + BUFFER_OVERHEAD);
+const _: () = assert!(REPLY_STORAGE_BYTES >= 2 * (MAX_SUPPORTED_MTU + BUFFER_OVERHEAD));
+
+pub fn validate_mtu(mtu: usize) -> Result<(), Refused> {
+    if (MIN_SUPPORTED_MTU..=MAX_SUPPORTED_MTU).contains(&mtu) {
+        Ok(())
+    } else {
+        Err(Refused::UnsupportedMtu)
+    }
+}
 const HELD_DATAGRAMS: usize = 4;
 const STREAM_BUFFER: usize = 4096;
 const CONNECT_LIMIT: Duration = Duration::from_secs(2);
@@ -63,6 +80,7 @@ fn region(
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Stats {
+    pub unsupported_mtu: u64,
     pub tcp_flows: usize,
     pub udp_flows: usize,
     pub dropped_disposition: u64,
@@ -251,7 +269,7 @@ pub struct Forwarder<A: LocalAuthority> {
 
 impl<A: LocalAuthority> Forwarder<A> {
     pub fn new(authority: Arc<A>, buffers: Arc<dyn RelayBufferAllocator>) -> Result<Self, Refused> {
-        Self::with_mtu(authority, buffers, 1280)
+        Self::with_mtu(authority, buffers, DEFAULT_LOCAL_MTU)
     }
 
     pub fn with_mtu(
@@ -259,16 +277,10 @@ impl<A: LocalAuthority> Forwarder<A> {
         buffers: Arc<dyn RelayBufferAllocator>,
         mtu: usize,
     ) -> Result<Self, Refused> {
-        assert!(
-            (1280..=MAX_PACKET_SIZE).contains(&mtu),
-            "frontend MTU outside packet ceiling"
-        );
+        validate_mtu(mtu)?;
         // Both queues, one token/encoder peak and a receive scratch are funded
         // before startup. They cannot compete with newly admitted input bytes.
-        let replies = region(
-            &*buffers,
-            (2 * OUTPUT_PACKETS + 2) * (mtu + BUFFER_OVERHEAD),
-        )?;
+        let replies = region(&*buffers, REPLY_STORAGE_BYTES)?;
         let input = region(&*buffers, 2 * (MAX_PACKET_SIZE + BUFFER_OVERHEAD))?;
         let scratch_charge = buffers
             .try_reserve(MAX_PACKET_SIZE + BUFFER_OVERHEAD)
@@ -308,6 +320,17 @@ impl<A: LocalAuthority> Forwarder<A> {
             scratch,
             _metadata: metadata,
         })
+    }
+
+    /// Update packetization metadata, never sockets, grants or funded queues.
+    pub fn set_mtu(&mut self, mtu: usize) -> Result<(), Refused> {
+        validate_mtu(mtu)?;
+        if mtu != self.mtu {
+            log::debug!("local-receiver-mtu previous={} current={mtu}", self.mtu);
+            self.stack.set_mtu(mtu);
+            self.mtu = mtu;
+        }
+        Ok(())
     }
 
     /// Precharged capture scratch, kept by the frontend through its read loop.
@@ -373,6 +396,7 @@ impl<A: LocalAuthority> Forwarder<A> {
 
     fn refused(&mut self, refusal: Refused) {
         match refusal {
+            Refused::UnsupportedMtu => self.stats.unsupported_mtu += 1,
             Refused::Denied => self.stats.denied += 1,
             Refused::Stale => self.stats.stale += 1,
             Refused::Full => self.stats.full += 1,
@@ -504,6 +528,10 @@ impl<A: LocalAuthority> Forwarder<A> {
             }
         };
         let flow = packet.flow;
+        if flow.source.is_ipv6() && self.mtu < 1280 {
+            self.refused(Refused::UnsupportedMtu);
+            return;
+        }
         if self.authority.disposition(flow.destination.ip()) == Disposition::Drop {
             self.stats.dropped_disposition += 1;
             return;
@@ -662,6 +690,9 @@ impl<A: LocalAuthority> Forwarder<A> {
     }
 
     fn drain_stack(&mut self) {
+        if let Some(refused) = self.stack.device.refused.take() {
+            self.refused(refused);
+        }
         while let Some(bytes) = self.stack.device.outgoing.pop_front() {
             let Ok(packet) = packet::parse(&bytes) else {
                 self.stats.malformed += 1;

@@ -209,7 +209,12 @@ async fn failed_establishment_retains_its_request_until_external_retry_or_distin
             ipv6: Some(ROUTER_IPV6),
         };
         let receipt = capture
-            .bind_observed_identity("retained", 71_u64 << 32, sources, ROUTER_MTU)
+            .bind_observed_identity(
+                "retained",
+                71_u64 << 32,
+                sources,
+                talpid_tunnel::tun_provider::transport::LOCAL_ONLY_MTU,
+            )
             .unwrap();
         delivery.maintain_config(Some(configured())).await;
         delivery.authority.update(&policy(), Some(observation()));

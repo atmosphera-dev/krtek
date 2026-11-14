@@ -78,7 +78,11 @@ impl CaptureExpectation {
             || owner_uid < 0
             || api_level < 28
             || addresses.is_empty()
-            || mtu < 1280
+            || mtu == 0
+            || (mtu < 1280
+                && (addresses.iter().any(IpAddr::is_ipv6)
+                    || routes.iter().any(|route| route.address.is_ipv6())
+                    || dns_servers.iter().any(IpAddr::is_ipv6)))
         {
             return None;
         }

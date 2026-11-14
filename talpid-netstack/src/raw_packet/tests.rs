@@ -119,7 +119,7 @@ fn roundtrip(bytes: &[u8]) {
     let budget = BufferBudget::new(1024 * 1024);
     let (_capture, owner) = owners(&budget, sources());
     let attempt = owner.capability();
-    let mut mtu = MtuWatcher::new(attempt.identity().mtu);
+    let mut mtu = MtuWatcher::new(attempt.mtu());
     assert_eq!(mtu.get(), 1500);
     assert!(native_accepts(bytes, sources()));
     let packet = outbound(bytes, &attempt, &budget).unwrap();

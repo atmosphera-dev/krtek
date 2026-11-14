@@ -24,5 +24,5 @@ mod forwarder;
 pub mod packet;
 
 pub use authority::{Disposition, LocalAuthority, Refused};
-pub use forwarder::{Forwarder, Stats};
+pub use forwarder::{Forwarder, MAX_SUPPORTED_MTU, MIN_SUPPORTED_MTU, Stats, validate_mtu};
 pub use packet::{Flow, Transport};

@@ -56,7 +56,7 @@ impl CaptureConfig {
 
     pub fn mtu(&self) -> u16 {
         self.secured_config()
-            .map_or(crate::tun_provider::transport::ROUTER_MTU, |config| {
+            .map_or(crate::tun_provider::transport::LOCAL_ONLY_MTU, |config| {
                 config.mtu
             })
     }

@@ -216,7 +216,7 @@ open class TalpidVpnService : LifecycleVpnService() {
     private fun TunConfig.validSecuredFields() =
         listOf(addresses, routes, dnsServers).all { it.isNotEmpty() } &&
             addresses.none { it.isAnyLocalAddress || it.isMulticastAddress } &&
-            mtu >= BLOCKING_MTU
+            mtu > 0
 
     private fun openFrontend(generation: Long, create: () -> CreateTunResult): CreateTunResult {
         if (!localFrontendOwnership.tryFrontend(generation)) return EstablishError
@@ -305,7 +305,7 @@ open class TalpidVpnService : LifecycleVpnService() {
             { address, prefix -> builder.addAddress(address, prefix) },
             { builder.addRoute(InetAddress.getByAddress(it.networkBytes()), it.prefix) },
         )
-        builder.setMtu(BLOCKING_MTU)
+        builder.setMtu(LOCAL_ONLY_MTU)
         builder.setBlocking(false)
         builder.setMeteredIfSupported(false)
         builder.excludeApplications(excludedPackages.asList())
@@ -559,6 +559,7 @@ open class TalpidVpnService : LifecycleVpnService() {
         const val ROUTE_ALL_IPV4 = "0.0.0.0"
         const val ROUTE_ALL_IPV6 = "::"
         const val BLOCKING_MTU = 1280
+        private const val LOCAL_ONLY_MTU = 1280
 
         private const val IPV4_PREFIX_LENGTH = 32
         private const val IPV6_PREFIX_LENGTH = 128

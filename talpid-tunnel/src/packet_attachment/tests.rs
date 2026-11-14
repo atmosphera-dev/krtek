@@ -11,15 +11,18 @@ use talpid_netstack::buffer_budget::BufferBudget;
 
 fn config() -> TunConfig {
     let mut config = crate::tun_provider::blocking_config();
-    config.addresses = vec!["10.64.0.2".parse().unwrap(), "fc00::2".parse().unwrap()];
+    config.addresses = vec![
+        "172.27.1.1".parse().unwrap(),
+        "fdf0:ce4a:801d::172:27:1:1".parse().unwrap(),
+    ];
     config.mtu = 1420;
     config
 }
 
 fn sources() -> RelaySources {
     RelaySources {
-        ipv4: Some("10.64.0.2".parse().unwrap()),
-        ipv6: Some("fc00::2".parse().unwrap()),
+        ipv4: Some("172.27.1.1".parse().unwrap()),
+        ipv6: Some("fdf0:ce4a:801d::172:27:1:1".parse().unwrap()),
     }
 }
 

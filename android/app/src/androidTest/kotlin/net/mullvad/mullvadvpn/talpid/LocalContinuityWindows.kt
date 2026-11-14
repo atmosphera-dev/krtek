@@ -82,7 +82,7 @@ internal object LocalContinuityWindows {
         val down = Regex("RTM_NEWLINK:.*ifname=(tun\\d+).*ifi_flags=0x10 \\(\\)")
         val route =
             Regex(
-                "networkAddRouteParcel\\((\\d+), .*destination: ${Regex.escape(peer)}/32, ifName: (tun\\d+)"
+                "networkAddRouteParcel\\((\\d+), .*destination: ([0-9a-fA-F:.]+/\\d+), ifName: (tun\\d+)"
             )
         check(intents.zipWithNext().all { (a, b) -> a.time <= b.time }) { "Reordered intents" }
         val sessionEntries = entries.filter {
@@ -95,7 +95,10 @@ internal object LocalContinuityWindows {
                     .drop(index + 1)
                     .takeWhile { it.first - time <= 250_000_000L }
                     .firstOrNull { (_, later) ->
-                        route.find(later)?.groupValues?.get(2)?.let { it != old } == true
+                        route.find(later)?.let { installed ->
+                            installed.groupValues[3] != old &&
+                                CaptureReadiness.covers(installed.groupValues[2], "$peer/32")
+                        } == true
                     } ?: return@mapIndexedNotNull null
             val start = time + 1_000L - low
             val finish = installed.first - 1_000L - high

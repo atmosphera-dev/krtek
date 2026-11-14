@@ -364,7 +364,7 @@ async fn udp_echo(ipv6: bool) -> (SocketAddr, mpsc::UnboundedReceiver<Vec<u8>>, 
     let address = socket.local_addr().unwrap();
     let (hits, rx) = mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
-        let mut bytes = [0; 1280];
+        let mut bytes = vec![0; MAX_PACKET_SIZE];
         while let Ok((len, peer)) = socket.recv_from(&mut bytes).await {
             hits.send(bytes[..len].to_vec()).unwrap();
             socket.send_to(&bytes[..len], peer).await.unwrap();
