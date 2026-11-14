@@ -2105,7 +2105,10 @@ class LocalNetworkDeliveryInstrumentedTest {
                             .map { canonicalPrefix(it.trim()) }
                             .toSet()
                     val bookkeeping =
-                        setOf(canonicalPrefix("192.0.2.2/32"), canonicalPrefix("2001:db8::2/128"))
+                        setOf(
+                            canonicalPrefix("172.27.1.1/32"),
+                            canonicalPrefix("fdf0:ce4a:801d::172:27:1:1/128"),
+                        )
                     val frontend = addresses == bookkeeping
                     val routeText = checkNotNull(delimitedField(agent, "Routes: [", ']'))
                     val dns = checkNotNull(delimitedField(agent, "DnsAddresses: [", ']')).trim()

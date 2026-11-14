@@ -7,8 +7,8 @@ mod feedback_integration_tests;
 
 fn fixed() -> RelaySources {
     RelaySources {
-        ipv4: Some("192.0.2.2".parse().unwrap()),
-        ipv6: Some("2001:db8::2".parse().unwrap()),
+        ipv4: Some("172.27.1.1".parse().unwrap()),
+        ipv6: Some("fdf0:ce4a:801d::172:27:1:1".parse().unwrap()),
     }
 }
 

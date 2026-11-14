@@ -67,7 +67,10 @@ fn tun_config(config: &Config) -> tun_provider::TunConfig {
 
 fn fixed_config(config: &Config) -> tun_provider::TunConfig {
     let mut tun = tun_config(config);
-    tun.addresses = vec!["192.0.2.2".parse().unwrap(), "2001:db8::2".parse().unwrap()];
+    tun.addresses = vec![
+        "172.27.1.1".parse().unwrap(),
+        "fdf0:ce4a:801d::172:27:1:1".parse().unwrap(),
+    ];
     tun.mtu = 1280;
     tun
 }
@@ -95,8 +98,8 @@ async fn assigned_target_configuration_is_not_the_capture_projection() {
             "tun17",
             99,
             RelaySources {
-                ipv4: Some("192.0.2.2".parse().unwrap()),
-                ipv6: Some("2001:db8::2".parse().unwrap()),
+                ipv4: Some("172.27.1.1".parse().unwrap()),
+                ipv6: Some("fdf0:ce4a:801d::172:27:1:1".parse().unwrap()),
             },
             1280,
         )
@@ -1680,7 +1683,7 @@ async fn ordinary_tcp_stream_consumers_receive_full_nonces_through_real_crypto()
         let (application, mut app_output, mut app_input, mut app_guard) =
             smoltcp_network(SmoltcpNetworkConfig {
                 ipv4_addr: if translated {
-                    "192.0.2.2".parse().unwrap()
+                    "172.27.1.1".parse().unwrap()
                 } else {
                     config.tunnel_ipv4().unwrap()
                 },

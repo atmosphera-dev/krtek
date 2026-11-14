@@ -274,7 +274,7 @@ fn sink_handover_preserves_session_and_exact_target_but_never_old_sink_authority
 fn partial_sink_has_no_managed_handle_and_sink_reservations_are_bounded() {
     let budget = BufferBudget::new(8 * BUFFER_OVERHEAD);
     let sources = RelaySources {
-        ipv4: Some("192.0.2.2".parse().unwrap()),
+        ipv4: Some("172.27.1.1".parse().unwrap()),
         ipv6: None,
     };
     let owner = RelayCaptureOwner::session(

@@ -5,8 +5,8 @@ import net.mullvad.mullvadvpn.lib.model.LocalCidr
 /** This path deliberately has no DNS configuration or upstream empty-DNS fallback. */
 internal class LocalFrontendConfig private constructor(val routes: List<LocalCidr>) {
     fun configure(address: (String, Int) -> Unit, route: (LocalCidr) -> Unit) {
-        address("192.0.2.2", IPV4_HOST_PREFIX)
-        address("2001:db8::2", IPV6_HOST_PREFIX)
+        address("172.27.1.1", IPV4_HOST_PREFIX)
+        address("fdf0:ce4a:801d::172:27:1:1", IPV6_HOST_PREFIX)
         routes.forEach(route)
     }
 

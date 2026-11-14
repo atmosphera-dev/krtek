@@ -1,5 +1,6 @@
 package net.mullvad.mullvadvpn.talpid
 
+import java.net.InetAddress
 import kotlin.test.assertEquals
 import kotlin.test.assertFails
 import kotlin.test.assertFalse
@@ -98,9 +99,9 @@ class CaptureReadinessTest {
         assertFails { sample(ready().replace(encoded, "[malformed]")) }
     }
 
-    // Exact Connected receipt retained from the first run-05 item-5 phone failure.
+    // Connected receipt shape from run-05, updated to the current fixed router pair.
     private val actualRoutes =
-        "[CaptureRoute { destination: CapturePrefix { address: 0.0.0.0, prefix_length: 0 }, gateway: None, interface_name: \"tun0\", route_type: Some(1) }, CaptureRoute { destination: CapturePrefix { address: 10.0.2.2, prefix_length: 32 }, gateway: None, interface_name: \"tun0\", route_type: Some(1) }, CaptureRoute { destination: CapturePrefix { address: 10.64.0.1, prefix_length: 32 }, gateway: None, interface_name: \"tun0\", route_type: Some(1) }, CaptureRoute { destination: CapturePrefix { address: 192.0.2.2, prefix_length: 32 }, gateway: None, interface_name: \"tun0\", route_type: Some(1) }, CaptureRoute { destination: CapturePrefix { address: ::, prefix_length: 0 }, gateway: None, interface_name: \"tun0\", route_type: Some(1) }, CaptureRoute { destination: CapturePrefix { address: 2001:db8::2, prefix_length: 128 }, gateway: None, interface_name: \"tun0\", route_type: Some(1) }, CaptureRoute { destination: CapturePrefix { address: fc00:bbbb:bbbb:bb01::1, prefix_length: 128 }, gateway: None, interface_name: \"tun0\", route_type: Some(1) }]"
+        "[CaptureRoute { destination: CapturePrefix { address: 0.0.0.0, prefix_length: 0 }, gateway: None, interface_name: \"tun0\", route_type: Some(1) }, CaptureRoute { destination: CapturePrefix { address: 10.0.2.2, prefix_length: 32 }, gateway: None, interface_name: \"tun0\", route_type: Some(1) }, CaptureRoute { destination: CapturePrefix { address: 10.64.0.1, prefix_length: 32 }, gateway: None, interface_name: \"tun0\", route_type: Some(1) }, CaptureRoute { destination: CapturePrefix { address: 172.27.1.1, prefix_length: 32 }, gateway: None, interface_name: \"tun0\", route_type: Some(1) }, CaptureRoute { destination: CapturePrefix { address: ::, prefix_length: 0 }, gateway: None, interface_name: \"tun0\", route_type: Some(1) }, CaptureRoute { destination: CapturePrefix { address: fdf0:ce4a:801d::172:27:1:1, prefix_length: 128 }, gateway: None, interface_name: \"tun0\", route_type: Some(1) }, CaptureRoute { destination: CapturePrefix { address: fc00:bbbb:bbbb:bb01::1, prefix_length: 128 }, gateway: None, interface_name: \"tun0\", route_type: Some(1) }]"
 
     private fun actual(
         receiptRoutes: String = actualRoutes,
@@ -111,26 +112,38 @@ class CaptureReadinessTest {
             "tun0",
             "183",
             setOf(
-                "0.0.0.0/0",
-                "10.0.2.2/32",
-                "10.64.0.1/32",
-                "192.0.2.2/32",
-                "::/0",
-                "2001:db8::2/128",
-                "fc00:bbbb:bbbb:bb01::1/128",
-            ),
+                    "0.0.0.0/0",
+                    "10.0.2.2/32",
+                    "10.64.0.1/32",
+                    "172.27.1.1/32",
+                    "::/0",
+                    "fdf0:ce4a:801d::172:27:1:1/128",
+                    "fc00:bbbb:bbbb:bb01::1/128",
+                )
+                .map(::canonicalPrefix)
+                .toSet(),
             1280,
             10181,
             null,
         ) {
-            it
+            canonicalPrefix(it)
         }
+
+    private fun canonicalPrefix(text: String): String {
+        val (address, prefix) = text.split("/")
+        return "${InetAddress.getByName(address).hostAddress}/${prefix.toInt()}"
+    }
 
     @Test
     fun realCaptureRouteReceiptIsAcceptedExactly() {
         val receipt = assertNotNull(actual())
         assertEquals("3", receipt.generation)
         assertEquals("789384712205", receipt.handle)
+        assertNotNull(
+            actual(
+                actualRoutes.replace("fdf0:ce4a:801d::172:27:1:1", "fdf0:ce4a:801d:0:172:27:1:1")
+            )
+        )
         assertNotNull(sample(ready().replace("Some(1)", "None")))
         assertNull(sample(ready().replace("interface_name: \"tun0\"", "interface_name: \"tun1\"")))
     }

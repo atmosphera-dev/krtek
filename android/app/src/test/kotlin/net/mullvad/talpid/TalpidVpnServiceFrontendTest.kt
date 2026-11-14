@@ -117,8 +117,25 @@ class TalpidVpnServiceFrontendTest {
         verify(exactly = 0) {
             anyConstructed<VpnService.Builder>().addDnsServer(any<InetAddress>())
         }
-        verify(exactly = 3) { anyConstructed<VpnService.Builder>().addAddress("192.0.2.2", 32) }
-        verify(exactly = 3) { anyConstructed<VpnService.Builder>().addAddress("2001:db8::2", 128) }
+        verify(exactly = 3) {
+            anyConstructed<VpnService.Builder>()
+                .addAddress(
+                    match<String> {
+                        InetAddress.getByName(it) == InetAddress.getByName("172.27.1.1")
+                    },
+                    32,
+                )
+        }
+        verify(exactly = 3) {
+            anyConstructed<VpnService.Builder>()
+                .addAddress(
+                    match<String> {
+                        InetAddress.getByName(it) ==
+                            InetAddress.getByName("fdf0:ce4a:801d::172:27:1:1")
+                    },
+                    128,
+                )
+        }
         verify(exactly = 3) { anyConstructed<VpnService.Builder>().establish() }
     }
 

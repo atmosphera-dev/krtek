@@ -336,9 +336,9 @@ fn flow(destination: SocketAddr, transport: Transport, port: u16) -> Flow {
     Flow {
         source: SocketAddr::new(
             if destination.is_ipv6() {
-                "2001:db8::2".parse().unwrap()
+                "fdf0:ce4a:801d::172:27:1:1".parse().unwrap()
             } else {
-                "192.0.2.2".parse().unwrap()
+                "172.27.1.1".parse().unwrap()
             },
             port,
         ),

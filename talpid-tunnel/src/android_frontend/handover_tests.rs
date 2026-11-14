@@ -320,7 +320,10 @@ async fn explicit_release_retry_joins_outstanding_predecessor_cleanup() {
 
 fn fixed_config(dns: &str) -> TunConfig {
     let mut config = blocking_config();
-    config.addresses = vec!["192.0.2.2".parse().unwrap(), "2001:db8::2".parse().unwrap()];
+    config.addresses = vec![
+        "172.27.1.1".parse().unwrap(),
+        "fdf0:ce4a:801d::172:27:1:1".parse().unwrap(),
+    ];
     config.mtu = 1280;
     config.dns_servers = Some(vec![dns.parse().unwrap()]);
     config

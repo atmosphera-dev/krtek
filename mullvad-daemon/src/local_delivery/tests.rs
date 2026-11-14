@@ -118,7 +118,7 @@ fn route(address: &str, prefix_length: i16) -> LocalPhysicalRoute {
 
 fn flow(transport: Transport, source_port: u16) -> Flow {
     Flow {
-        source: SocketAddr::new("192.0.2.2".parse().unwrap(), source_port),
+        source: SocketAddr::new("172.27.1.1".parse().unwrap(), source_port),
         destination: "10.0.2.2:18080".parse().unwrap(),
         transport,
     }
@@ -466,7 +466,9 @@ fn authority_triages_without_preparing_and_refuses_wrong_sources_and_missing_obs
         assert_eq!(authority.authorize(request), Err(Refused::Denied));
     }
     let mut request = flow(Transport::Tcp, 40000);
-    request.source.set_ip("2001:db8::2".parse().unwrap());
+    request
+        .source
+        .set_ip("fdf0:ce4a:801d::172:27:1:1".parse().unwrap());
     assert!(authority.authorize(request).is_ok());
     let mut configured = policy();
     configured.rules[0]
@@ -535,7 +537,7 @@ async fn authority_update_revokes_before_notification_and_preparation_retains_se
     authority.update(&policy(), Some(observation()));
     let mut request = flow(Transport::Udp, 40001);
     request.destination = "[fe80::12]:18081".parse().unwrap();
-    request.source = "[2001:db8::2]:40001".parse().unwrap();
+    request.source = "[fdf0:ce4a:801d::172:27:1:1]:40001".parse().unwrap();
     let scoped = authority.authorize(request).unwrap();
     assert_eq!(
         authority.physical_destination(&scoped, request),
@@ -697,8 +699,8 @@ impl FrontendFactory for FakeFactory {
                 .bind_partial_identity(
                     "tun-fake",
                     talpid_types::relay_flow::RelaySources {
-                        ipv4: Some("192.0.2.2".parse().unwrap()),
-                        ipv6: Some("2001:db8::2".parse().unwrap()),
+                        ipv4: Some("172.27.1.1".parse().unwrap()),
+                        ipv6: Some("fdf0:ce4a:801d::172:27:1:1".parse().unwrap()),
                     },
                     1280,
                 )
@@ -1306,7 +1308,10 @@ async fn successor_reserved_destinations_are_published_before_its_owner_command(
         Disposition::Local
     );
     let mut config = assigned_config();
-    config.addresses = vec!["192.0.2.2".parse().unwrap(), "2001:db8::2".parse().unwrap()];
+    config.addresses = vec![
+        "172.27.1.1".parse().unwrap(),
+        "fdf0:ce4a:801d::172:27:1:1".parse().unwrap(),
+    ];
     config.mtu = 1280;
     let request = broker.request_capture(config).unwrap();
     delivery

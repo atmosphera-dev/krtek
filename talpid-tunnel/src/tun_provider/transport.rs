@@ -4,9 +4,9 @@ use crate::packet_attachment::{
     AttachmentBroker, AttachmentError, AttachmentMode, ConfigurationRequest, TransportCleanup,
 };
 
-pub const ROUTER_IPV4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 0, 2, 2);
+pub const ROUTER_IPV4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(172, 27, 1, 1);
 pub const ROUTER_IPV6: std::net::Ipv6Addr =
-    std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+    std::net::Ipv6Addr::new(0xfdf0, 0xce4a, 0x801d, 0, 0x172, 0x27, 0x1, 0x1);
 pub const ROUTER_MTU: u16 = 1280;
 
 pub enum TransportMode {
@@ -166,8 +166,8 @@ mod tests {
         assert_eq!(
             projected.addresses,
             vec![
-                "192.0.2.2".parse::<std::net::IpAddr>().unwrap(),
-                "2001:db8::2".parse().unwrap()
+                "172.27.1.1".parse::<std::net::IpAddr>().unwrap(),
+                "fdf0:ce4a:801d::172:27:1:1".parse().unwrap()
             ]
         );
         assert_eq!(projected.mtu, 1280);

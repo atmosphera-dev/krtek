@@ -3,8 +3,10 @@ use crate::buffer_budget::BufferBudget;
 use talpid_types::relay_flow::{RelayAttemptOwner, RelayCaptureGeneration, RelayCaptureOwner};
 
 pub(super) const FIXED: RelaySources = RelaySources {
-    ipv4: Some(std::net::Ipv4Addr::new(192, 0, 2, 2)),
-    ipv6: Some(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2)),
+    ipv4: Some(std::net::Ipv4Addr::new(172, 27, 1, 1)),
+    ipv6: Some(std::net::Ipv6Addr::new(
+        0xfdf0, 0xce4a, 0x801d, 0, 0x172, 0x27, 0x1, 0x1,
+    )),
 };
 pub(super) const ASSIGNED: RelaySources = RelaySources {
     ipv4: Some(std::net::Ipv4Addr::new(10, 64, 0, 7)),

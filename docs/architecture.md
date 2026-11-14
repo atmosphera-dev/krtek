@@ -278,6 +278,13 @@ See the [split tunneling documentation](split-tunneling.md).
 
 ### Android
 
+Krtek's Android router uses the fixed private IPv4 address `172.27.1.1/32` and
+RFC 4193 ULA `fdf0:ce4a:801d::172:27:1:1/128`, with MTU 1280. These app-facing
+addresses are independent of Mullvad login, key rotation and tunnel assignment.
+Tunnel targets translate to their own assigned addresses; Local uses protected,
+physical-network-bound sockets. Private networks can still collide with this
+fixed pair; private-use addressing does not guarantee collision-free routing.
+
 ### iOS
 
 ### CLI

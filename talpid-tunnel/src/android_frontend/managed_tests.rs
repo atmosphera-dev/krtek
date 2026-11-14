@@ -39,7 +39,7 @@ async fn unsupported_capture_formats_never_admit_packets_and_retain_failed_relea
                 source: if secured {
                     "10.64.42.2:48500"
                 } else {
-                    "192.0.2.2:48500"
+                    "172.27.1.1:48500"
                 }
                 .parse()
                 .unwrap(),

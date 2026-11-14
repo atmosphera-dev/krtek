@@ -341,8 +341,10 @@ async fn daemon_route_handover_retains_the_partial_grant_and_same_physical_tcp_s
                 ),
                 2 | 3 => {
                     let mut config = assigned_config();
-                    config.addresses =
-                        vec!["192.0.2.2".parse().unwrap(), "2001:db8::2".parse().unwrap()];
+                    config.addresses = vec![
+                        "172.27.1.1".parse().unwrap(),
+                        "fdf0:ce4a:801d::172:27:1:1".parse().unwrap(),
+                    ];
                     config.mtu = 1280;
                     if index == 3 {
                         config.dns_servers = Some(vec!["10.64.0.2".parse().unwrap()]);
@@ -832,7 +834,10 @@ fn release_fixture() -> (
 
 fn fixed_config() -> talpid_tunnel::tun_provider::TunConfig {
     let mut config = assigned_config();
-    config.addresses = vec!["192.0.2.2".parse().unwrap(), "2001:db8::2".parse().unwrap()];
+    config.addresses = vec![
+        "172.27.1.1".parse().unwrap(),
+        "fdf0:ce4a:801d::172:27:1:1".parse().unwrap(),
+    ];
     config.mtu = 1280;
     config
 }

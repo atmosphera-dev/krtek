@@ -1,5 +1,6 @@
 package net.mullvad.talpid
 
+import java.net.InetAddress
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
@@ -52,7 +53,13 @@ class LocalFrontendTest {
                 { announced += it.toString() },
             )
             assertEquals(routes, announced)
-            assertEquals(listOf("192.0.2.2" to 32, "2001:db8::2" to 128), addresses)
+            assertEquals(
+                listOf(
+                    InetAddress.getByName("172.27.1.1") to 32,
+                    InetAddress.getByName("fdf0:ce4a:801d::172:27:1:1") to 128,
+                ),
+                addresses.map { (address, prefix) -> InetAddress.getByName(address) to prefix },
+            )
         }
     }
 

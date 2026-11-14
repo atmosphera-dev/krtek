@@ -34,7 +34,7 @@ fn socket_option(socket: &UdpSocket, option: i32) -> i32 {
 #[ignore = "requires isolated network namespace, /dev/net/tun and CAP_NET_ADMIN"]
 async fn ipv4_pmtu_feedback_crosses_the_capture_writer_and_updates_the_kernel_socket() {
     use nix::libc;
-    let fixed = "192.0.2.2".parse::<std::net::Ipv4Addr>().unwrap();
+    let fixed = "172.27.1.1".parse::<std::net::Ipv4Addr>().unwrap();
     let remote = "203.0.113.9".parse::<std::net::Ipv4Addr>().unwrap();
     let mut configuration = tun::Configuration::default();
     configuration
