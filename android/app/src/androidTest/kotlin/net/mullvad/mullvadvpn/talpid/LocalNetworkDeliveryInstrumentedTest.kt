@@ -1187,6 +1187,12 @@ class LocalNetworkDeliveryInstrumentedTest {
                     report("continuity_excluded_uid", excludedUid)
                     report("continuity_consumer_uid", consumerUid)
                 }
+                // Android closes connections open at the app-list change (run-05
+                // item-4-answer-r02); fresh ones to the same peer work right away.
+                listOf("tcp", "udp").forEach {
+                    probeSocket(consumer, it, "reply", sessionFrame = true)
+                }
+                report("fresh_after_app_list_change", "tcp,udp")
                 // Finish the list-changing lifetime before the static-list cycle.
                 // Only that explicit app-list change may destroy the old TCP stream.
                 if (connectWithExclusion) {
@@ -1920,6 +1926,19 @@ class LocalNetworkDeliveryInstrumentedTest {
                 val samples = local.filter { it.getString("transport") == transport }
                 samples.forEachIndexed { index, sample ->
                     assertEquals(index, sample.getInt("tick"))
+                    val sendFailure =
+                        if (sample.getString("outcome") == "udp-send-error")
+                            LocalContinuityLedger.UdpSendFailure(
+                                expectedScheduled =
+                                    stop.getLong("started_ns") + index * 250_000_000L,
+                                scheduled = sample.getLong("scheduled_ns"),
+                                start = sample.getLong("start_ns"),
+                                send = sample.getLong("send_ns"),
+                                returned = sample.getLong("return_ns"),
+                                errorClass = sample.getString("error_class"),
+                                ioException = sample.getString("send_ioexception"),
+                            )
+                        else null
                     appListChangeAt?.let { boundary ->
                         if (sample.getString("outcome") in setOf("error", "cancelled")) {
                             assertTrue(sample.getString("outcome") in setOf("error", "cancelled"))
@@ -1936,20 +1955,29 @@ class LocalNetworkDeliveryInstrumentedTest {
                             assertTrue(sample.getLong("expired_ns") >= boundary)
                             return@forEachIndexed
                         }
-                    }
-                    val sendFailure =
-                        if (sample.getString("outcome") == "udp-send-error")
-                            LocalContinuityLedger.UdpSendFailure(
-                                expectedScheduled =
-                                    stop.getLong("started_ns") + index * 250_000_000L,
-                                scheduled = sample.getLong("scheduled_ns"),
-                                start = sample.getLong("start_ns"),
-                                send = sample.getLong("send_ns"),
-                                returned = sample.getLong("return_ns"),
-                                errorClass = sample.getString("error_class"),
-                                ioException = sample.getString("send_ioexception"),
+                        // Android closes the pre-existing UDP socket's path at the change too.
+                        if (
+                            sendFailure != null &&
+                                LocalContinuityLedger.appListSocketDrop(
+                                    transport,
+                                    sendFailure,
+                                    boundary,
+                                    sample.getInt("socket_id"),
+                                    stop.getJSONObject("udp_socket").getInt("object_id"),
+                                )
+                        ) {
+                            report(
+                                "app_list_udp_send_drop",
+                                JSONObject()
+                                    .put("session_id", id)
+                                    .put("tick", index)
+                                    .put("send_ns", sendFailure.send)
+                                    .put("change_ns", boundary)
+                                    .put("send_ioexception", sample.getString("send_ioexception")),
                             )
-                        else null
+                            return@forEachIndexed
+                        }
+                    }
                     if (
                         LocalContinuityLedger.retirementOutcome(
                             transport,
@@ -1995,7 +2023,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                             stop.getJSONObject("udp_socket").getString("local_address"),
                             sample.getString("local_address"),
                         )
-                        val next = samples[index + 1]
+                        val next = samples[LocalContinuityLedger.recoveryIndex(index, samples.size)]
                         assertEquals(index + 1, next.getInt("tick"))
                         assertEquals("reply", next.getString("outcome"))
                         assertEquals(scheduled + 250_000_000L, next.getLong("scheduled_ns"))

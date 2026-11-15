@@ -44,4 +44,33 @@ internal object LocalContinuityLedger {
         check(outcome in setOf("error", "cancelled", "udp-reply-missing"))
         return true
     }
+
+    /**
+     * Run-05 item-4-answer-r02: an app-list change rebuilds the interface and Android closes
+     * connections open at that moment. Only the session's pre-existing UDP socket, sending at or
+     * after the measured change, may fail that way. Earlier sends, other sockets and sessions
+     * without a measured app-list change still fail.
+     */
+    fun appListSocketDrop(
+        transport: String,
+        failure: UdpSendFailure,
+        appListChangeAt: Long?,
+        socketId: Int,
+        preExistingSocketId: Int,
+    ): Boolean {
+        check(transport == "udp")
+        return appListChangeAt != null &&
+            socketId == preExistingSocketId &&
+            failure.send >= appListChangeAt
+    }
+
+    /** Any other tolerated UDP failure needs its recovery reply; the last sample has none. */
+    fun recoveryIndex(index: Int, sampleCount: Int): Int {
+        check(index in 0 until sampleCount)
+        if (index + 1 >= sampleCount)
+            throw AssertionError(
+                "UDP failure at tick $index is the session's last sample: no recovery reply"
+            )
+        return index + 1
+    }
 }

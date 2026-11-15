@@ -2,6 +2,7 @@ package net.mullvad.mullvadvpn.talpid
 
 import kotlin.test.assertEquals
 import kotlin.test.assertFails
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import org.junit.jupiter.api.Test
@@ -120,5 +121,40 @@ class LocalContinuityLedgerTest {
                 2_000_000_000,
             )
         }
+    }
+
+    @Test
+    fun appListDropAcceptsOnlyThePreExistingSocketAtOrAfterTheChange() {
+        fun drop(
+            boundary: Long?,
+            socket: Int = 7,
+            sample: LocalContinuityLedger.UdpSendFailure = failure,
+        ) = LocalContinuityLedger.appListSocketDrop("udp", sample, boundary, socket, 7)
+        assertTrue(drop(failure.send))
+        assertTrue(drop(failure.send - 1))
+        assertTrue(drop(failure.scheduled))
+        // A send before the measured change is not the app-list drop.
+        assertFalse(drop(failure.send + 1))
+        assertFalse(drop(failure.returned))
+        // No measured change (every non-exclusion session) and other sockets never qualify.
+        assertFalse(drop(null))
+        assertFalse(drop(failure.send, socket = 8))
+        assertFails { LocalContinuityLedger.appListSocketDrop("tcp", failure, failure.send, 7, 7) }
+        val eacces =
+            failure.copy(
+                errorClass = "java.io.IOException",
+                ioException = "java.io.IOException: sendto failed: EACCES (Permission denied)",
+            )
+        assertTrue(drop(eacces.send, sample = eacces))
+        assertFalse(drop(eacces.send + 1, sample = eacces))
+    }
+
+    @Test
+    fun trailingUdpFailureIsAnExplicitMissingRecoveryNotACrash() {
+        assertEquals(12, LocalContinuityLedger.recoveryIndex(11, 13))
+        val error = assertFailsWith<AssertionError> { LocalContinuityLedger.recoveryIndex(12, 13) }
+        assertTrue(error.message!!.contains("no recovery reply"))
+        assertFailsWith<IllegalStateException> { LocalContinuityLedger.recoveryIndex(13, 13) }
+        assertFailsWith<IllegalStateException> { LocalContinuityLedger.recoveryIndex(-1, 13) }
     }
 }
