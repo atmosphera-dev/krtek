@@ -16,9 +16,16 @@ fn add_ipv6_address(index: u32, address: std::net::Ipv6Addr) {
     use netlink_packet_core::{
         NLM_F_ACK, NLM_F_CREATE, NLM_F_REQUEST, NetlinkMessage, NetlinkPayload,
     };
-    use netlink_packet_route::{RouteNetlinkMessage, address::AddressHeaderFlags};
+    use netlink_packet_route::{
+        RouteNetlinkMessage,
+        address::AddressHeaderFlags,
+        route::{RouteAddress, RouteAttribute, RouteType},
+    };
     use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_ROUTE};
+    use nix::libc;
     use rtnetlink::AddressMessageBuilder;
+    const RTNLGRP_IPV6_ROUTE: u32 = 11;
+    const RT_TABLE_LOCAL: u32 = 255;
 
     // Use the same direct kernel API as tun_provider::netlink, but a /64
     // gives this isolated peer fixture its connected IPv6 route as well.
@@ -33,12 +40,66 @@ fn add_ipv6_address(index: u32, address: std::net::Ipv6Addr) {
     let mut bytes = vec![0; request.buffer_len()];
     request.serialize(&mut bytes);
     let socket = Socket::new(NETLINK_ROUTE).unwrap();
+    // The acknowledgement only means the address exists. Even without DAD,
+    // the kernel installs the address's local route later, from addrconf's
+    // DAD work; until then inbound packets to it are address errors. So
+    // subscribe before the request and wait for that route's announcement.
+    socket.add_membership(RTNLGRP_IPV6_ROUTE).unwrap();
+    let bound = libc::timeval {
+        tv_sec: 10,
+        tv_usec: 0,
+    };
+    // SAFETY: the socket is live, and the option value has its declared size.
+    assert_eq!(
+        unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                (&bound as *const libc::timeval).cast(),
+                std::mem::size_of_val(&bound) as libc::socklen_t,
+            )
+        },
+        0
+    );
     socket.send_to(&bytes, &SocketAddr::new(0, 0), 0).unwrap();
-    let (response, _) = socket.recv_from_full().unwrap();
-    let response = NetlinkMessage::<RouteNetlinkMessage>::deserialize(&response).unwrap();
-    match response.payload {
-        NetlinkPayload::Error(error) => assert_eq!(error.code, None, "{error:?}"),
-        other => panic!("expected address acknowledgement, got {other:?}"),
+    let (mut acknowledged, mut routed) = (false, false);
+    while !(acknowledged && routed) {
+        let (datagram, _) = socket
+            .recv_from_full()
+            .expect("address acknowledgement and its local route announcement");
+        let mut offset = 0;
+        while offset < datagram.len() {
+            let message =
+                NetlinkMessage::<RouteNetlinkMessage>::deserialize(&datagram[offset..]).unwrap();
+            offset += (message.header.length as usize + 3) & !3;
+            match message.payload {
+                NetlinkPayload::Error(error) => {
+                    assert_eq!(error.code, None, "{error:?}");
+                    acknowledged = true;
+                }
+                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(route)) => {
+                    let table = route
+                        .attributes
+                        .iter()
+                        .find_map(|attribute| match attribute {
+                            RouteAttribute::Table(table) => Some(*table),
+                            _ => None,
+                        })
+                        .unwrap_or(u32::from(route.header.table));
+                    routed |= route.header.kind == RouteType::Local
+                        && table == RT_TABLE_LOCAL
+                        && route.header.destination_prefix_length == 128
+                        && route.attributes.contains(&RouteAttribute::Oif(index))
+                        && route
+                            .attributes
+                            .contains(&RouteAttribute::Destination(RouteAddress::Inet6(address)));
+                }
+                // Other IPv6 route announcements are unrelated to readiness.
+                NetlinkPayload::InnerMessage(_) => {}
+                other => panic!("unexpected address-setup message {other:?}"),
+            }
+        }
     }
 }
 fn socket_option(socket: &UdpSocket, level: i32, option: i32) -> i32 {
@@ -160,7 +221,7 @@ fn peer_reply(invoking: &[u8], payload: &[u8]) -> Vec<u8> {
     checksums(&mut output, 17);
     output
 }
-fn fragments(bytes: &[u8]) -> Vec<Vec<u8>> {
+fn fragments(bytes: &[u8], identification: u32) -> Vec<Vec<u8>> {
     let v6 = bytes[0] >> 4 == 6;
     let ip = if v6 { 40 } else { 20 };
     bytes[ip..]
@@ -175,10 +236,10 @@ fn fragments(bytes: &[u8]) -> Vec<Vec<u8>> {
                 output[4..6].copy_from_slice(&((part.len() + 8) as u16).to_be_bytes());
                 output.extend_from_slice(&[17, 0]);
                 output.extend_from_slice(&((offset as u16) | u16::from(more)).to_be_bytes());
-                output.extend_from_slice(&0x12345678u32.to_be_bytes());
+                output.extend_from_slice(&identification.to_be_bytes());
             } else {
                 output[2..4].copy_from_slice(&((part.len() + 20) as u16).to_be_bytes());
-                output[4..6].copy_from_slice(&0x1234u16.to_be_bytes());
+                output[4..6].copy_from_slice(&(identification as u16).to_be_bytes());
                 output[6..8].copy_from_slice(
                     &((offset as u16 / 8) | if more { 0x2000 } else { 0 }).to_be_bytes(),
                 );
@@ -255,7 +316,13 @@ async fn endpoint_injection_preserves_large_replies_and_real_network_pmtu() {
         .up();
     let mut device = tun::create(&configuration).expect("isolated kernel TUN");
     device.set_nonblock().unwrap();
-    add_ipv6_address(device.tun_index().unwrap() as u32, fixed.ipv6.unwrap());
+    let index = device.tun_index().unwrap() as u32;
+    add_ipv6_address(index, fixed.ipv6.unwrap());
+    // Reassembly queues belong to the namespace and outlive this process, so
+    // a fixed fragment identification could join a queue left by an earlier
+    // run. The kernel never reuses an ifindex within a namespace until it
+    // wraps, which makes this TUN's index a unique identification per run.
+    let identification = index;
     for interface in ["all", "krtek-pmtu"] {
         assert_eq!(
             std::fs::read_to_string(format!("/proc/sys/net/ipv4/conf/{interface}/accept_local"))
@@ -329,7 +396,7 @@ async fn endpoint_injection_preserves_large_replies_and_real_network_pmtu() {
         let wire = owned_bytes(path.process(&input, Direction::Outbound).unwrap());
         let payload: Vec<u8> = (0..3072).map(|n| (n % 251) as u8).collect();
         let reply = peer_reply(&wire, &payload);
-        let pieces = fragments(&reply);
+        let pieces = fragments(&reply, identification);
         assert_eq!(pieces.len(), 3);
         assert!(pieces[0].len() > 1280);
         for piece in pieces.iter().rev() {
