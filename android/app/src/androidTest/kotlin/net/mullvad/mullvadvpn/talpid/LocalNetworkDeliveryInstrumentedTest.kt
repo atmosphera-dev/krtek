@@ -17,12 +17,14 @@ import android.os.ParcelFileDescriptor
 import android.os.Process
 import android.os.SystemClock
 import androidx.test.platform.app.InstrumentationRegistry
+import arrow.core.Either
 import co.touchlab.kermit.LogWriter
 import co.touchlab.kermit.Logger
 import co.touchlab.kermit.Severity
 import com.squareup.wire.GrpcClient
 import java.io.File
 import java.io.RandomAccessFile
+import java.net.InetAddress
 import java.net.Proxy
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
@@ -62,6 +64,7 @@ import net.mullvad.mullvadvpn.lib.grpc.util.UnixDomainSocketFactory
 import net.mullvad.mullvadvpn.lib.model.ConnectedWifi
 import net.mullvad.mullvadvpn.lib.model.CustomListName
 import net.mullvad.mullvadvpn.lib.model.DisconnectReason
+import net.mullvad.mullvadvpn.lib.model.DnsState
 import net.mullvad.mullvadvpn.lib.model.ErrorStateCause
 import net.mullvad.mullvadvpn.lib.model.ForwardingAvailability
 import net.mullvad.mullvadvpn.lib.model.LocalBypassRule
@@ -296,7 +299,7 @@ class LocalNetworkDeliveryInstrumentedTest {
     // extend this same method before the final clean-pair B7 campaign.
     @Test
     fun rulesOffMatchesUpstream() =
-        withConsumer(null, testTimeout = 8.minutes, after = { it.verifySupportAndGuide() }) {
+        withConsumer(null, testTimeout = 12.minutes, after = { it.verifySupportAndGuide() }) {
             consumer,
             repository,
             connection ->
@@ -399,6 +402,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                             "${system.startId}:true,${systemDuplicate.startId}:false",
                         )
                         report("rules_off_command_baseline", "complete")
+                        rulesOffParity(repository, connection, events, afterDuplicate)
                         terminalStart = events.cursor()
                         terminalEventExpected = runBlocking {
                             connection.tunnelState.first() !is TunnelState.Disconnected
@@ -428,6 +432,414 @@ class LocalNetworkDeliveryInstrumentedTest {
                 }
             }
         }
+
+    // Upstream 8fcbcd553e resolve_routes: allow_lan subtracts ALLOWED_LAN_NETS and the LAN
+    // multicast nets, keeping the IPv4/IPv6 gateways and the SOCKS range 10.124.0.0/23.
+    private val parityTunnelled4 = listOf("1.1.1.1", "10.64.0.1", "10.124.0.1", "10.124.1.254")
+    private val parityLan4 =
+        listOf(
+            "10.0.2.53",
+            "10.0.2.2",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "224.0.0.251",
+            "239.1.1.1",
+            "255.255.255.255",
+        )
+    private val parityTunnelled6 = listOf("2606:4700:4700::1111", "fc00:bbbb:bbbb:bb01::1")
+    private val parityLan6 = listOf("fe80::1", "fd00::1", "ff02::fb", "ff05::2")
+
+    private fun dnsSet(dns: String): Set<String> =
+        dns.split(',')
+            .filter { it.isNotBlank() }
+            .map { checkNotNull(InetAddress.getByName(it.trim().removePrefix("/")).hostAddress) }
+            .toSet()
+
+    private fun normalizedDns(addresses: Set<String>): Set<String> =
+        addresses.map { checkNotNull(InetAddress.getByName(it).hostAddress) }.toSet()
+
+    private fun assertUpstreamRoutes(
+        label: String,
+        capture: AppliedCapture,
+        ipv6: Boolean,
+        allowLan: Boolean,
+    ) {
+        fun covered(address: String) =
+            capture.routes.any {
+                CaptureReadiness.covers(it, if (':' in address) "$address/128" else "$address/32")
+            }
+        (parityTunnelled4 + if (ipv6) parityTunnelled6 else emptyList()).forEach {
+            assertTrue(covered(it), "$label: upstream routes $it into the tunnel")
+        }
+        (parityLan4 + if (ipv6) parityLan6 else emptyList()).forEach {
+            assertEquals(!allowLan, covered(it), "$label: allow_lan=$allowLan membership of $it")
+        }
+        if (ipv6) assertTrue(capture.addresses.any { ':' in it }, "$label: IPv6 address")
+        else {
+            assertTrue(capture.addresses.none { ':' in it }, "$label: no IPv6 address")
+            assertTrue(capture.routes.none { ':' in it }, "$label: upstream routes no IPv6")
+        }
+    }
+
+    private fun transitionsUntil(events: OrderedTunnelEvents, start: Int, last: String) =
+        events.since(start).map { it.javaClass.simpleName }.let { it.take(it.indexOf(last) + 1) }
+
+    /**
+     * Rules-off parity with upstream 8fcbcd553e on the preserved device settings (no MTU override,
+     * IPv6 on, allow_lan off, default DNS): every real change is one Reconnect(0) and one
+     * establishment, an equivalent change is neither, and NoMatchingRelay blocks with the upstream
+     * blocking configuration before and after a target, then recovers.
+     */
+    private fun rulesOffParity(
+        repository: SettingsRepository,
+        connection: ConnectionProxy,
+        events: OrderedTunnelEvents,
+        baseline: AppliedCapture,
+    ) {
+        val off = LocalNetworkAccess()
+        val original = checkNotNull(repository.settingsUpdates.value)
+        val originalOptions = original.tunnelOptions
+        val originalDns = originalOptions.dnsOptions
+        check(
+            originalOptions.mtu == null &&
+                originalOptions.enableIpv6 &&
+                !original.allowLan &&
+                originalDns.state == DnsState.Default &&
+                !originalDns.defaultOptions.isAnyBlockerEnabled
+        ) {
+            "Parity expectations assume the preserved device settings"
+        }
+        val gateways = normalizedDns(setOf("10.64.0.1", "fc00:bbbb:bbbb:bb01::1"))
+        // Android link MTU 1280 minus IPv4 WireGuard overhead, clamped to 1280 with IPv6.
+        assertEquals(1280, baseline.mtu, "baseline: upstream derived MTU")
+        assertEquals(gateways, dnsSet(baseline.dns), "baseline: upstream gateway DNS")
+        assertUpstreamRoutes("baseline", baseline, ipv6 = true, allowLan = false)
+        var current = baseline
+        fun record(label: String, capture: AppliedCapture, transitions: List<String>) =
+            report(
+                "rules_off_parity",
+                JSONObject()
+                    .put("case", label)
+                    .put("transitions", transitions.joinToString(","))
+                    .put("generation", capture.generation)
+                    .put("net_id", capture.netId)
+                    .put("mtu", capture.mtu)
+                    .put("dns", dnsSet(capture.dns).sorted().joinToString(","))
+                    .put("addresses", capture.addresses.sorted().joinToString(","))
+                    .put("routes", capture.routes.sorted().joinToString(",")),
+            )
+        fun apply(
+            change: suspend () -> Either<Any?, Any?>,
+            settled: (net.mullvad.mullvadvpn.lib.model.Settings) -> Boolean,
+        ) = runBlocking {
+            assertTrue(change().isRight())
+            withTimeout(10_000) {
+                repository.settingsUpdates.first { it != null && settled(it) }
+            }
+        }
+        fun step(
+            label: String,
+            mtu: Int,
+            dns: Set<String>,
+            ipv6: Boolean,
+            allowLan: Boolean,
+            change: suspend () -> Either<Any?, Any?>,
+            settled: (net.mullvad.mullvadvpn.lib.model.Settings) -> Boolean,
+        ) {
+            val start = events.cursor()
+            apply(change, settled)
+            awaitOrderedConnected(events, start)
+            val transitions = transitionsUntil(events, start, "Connected")
+            assertEquals("Disconnecting", transitions.first(), "$label: upstream Reconnect(0)")
+            assertTrue(
+                transitions.none { it == "Disconnected" || it == "Error" },
+                "$label: reconnect publishes no Disconnected or Error",
+            )
+            val expectedDns = normalizedDns(dns)
+            val next =
+                appliedConfiguration(
+                    off,
+                    ForwardingAvailability.Off,
+                    "Connected",
+                    current.generation,
+                    requiredMtu = mtu,
+                    requiredDns = expectedDns,
+                )
+            assertEquals(
+                checkNotNull(current.generation).toULong() + 1uL,
+                checkNotNull(next.generation).toULong(),
+                "$label: a real change is exactly one establishment",
+            )
+            SystemClock.sleep(2_000)
+            assertEquals(
+                next,
+                appliedConfiguration(
+                    off,
+                    ForwardingAvailability.Off,
+                    "Connected",
+                    requiredMtu = mtu,
+                    requiredDns = expectedDns,
+                ),
+                "$label: no further establishment",
+            )
+            assertUpstreamRoutes(label, next, ipv6, allowLan)
+            record(label, next, transitions)
+            current = next
+        }
+        fun equivalent(
+            label: String,
+            change: suspend () -> Either<Any?, Any?>,
+            settled: (net.mullvad.mullvadvpn.lib.model.Settings) -> Boolean,
+        ) {
+            val start = events.cursor()
+            apply(change, settled)
+            SystemClock.sleep(3_000)
+            assertTrue(
+                events.since(start).isEmpty(),
+                "$label: an equivalent setting publishes no transition",
+            )
+            assertEquals(
+                current,
+                appliedConfiguration(
+                    off,
+                    ForwardingAvailability.Off,
+                    "Connected",
+                    requiredMtu = current.mtu,
+                    requiredDns = dnsSet(current.dns),
+                ),
+                "$label: an equivalent setting establishes nothing",
+            )
+            record(label, current, emptyList())
+        }
+        fun noMatchingRelay(label: String, fromTarget: Boolean) {
+            val start = events.cursor()
+            var recoveryStart = 0
+            runBlocking {
+                withEmptyRelayList(repository) {
+                    if (!fromTarget) assertTrue(connection.connect().isRight())
+                    val error =
+                        withTimeout(60_000) {
+                            connection.tunnelState.first { it is TunnelState.Error }
+                        }
+                            as TunnelState.Error
+                    assertEquals(
+                        ErrorStateCause.TunnelParameterError(
+                            ParameterGenerationError.NoMatchingRelay
+                        ),
+                        error.errorState.cause,
+                    )
+                    assertTrue(error.errorState.isBlocking)
+                    withTimeout(60_000) {
+                        events.await(start) { it is RpcTunnelState.State.Error }
+                    }
+                    val transitions = transitionsUntil(events, start, "Error")
+                    assertEquals(
+                        if (fromTarget) listOf("Disconnecting", "Error") else listOf("Error"),
+                        transitions,
+                        "$label: parameter generation fails before Connecting",
+                    )
+                    // Upstream blocking_config: MTU 1380, DNS 192.0.2.1, all routes.
+                    val blocked =
+                        appliedConfiguration(
+                            off,
+                            ForwardingAvailability.Off,
+                            "Error",
+                            current.generation,
+                        )
+                    assertEquals(
+                        checkNotNull(current.generation).toULong() + 1uL,
+                        checkNotNull(blocked.generation).toULong(),
+                        "$label: blocking is exactly one establishment",
+                    )
+                    assertTrue("0.0.0.0/0" in blocked.routes && "::/0" in blocked.routes)
+                    record("$label-error", blocked, transitions)
+                    current = blocked
+                    recoveryStart = events.cursor()
+                }
+            }
+            // Restoring the relay settings reconnects the secured target from Error.
+            awaitOrderedConnected(events, recoveryStart)
+            val recovery = transitionsUntil(events, recoveryStart, "Connected")
+            assertEquals(listOf("Connecting", "Connected"), recovery, "$label: recovery")
+            val recovered =
+                appliedConfiguration(
+                    off,
+                    ForwardingAvailability.Off,
+                    "Connected",
+                    current.generation,
+                    requiredMtu = 1280,
+                    requiredDns = gateways,
+                )
+            assertEquals(
+                checkNotNull(current.generation).toULong() + 1uL,
+                checkNotNull(recovered.generation).toULong(),
+                "$label: recovery is exactly one establishment",
+            )
+            assertUpstreamRoutes("$label-recovery", recovered, ipv6 = true, allowLan = false)
+            record("$label-recovery", recovered, recovery)
+            current = recovered
+        }
+
+        val v6Dns = InetAddress.getByName("2606:4700:4700::1111")
+        val privateDns = InetAddress.getByName("10.0.2.53")
+        fun custom(addresses: List<InetAddress>): suspend () -> Either<Any?, Any?> = {
+            repository.setDnsOptions(DnsState.Custom, addresses, originalDns.defaultOptions)
+        }
+        fun isCustom(
+            settings: net.mullvad.mullvadvpn.lib.model.Settings,
+            addresses: List<InetAddress>,
+        ) =
+            settings.tunnelOptions.dnsOptions.state == DnsState.Custom &&
+                settings.tunnelOptions.dnsOptions.customOptions.addresses == addresses
+        var failure: Throwable? = null
+        try {
+            step(
+                "mtu-1380",
+                1380,
+                gateways,
+                true,
+                false,
+                { repository.setWireguardMtu(Mtu(1380)) },
+            ) {
+                it.tunnelOptions.mtu == Mtu(1380)
+            }
+            equivalent("mtu-1380-equivalent", { repository.setWireguardMtu(Mtu(1380)) }) {
+                it.tunnelOptions.mtu == Mtu(1380)
+            }
+            step("mtu-reset", 1280, gateways, true, false, { repository.resetWireguardMtu() }) {
+                it.tunnelOptions.mtu == null
+            }
+            // IPv4-only: link 1280 minus 60 bytes of IPv4 WireGuard overhead, no IPv6 clamp.
+            step(
+                "ipv6-off",
+                1220,
+                setOf("10.64.0.1"),
+                false,
+                false,
+                {
+                    repository.setIpv6Enabled(false)
+                },
+            ) {
+                !it.tunnelOptions.enableIpv6
+            }
+            // Only an IPv6 resolver while IPv6 is off: upstream's dummy fallback 192.0.2.1.
+            step(
+                "empty-dns-fallback",
+                1220,
+                setOf("192.0.2.1"),
+                false,
+                false,
+                custom(listOf(v6Dns)),
+            ) {
+                isCustom(it, listOf(v6Dns))
+            }
+            step(
+                "ipv6-on",
+                1280,
+                setOf(checkNotNull(v6Dns.hostAddress)),
+                true,
+                false,
+                {
+                    repository.setIpv6Enabled(true)
+                },
+            ) {
+                it.tunnelOptions.enableIpv6
+            }
+            step("private-dns", 1280, setOf("10.0.2.53"), true, false, custom(listOf(privateDns))) {
+                isCustom(it, listOf(privateDns))
+            }
+            step(
+                "allow-lan-private-dns",
+                1280,
+                setOf("10.0.2.53"),
+                true,
+                true,
+                {
+                    repository.setLocalNetworkSharing(true)
+                },
+            ) {
+                it.allowLan
+            }
+            // Custom with no address is DnsConfig::default: the tunnel gateways.
+            step("empty-custom-dns", 1280, gateways, true, true, custom(emptyList())) {
+                isCustom(it, emptyList())
+            }
+            step(
+                "allow-lan-off",
+                1280,
+                gateways,
+                true,
+                false,
+                {
+                    repository.setLocalNetworkSharing(false)
+                },
+            ) {
+                !it.allowLan
+            }
+            equivalent(
+                "default-dns-equivalent",
+                {
+                    repository.setDnsOptions(
+                        originalDns.state,
+                        originalDns.customOptions.addresses,
+                        originalDns.defaultOptions,
+                    )
+                },
+            ) {
+                it.tunnelOptions == originalOptions && it.allowLan == original.allowLan
+            }
+            // Interface name and handle may change across establishments; the configuration
+            // Android reports must not.
+            fun configuration(capture: AppliedCapture) =
+                capture.copy(generation = null, handle = null, interfaceName = "", netId = "")
+            assertEquals(
+                configuration(baseline),
+                configuration(current),
+                "Restored settings reproduce the baseline configuration",
+            )
+            noMatchingRelay("no-matching-relay-after-target", fromTarget = true)
+            val down = events.cursor()
+            disconnect(connection)
+            awaitOrderedEvent(events, down, 60_000) { it is RpcTunnelState.State.Disconnected }
+            appliedConfiguration(off, ForwardingAvailability.Off, "Disconnected")
+            noMatchingRelay("no-matching-relay-before-target", fromTarget = false)
+            report("rules_off_parity_cases", "complete")
+        } catch (error: Throwable) {
+            failure = error
+            throw error
+        } finally {
+            try {
+                runBlocking {
+                    val now = checkNotNull(repository.settingsUpdates.value)
+                    if (now.tunnelOptions.mtu != originalOptions.mtu)
+                        assertTrue(repository.resetWireguardMtu().isRight())
+                    if (now.tunnelOptions.enableIpv6 != originalOptions.enableIpv6)
+                        assertTrue(repository.setIpv6Enabled(originalOptions.enableIpv6).isRight())
+                    if (now.tunnelOptions.dnsOptions != originalDns)
+                        assertTrue(
+                            repository
+                                .setDnsOptions(
+                                    originalDns.state,
+                                    originalDns.customOptions.addresses,
+                                    originalDns.defaultOptions,
+                                )
+                                .isRight()
+                        )
+                    if (now.allowLan != original.allowLan)
+                        assertTrue(repository.setLocalNetworkSharing(original.allowLan).isRight())
+                    withTimeout(10_000) {
+                        repository.settingsUpdates.first {
+                            it?.tunnelOptions == originalOptions && it.allowLan == original.allowLan
+                        }
+                    }
+                }
+                report("rules_off_parity_settings_restored", true)
+            } catch (restore: Throwable) {
+                failure?.addSuppressed(restore) ?: throw restore
+            }
+        }
+    }
 
     private fun restoreTunnelAfterCase(
         originalFailure: Throwable?,
@@ -1144,8 +1556,38 @@ class LocalNetworkDeliveryInstrumentedTest {
         connection: ConnectionProxy,
         session: LocalSession,
     ) = runBlocking {
-        val koin = (target.applicationContext as MullvadApplication).getKoin()
         continuityIntent("error")
+        withEmptyRelayList(repository) {
+            assertTrue(connection.connect().isRight())
+            val error =
+                withTimeout(60_000) {
+                    connection.tunnelState.first { it is TunnelState.Error }
+                }
+                    as TunnelState.Error
+            assertEquals(
+                ErrorStateCause.TunnelParameterError(ParameterGenerationError.NoMatchingRelay),
+                error.errorState.cause,
+            )
+            assertTrue(error.errorState.isBlocking)
+            report("parameter_error_observed", "NoMatchingRelay")
+            appliedConfiguration(
+                checkNotNull(repository.settingsUpdates.value?.localNetworkAccess),
+                ForwardingAvailability.Active,
+                "Error",
+                fixedCapture = true,
+            )
+            session.dwell("error-no-matching-relay", 2000)
+        }
+    }
+
+    /**
+     * Selects an owned empty custom list (NoMatchingRelay), then restores the exact relay proto.
+     */
+    private suspend fun <T> withEmptyRelayList(
+        repository: SettingsRepository,
+        block: suspend () -> T,
+    ): T {
+        val koin = (target.applicationContext as MullvadApplication).getKoin()
         val management = koin.get<ManagementService>()
         // Preserve the complete proto, including Constraint.Any, using the normal API.
         val socket = koin.get<File>(named(GRPC_SOCKET_FILE_NAMED_ARGUMENT))
@@ -1179,25 +1621,7 @@ class LocalNetworkDeliveryInstrumentedTest {
             assertTrue(
                 management.setRelayLocationMultihop(MultihopMode.NEVER, null, list).isRight()
             )
-            assertTrue(connection.connect().isRight())
-            val error =
-                withTimeout(60_000) {
-                    connection.tunnelState.first { it is TunnelState.Error }
-                }
-                    as TunnelState.Error
-            assertEquals(
-                ErrorStateCause.TunnelParameterError(ParameterGenerationError.NoMatchingRelay),
-                error.errorState.cause,
-            )
-            assertTrue(error.errorState.isBlocking)
-            report("parameter_error_observed", "NoMatchingRelay")
-            appliedConfiguration(
-                checkNotNull(repository.settingsUpdates.value?.localNetworkAccess),
-                ForwardingAvailability.Active,
-                "Error",
-                fixedCapture = true,
-            )
-            session.dwell("error-no-matching-relay", 2000)
+            return block()
         } finally {
             try {
                 rpc.SetRelaySettings().execute(saved)
@@ -2695,6 +3119,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         previousGeneration: String? = null,
         fixedCapture: Boolean = true,
         requiredMtu: Int? = null,
+        requiredDns: Set<String>? = null,
     ): AppliedCapture = runBlocking {
         val expected =
             policy.rules
@@ -2805,7 +3230,9 @@ class LocalNetworkDeliveryInstrumentedTest {
                                         else if (expectedTunnel == "Error") 1380 else null,
                                     addresses.any { ':' in it },
                                     requiredDns =
-                                        if (expectedTunnel == "Error") setOf("192.0.2.1") else null,
+                                        requiredDns
+                                            ?: if (expectedTunnel == "Error") setOf("192.0.2.1")
+                                            else null,
                                 )
                         ) {
                             delay(100)
