@@ -734,6 +734,17 @@ class LocalNetworkDeliveryInstrumentedTest {
             try {
                 LocalSession(consumer).use { session ->
                     session.dwell("before-app-list-change")
+                    // Upstream applies the app list through the reconnect's new
+                    // interface; the old capture stays until then. Require that
+                    // newer capture on a rebuilt network, not the pre-change one.
+                    val beforeChange =
+                        appliedConfiguration(
+                            policy,
+                            ForwardingAvailability.Active,
+                            "Connected",
+                            fixedCapture = true,
+                        )
+                    assertTrue(uidIncluded(beforeChange.uids, excludedUid))
                     session.markAppListChange()
                     runBlocking {
                         assertTrue(split.excludeApp(excluded).isRight())
@@ -751,8 +762,14 @@ class LocalNetworkDeliveryInstrumentedTest {
                             policy,
                             ForwardingAvailability.Active,
                             "Connected",
+                            previousGeneration = checkNotNull(beforeChange.generation),
                             fixedCapture = true,
                         )
+                    assertNotEquals(
+                        beforeChange.netId,
+                        config.netId,
+                        "An app-list change must rebuild the Android VPN network",
+                    )
                     assertTrue(!uidIncluded(config.uids, excludedUid))
                     assertTrue(uidIncluded(config.uids, consumerUid))
                     report("continuity_excluded_uid", excludedUid)
