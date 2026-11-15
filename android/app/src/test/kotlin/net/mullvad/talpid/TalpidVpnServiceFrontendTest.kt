@@ -760,6 +760,7 @@ class TalpidVpnServiceFrontendTest {
                         callback = args[1] as (Any) -> Unit
                         Unit
                     }
+                    "currentNetworks" -> emptySet<Long>()
                     "stop" -> Unit
                     else -> error("Unexpected source call ${method.name}")
                 }

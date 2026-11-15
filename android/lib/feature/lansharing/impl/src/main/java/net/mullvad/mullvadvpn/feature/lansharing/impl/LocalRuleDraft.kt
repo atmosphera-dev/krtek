@@ -96,6 +96,8 @@ data class LocalEditorState(
     val confirmDiscard: Boolean = false,
     val waitingForWifi: Boolean = false,
     val wifiMessage: Int? = null,
+    /** Identifies one "Use connected Wi-Fi" request, so its deadline never reaches a later one. */
+    val wifiRequest: Long = 0,
 ) : Parcelable {
     val dirty: Boolean
         get() = draft != null && draft != baseline

@@ -53,6 +53,14 @@ internal class AndroidLocalNetworkSource(private val context: Context) : LocalNe
         watchPermissions(onAccessChanged)
     }
 
+    // No callback marks the end of the initial set, so list the matching networks directly.
+    @Suppress("DEPRECATION")
+    override fun currentNetworks(): Set<Long> =
+        connectivity.allNetworks
+            .filter { connectivity.getNetworkCapabilities(it)?.let(::requested) == true }
+            .map { it.networkHandle }
+            .toSet()
+
     private fun watchPermissions(changed: () -> Unit) {
         val broadcast =
             object : BroadcastReceiver() {
@@ -199,6 +207,12 @@ internal class AndroidLocalNetworkSource(private val context: Context) : LocalNe
                 .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
                 .build()
         }
+
+        /** The same networks [request] selects, for an existing capability record. */
+        private fun requested(capabilities: NetworkCapabilities) =
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
+                (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))
 
         private fun capabilitiesEvent(
             network: Network,

@@ -130,6 +130,8 @@ class LocalSocketGateTest {
             event = onEvent
         }
 
+        override fun currentNetworks() = emptySet<Long>()
+
         override fun stop() = Unit
 
         override fun withLegacyIdentity(networks: List<LocalPhysicalNetwork>, allowed: Boolean) =

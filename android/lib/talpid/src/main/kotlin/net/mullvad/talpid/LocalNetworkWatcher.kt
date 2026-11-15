@@ -21,6 +21,8 @@ internal class LocalNetworkWatcher(
     private val lock = Any()
     private val changes = Channel<Unit>(Channel.CONFLATED)
     private val networks = linkedMapOf<Long, LocalPhysicalNetwork>()
+    // Networks present at registration whose first capabilities have not arrived yet.
+    private val initial = mutableSetOf<Long>()
     private var access = LocalIdentityAccess(false, false, false, false, false)
     private var running = false
     private var registration = 0L
@@ -53,6 +55,7 @@ internal class LocalNetworkWatcher(
                 running = false
                 epoch++
                 networks.clear()
+                initial.clear()
                 published = null
                 pending = false
                 Triple(epoch, registration, inactiveSnapshot())
@@ -93,18 +96,24 @@ internal class LocalNetworkWatcher(
     private fun subscribe() {
         val current = ++epoch
         networks.clear()
+        initial.clear()
         source.start(
             access.fine,
             { event ->
                 synchronized(lock) {
                     if (running && current == epoch) {
                         event.applyTo(networks)
+                        if (event is LocalNetworkEvent.Lost) initial.remove(event.handle)
+                        initial.removeAll { networks[it]?.capabilitiesFresh == true }
                         changed()
                     }
                 }
             },
             { synchronized(lock) { if (running && current == epoch) changed() } },
         )
+        // Callbacks are already registered, so every listed network reports itself; callbacks
+        // wait for this lock, so none can be missed between registration and this read.
+        initial += source.currentNetworks()
     }
 
     private fun changed() {
@@ -146,6 +155,7 @@ internal class LocalNetworkWatcher(
         running = false
         epoch++
         networks.clear()
+        initial.clear()
         published = null
         stopSource()
         Logger.w("Local network watcher unavailable")
@@ -162,7 +172,9 @@ internal class LocalNetworkWatcher(
     private fun deliver() {
         val delivery =
             synchronized(lock) {
-                val snapshot = if (running) observation() else inactiveSnapshot()
+                // Null while the initial networks are still reporting: stay pending (STALE for
+                // sockets) and publish once their callbacks complete the set.
+                val snapshot = (if (running) observation() else inactiveSnapshot()) ?: return
                 published = snapshot
                 pending = false
                 if (registration == 0L) null else registration to snapshot
@@ -182,7 +194,7 @@ internal class LocalNetworkWatcher(
             arrayListOf(),
         )
 
-    private fun observation(): LocalNetworkSnapshot =
+    private fun observation(): LocalNetworkSnapshot? =
         try {
             val fresh = source.readAccess()
             if (fresh != access) {
@@ -191,21 +203,31 @@ internal class LocalNetworkWatcher(
                 subscribe()
             }
             access = fresh
-            val observed = source.withLegacyIdentity(networks.values.toList(), access.identity)
-            LocalNetworkSnapshot(
-                ++sequence,
-                running,
-                access.local,
-                access.fine,
-                access.background,
-                access.location,
-                access.operations,
-                ArrayList(
-                    observed.map {
-                        if (access.identity && it.transport == WIFI) it else it.copy(ssidHex = null)
-                    }
-                ),
-            )
+            // A network that left before its callbacks can no longer complete the initial set.
+            if (initial.isNotEmpty()) initial.retainAll(source.currentNetworks())
+            // Until the networks present at registration have reported, an empty or partial set
+            // would read as "not on Wi-Fi". Publish nothing (the daemon keeps Pending), and revoke
+            // a record from an earlier subscription rather than leave its authority in place.
+            if (initial.isNotEmpty()) {
+                if (published?.observerRunning == true) inactiveSnapshot() else null
+            } else {
+                val observed = source.withLegacyIdentity(networks.values.toList(), access.identity)
+                LocalNetworkSnapshot(
+                    ++sequence,
+                    running,
+                    access.local,
+                    access.fine,
+                    access.background,
+                    access.location,
+                    access.operations,
+                    ArrayList(
+                        observed.map {
+                            if (access.identity && it.transport == WIFI) it
+                            else it.copy(ssidHex = null)
+                        }
+                    ),
+                )
+            }
         } catch (_: RuntimeException) {
             unavailable()
             LocalNetworkSnapshot(
@@ -263,6 +285,9 @@ internal interface LocalNetworkSource {
         onEvent: (LocalNetworkEvent) -> Unit,
         onAccessChanged: () -> Unit,
     )
+
+    /** Handles of the physical networks the started callback reports, as present right now. */
+    fun currentNetworks(): Set<Long>
 
     fun stop()
 

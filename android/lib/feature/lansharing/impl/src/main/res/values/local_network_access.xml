@@ -98,6 +98,8 @@
     <string name="local_access_not_on_wifi">Not connected to Wi-Fi</string>
     <string name="local_access_multiple_wifi">More than one Wi-Fi is connected</string>
     <string name="local_access_waiting_wifi">Waiting for the Wi-Fi name</string>
+    <string name="local_access_wifi_not_available">The Wi-Fi name is not available yet. You can
+    type it in.</string>
     <string name="local_access_wifi_limit">Remove a Wi-Fi name before adding another.</string>
     <string name="local_access_retry">Allow access</string>
     <string name="local_access_fine_title">Allow precise location?</string>

@@ -4,7 +4,9 @@ import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import java.util.UUID
+import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.WhileSubscribed
@@ -40,6 +42,7 @@ class LocalNetworkSharingViewModel(
     private val error = MutableStateFlow<Int?>(null)
     private val effects = Channel<LocalNetworkSharingSideEffect>(Channel.BUFFERED)
     val uiSideEffect = effects.receiveAsFlow()
+    private var wifiRequests = 0L
 
     init {
         viewModelScope.launch {
@@ -51,11 +54,49 @@ class LocalNetworkSharingViewModel(
                 }
         }
         viewModelScope.launch {
+            // One deadline per waiting request. Closing or replacing the draft, a manual Wi-Fi
+            // edit or an answer ends the wait and cancels it. Expiry only explains the delay:
+            // the request stays, so a later fresh name still fills this draft.
+            editor
+                .map { if (it.waitingForWifi) it.wifiRequest else null }
+                .distinctUntilChanged()
+                .collectLatest { request ->
+                    // A null request still arrives here, so ending the wait cancels the delay.
+                    if (request != null) {
+                        delay(WIFI_ANSWER_DEADLINE)
+                        val edit = editor.value
+                        val wifi = settingsRepository.localNetworkStatus.value?.currentWifi
+                        val pending =
+                            wifi == null ||
+                                (wifi as? ConnectedWifi.Unknown)?.reason ==
+                                    WifiUnknownReason.Pending
+                        if (edit.waitingForWifi && edit.wifiRequest == request && pending)
+                            setEditor(
+                                edit.copy(wifiMessage = R.string.local_access_wifi_not_available)
+                            )
+                    }
+                }
+        }
+        viewModelScope.launch {
             combine(settingsRepository.localNetworkStatus, editor) { status, edit ->
                     status?.currentWifi to edit.waitingForWifi
                 }
                 .collect { (wifi, waiting) ->
-                    if (waiting && wifi is ConnectedWifi.Known) fillConnectedWifi(wifi)
+                    // A request made while Wi-Fi was pending or not permitted completes from the
+                    // next fresh status. The flag lives in this draft's editor state, so a new,
+                    // closed or edited draft never takes the answer.
+                    val edit = editor.value
+                    if (!waiting || !edit.waitingForWifi || edit.draft == null) return@collect
+                    when {
+                        wifi is ConnectedWifi.Known -> fillConnectedWifi(wifi)
+                        wifi is ConnectedWifi.Unknown && !wifi.reason.awaitsWifi() ->
+                            setEditor(
+                                edit.copy(
+                                    waitingForWifi = false,
+                                    wifiMessage = wifi.reason.message(),
+                                )
+                            )
+                    }
                 }
         }
     }
@@ -108,8 +149,11 @@ class LocalNetworkSharingViewModel(
     fun updateDraft(update: (LocalRuleDraft) -> LocalRuleDraft) {
         if (saving.value) return
         editor.value.draft?.let {
+            val next = update(it)
+            // Only editing the Wi-Fi names supersedes a pending "Use connected Wi-Fi" request.
             setEditor(
-                editor.value.copy(draft = update(it), waitingForWifi = false, wifiMessage = null)
+                if (next.wifiNames == it.wifiNames) editor.value.copy(draft = next)
+                else editor.value.copy(draft = next, waitingForWifi = false, wifiMessage = null)
             )
         }
         error.value = null
@@ -214,8 +258,9 @@ class LocalNetworkSharingViewModel(
                         if (draft.wifiNames.isEmpty())
                             draft.copy(wifiNames = listOf(LocalWifiDraft("")))
                         else draft,
-                    waitingForWifi = missing,
+                    waitingForWifi = reason.awaitsWifi(),
                     wifiMessage = reason.message(),
+                    wifiRequest = ++wifiRequests,
                 )
             )
             if (missing) viewModelScope.launch { effects.send(LocalNetworkSharingSideEffect(true)) }
@@ -251,6 +296,17 @@ class LocalNetworkSharingViewModel(
         )
     }
 }
+
+/**
+ * Android reports current networks right after registration (milliseconds; about a second on a
+ * loaded emulator). Five seconds leaves headroom for a slow binder or emulator while still telling
+ * the user soon that the name can be typed in.
+ */
+private val WIFI_ANSWER_DEADLINE = 5.seconds
+
+/** Observation that has not answered yet, or awaits access the user is being asked for. */
+private fun WifiUnknownReason.awaitsWifi() =
+    this == WifiUnknownReason.Pending || this == WifiUnknownReason.PermissionMissing
 
 internal fun WifiUnknownReason.message(): Int =
     when (this) {

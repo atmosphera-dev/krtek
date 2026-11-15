@@ -73,6 +73,94 @@ class LocalNetworkWatcherTest {
         watcher.stop()
     }
 
+    private fun wifi(handle: Long) =
+        LocalNetworkEvent.Update(handle) {
+            it.copy(transport = LocalNetworkWatcher.WIFI, capabilitiesFresh = true)
+        }
+
+    @Test
+    fun `should stay pending until the networks present at start have reported`() = runTest {
+        val source = FakeSource().apply { current = setOf(9, 11) }
+        val pushes = mutableListOf<LocalNetworkSnapshot>()
+        val watcher =
+            LocalNetworkWatcher(source, backgroundScope, StandardTestDispatcher(testScheduler)) {
+                _,
+                value ->
+                pushes += value
+            }
+        watcher.start()
+        assertTrue(watcher.attach(1))
+        runCurrent()
+        source.emit(LocalNetworkEvent.Available(9, false))
+        source.emit(wifi(9))
+        source.emit(LocalNetworkEvent.Available(11, false))
+        runCurrent()
+        // An empty or partial set would read as "not on Wi-Fi" instead of pending.
+        assertTrue(pushes.none { it.observerRunning })
+        source.emit(wifi(11))
+        runCurrent()
+        assertEquals(
+            listOf(9L, 11L),
+            pushes.single { it.observerRunning }.networks.map { it.networkHandle },
+        )
+        assertTrue(pushes.single { it.observerRunning }.networks.all { it.transport == 1 })
+        watcher.stop()
+    }
+
+    @Test
+    fun `should not wait for an initial network that left before reporting`() = runTest {
+        val source = FakeSource().apply { current = setOf(9) }
+        val pushes = mutableListOf<LocalNetworkSnapshot>()
+        val watcher =
+            LocalNetworkWatcher(source, backgroundScope, StandardTestDispatcher(testScheduler)) {
+                _,
+                value ->
+                pushes += value
+            }
+        watcher.start()
+        watcher.attach(1)
+        runCurrent()
+        assertTrue(pushes.none { it.observerRunning })
+        source.current = setOf(12)
+        source.emit(LocalNetworkEvent.Available(12, false))
+        source.emit(wifi(12))
+        runCurrent()
+        assertEquals(listOf(12L), pushes.last().networks.map { it.networkHandle })
+        assertTrue(pushes.last().observerRunning)
+        watcher.stop()
+    }
+
+    @Test
+    fun `should revoke the old record and wait again after an access change`() = runTest {
+        val source = FakeSource().apply { current = setOf(9) }
+        val pushes = mutableListOf<LocalNetworkSnapshot>()
+        val watcher =
+            LocalNetworkWatcher(source, backgroundScope, StandardTestDispatcher(testScheduler)) {
+                _,
+                value ->
+                pushes += value
+            }
+        watcher.start()
+        watcher.attach(1)
+        source.emit(LocalNetworkEvent.Available(9, false))
+        source.emit(wifi(9))
+        runCurrent()
+        assertTrue(pushes.last().observerRunning && pushes.last().networks.size == 1)
+        source.access = source.access.copy(background = false)
+        source.changed()
+        runCurrent()
+        // Fresh access needs fresh networks: no empty running record in between.
+        assertFalse(pushes.last().observerRunning)
+        assertEquals(listOf(true, true), source.flags)
+        source.emit(LocalNetworkEvent.Available(9, false))
+        source.emit(wifi(9))
+        runCurrent()
+        assertTrue(pushes.last().observerRunning)
+        assertEquals(listOf(9L), pushes.last().networks.map { it.networkHandle })
+        assertFalse(pushes.last().backgroundReady)
+        watcher.stop()
+    }
+
     @Test
     fun `should omit names without identity access but retain physical records`() = runTest {
         for (access in
@@ -398,6 +486,7 @@ class LocalNetworkWatcherTest {
         var accessReads = 0
         var identityReads = 0
         var onStop: () -> Unit = {}
+        var current = emptySet<Long>()
 
         override fun readAccess(): LocalIdentityAccess {
             accessReads++
@@ -416,6 +505,8 @@ class LocalNetworkWatcherTest {
             event = onEvent
             changed = onAccessChanged
         }
+
+        override fun currentNetworks(): Set<Long> = current
 
         override fun stop() {
             onStop()
