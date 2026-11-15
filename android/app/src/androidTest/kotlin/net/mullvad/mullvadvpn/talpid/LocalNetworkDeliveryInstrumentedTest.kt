@@ -2242,20 +2242,21 @@ class LocalNetworkDeliveryInstrumentedTest {
                 }
             report("location_stage", stage)
             val synthetic = checkNotNull(SsidIdentity.fromUserText("krtek-m3-different-wifi"))
-            if (granted) {
-                val known = runBlocking {
-                    withTimeout(30_000) {
-                            repository.localNetworkStatus.filterNotNull().first {
-                                it.currentWifi is ConnectedWifi.Known
-                            }
-                        }
-                        .currentWifi as ConnectedWifi.Known
-                }
-                assertNotEquals(known.ssid, synthetic)
-                report("location_wifi", "Known")
-            }
             val policy = peerPolicy(wifi = listOf(synthetic))
             withPolicy(repository, policy) {
+                // The enabled policy is the observation demand; rules off would observe nothing.
+                if (granted) {
+                    val known = runBlocking {
+                        withTimeout(30_000) {
+                                repository.localNetworkStatus.filterNotNull().first {
+                                    it.currentWifi is ConnectedWifi.Known
+                                }
+                            }
+                            .currentWifi as ConnectedWifi.Known
+                    }
+                    assertNotEquals(known.ssid, synthetic)
+                    report("location_wifi", "Known")
+                }
                 awaitState(
                     repository,
                     connection,

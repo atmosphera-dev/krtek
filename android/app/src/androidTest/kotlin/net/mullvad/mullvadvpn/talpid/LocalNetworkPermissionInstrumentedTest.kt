@@ -291,8 +291,11 @@ class LocalNetworkPermissionInstrumentedTest {
                         ?.localNetworkAccess
                 assertEquals(LocalNetworkAccess(), original)
                 check(granted("ACCESS_FINE_LOCATION") && granted("ACCESS_BACKGROUND_LOCATION"))
-                val known = awaitKnownWifi()
+                // Rules off and no draft: no Local observation, so no Wi-Fi name yet.
+                assertTrue(repository.localNetworkStatus.value?.currentWifi !is ConnectedWifi.Known)
                 driver.click(copy(R.string.local_access_add_rule))
+                // The open draft is the observation demand; wait for its fresh Wi-Fi status.
+                val known = awaitKnownWifi()
                 driver.enter("local_access_addresses", "192.168.240.10/32")
                 driver.click(copy(R.string.local_access_connected_wifi))
                 driver.requireConnectedDraft(known.ssid)
