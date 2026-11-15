@@ -90,7 +90,11 @@ impl FrontendPlatform for Platform {
         self.format_calls.fetch_add(1, SeqCst);
         CaptureFormat::from_flags(self.format_flags.lock().unwrap().unwrap_or(0x1001))
     }
-    fn open(&self, generation: i64, config: &CaptureConfig) -> io::Result<OwnedFd> {
+    fn open(
+        &self,
+        generation: i64,
+        config: &CaptureConfig,
+    ) -> io::Result<crate::tun_provider::AppliedTun> {
         assert!(generation > 0);
         self.generation.store(generation as u64, SeqCst);
         let routes = match config {
@@ -124,7 +128,7 @@ impl FrontendPlatform for Platform {
         if self.open_error.load(SeqCst) {
             return Err(io::Error::other("open acknowledgement failed"));
         }
-        Ok(fd)
+        Ok(fd.into())
     }
     fn capture_feed(&self) -> Arc<CaptureNetworkFeed> {
         self.feed.clone().unwrap()
@@ -1036,7 +1040,11 @@ impl FrontendPlatform for PausedPlatform {
     fn capture_format(&self, fd: BorrowedFd<'_>) -> io::Result<CaptureFormat> {
         self.inner.capture_format(fd)
     }
-    fn open(&self, generation: i64, config: &CaptureConfig) -> io::Result<OwnedFd> {
+    fn open(
+        &self,
+        generation: i64,
+        config: &CaptureConfig,
+    ) -> io::Result<crate::tun_provider::AppliedTun> {
         let fd = self.inner.open(generation, config)?;
         self.pause.enter();
         Ok(fd)

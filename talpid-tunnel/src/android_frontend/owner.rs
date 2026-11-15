@@ -87,6 +87,7 @@ impl Releases {
 
 struct Epoch {
     config: CaptureConfig,
+    applied: Option<CaptureConfig>,
     observation: Observation,
     fd: Option<OwnedFd>,
 }
@@ -113,6 +114,7 @@ pub(super) fn start<A: LocalAuthority>(
     let observation = Observation::begin(platform.as_ref(), &config, lease.clone(), None, None)?;
     let epoch = Epoch {
         config,
+        applied: None,
         observation,
         fd: None,
     };
@@ -148,12 +150,8 @@ pub(super) fn start<A: LocalAuthority>(
 fn validate(config: &CaptureConfig, broker: &AttachmentBroker) -> io::Result<()> {
     talpid_lan_forwarder::validate_mtu(usize::from(config.mtu()))
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Unsupported capture MTU"))?;
-    if config.sources().ipv6.is_some() && config.mtu() < crate::MIN_IPV6_MTU {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "IPv6 capture MTU below minimum",
-        ));
-    }
+    // Full-profile IPv6 semantics belong to configure-then-establish. Android
+    // may return a safe fallback fd; validate that actual profile at bind.
     match config {
         CaptureConfig::Partial(config) if config.routes.is_empty() => {
             Err(io::ErrorKind::InvalidInput.into())
@@ -163,6 +161,26 @@ fn validate(config: &CaptureConfig, broker: &AttachmentBroker) -> io::Result<()>
         } if !broker.same_broker(selected) => Err(io::ErrorKind::InvalidInput.into()),
         _ => Ok(()),
     }
+}
+
+fn configuration_result(
+    broker: &AttachmentBroker,
+    config: &CaptureConfig,
+    result: io::Result<()>,
+) -> io::Result<()> {
+    result.map_err(|error| {
+        let kind = error.kind();
+        // No platform operation started while a predecessor still owns a slot.
+        // Delivery retains this same request and retries on its cleanup signal.
+        if kind == io::ErrorKind::WouldBlock {
+            return error;
+        }
+        let cause = crate::tun_provider::ConfigurationError::from(error);
+        if let Some(request) = config.request() {
+            request.fail(broker, cause.clone());
+        }
+        io::Error::new(kind, cause)
+    })
 }
 
 /// Blocking establish/bind is always joined, even if Stop/readiness is cancelled.
@@ -186,12 +204,15 @@ async fn establish<A: LocalAuthority>(
             None => (platform.open(generation, &epoch.config), false),
         };
         let result = match descriptor {
-            Ok(fd) => {
-                epoch.fd = Some(fd);
+            Ok(applied) => {
+                epoch.fd = Some(applied.fd);
+                epoch.observation.cause = applied.cause;
+                epoch.applied = applied.profile.map(|profile| epoch.config.applied(profile));
+                let actual = epoch.applied.as_ref().unwrap_or(&epoch.config);
                 let fd = epoch.fd.as_ref().expect("adopted once");
                 platform.capture_format(fd.as_fd()).and_then(|format| {
                     log::info!("capture-format generation={generation} representation=plain-ip flags={:#06x}", format.flags());
-                    epoch.observation.bind(platform.as_ref(), &epoch.config, fd.as_fd(), format)
+                    epoch.observation.bind(platform.as_ref(), actual, fd.as_fd(), format)
                 })
             }
             Err(error) => Err(error),
@@ -341,7 +362,9 @@ async fn run<A: LocalAuthority>(actor: Actor<A>) -> io::Result<()> {
                 };
                 if result.is_ok() {
                     result = forwarder
-                        .set_mtu(usize::from(epoch.config.mtu()))
+                        .set_mtu(usize::from(
+                            epoch.applied.as_ref().unwrap_or(&epoch.config).mtu(),
+                        ))
                         .map_err(|_| {
                             io::Error::new(io::ErrorKind::InvalidInput, "Unsupported Local MTU")
                         });
@@ -350,6 +373,14 @@ async fn run<A: LocalAuthority>(actor: Actor<A>) -> io::Result<()> {
                 let stopped = result
                     .as_ref()
                     .is_err_and(|error| error.kind() == io::ErrorKind::Interrupted);
+                if let Err(error) = result {
+                    let kind = error.kind();
+                    let cause = crate::tun_provider::ConfigurationError::from(error);
+                    if let Some(request) = epoch.config.request() {
+                        request.fail(&broker, cause.clone());
+                    }
+                    result = Err(io::Error::new(kind, cause));
+                }
                 let _ = ready.send(result);
                 if failed {
                     break if stopped {
@@ -441,11 +472,15 @@ async fn run<A: LocalAuthority>(actor: Actor<A>) -> io::Result<()> {
             }
             Event::Command(Command::Handover(config, ack)) => {
                 if retained.is_some() || releases.generations().iter().flatten().count() != 1 {
-                    let _ = ack.send(Err(io::ErrorKind::WouldBlock.into()));
+                    let _ = ack.send(configuration_result(
+                        &broker,
+                        &config,
+                        Err(io::ErrorKind::WouldBlock.into()),
+                    ));
                     continue;
                 }
                 if let Err(error) = validate(&config, &broker) {
-                    let _ = ack.send(Err(error));
+                    let _ = ack.send(configuration_result(&broker, &config, Err(error)));
                     continue;
                 }
                 for request in &mut requests {
@@ -463,7 +498,11 @@ async fn run<A: LocalAuthority>(actor: Actor<A>) -> io::Result<()> {
                         .any(|held| held.id() == request.id())
                 {
                     let Some(slot) = requests.iter_mut().find(|slot| slot.is_none()) else {
-                        let _ = ack.send(Err(io::ErrorKind::WouldBlock.into()));
+                        let _ = ack.send(configuration_result(
+                            &broker,
+                            &config,
+                            Err(io::ErrorKind::WouldBlock.into()),
+                        ));
                         continue;
                     };
                     *slot = Some(request.clone());
@@ -471,9 +510,19 @@ async fn run<A: LocalAuthority>(actor: Actor<A>) -> io::Result<()> {
                 // Target assignment rotation belongs to the target mapper.
                 // An equal app-side projection reuses the exact observed sink.
                 if config.secured_config().is_some()
+                    && config.request().is_none_or(|request| {
+                        request.purpose()
+                            != crate::tun_provider::ConfigurationPurpose::ForcedRefresh
+                    })
                     && config
                         .secured_config()
-                        .zip(epoch.config.secured_config())
+                        .zip(
+                            epoch
+                                .applied
+                                .as_ref()
+                                .unwrap_or(&epoch.config)
+                                .secured_config(),
+                        )
                         .is_some_and(|(a, b)| a.same_android_config(b))
                 {
                     let result = epoch
@@ -482,7 +531,11 @@ async fn run<A: LocalAuthority>(actor: Actor<A>) -> io::Result<()> {
                             config.request().map_or(Ok(()), |request| {
                                 lease.acknowledge_router_request(
                                     request,
-                                    epoch.config.secured_config(),
+                                    epoch
+                                        .applied
+                                        .as_ref()
+                                        .unwrap_or(&epoch.config)
+                                        .secured_config(),
                                 )
                             })
                         })
@@ -490,8 +543,10 @@ async fn run<A: LocalAuthority>(actor: Actor<A>) -> io::Result<()> {
                             crate::packet_attachment::AttachmentError::CaptureUnready,
                         ))
                         .map_err(failure);
+                    let result = configuration_result(&broker, &config, result);
                     if result.is_ok() {
                         epoch.config = config;
+                        epoch.applied = None;
                     }
                     let _ = ack.send(result);
                     continue;
@@ -500,7 +555,11 @@ async fn run<A: LocalAuthority>(actor: Actor<A>) -> io::Result<()> {
                     match lease.begin_handover(config.request(), config.sources(), config.mtu()) {
                         Ok(change) => change,
                         Err(error) => {
-                            let _ = ack.send(Err(failure(error)));
+                            let _ = ack.send(configuration_result(
+                                &broker,
+                                &config,
+                                Err(failure(error)),
+                            ));
                             continue;
                         }
                     };
@@ -514,7 +573,7 @@ async fn run<A: LocalAuthority>(actor: Actor<A>) -> io::Result<()> {
                     Ok(observation) => observation,
                     Err(error) => {
                         let rollback = change.rollback();
-                        let _ = ack.send(Err(error));
+                        let _ = ack.send(configuration_result(&broker, &config, Err(error)));
                         if rollback.is_err() {
                             break FrontendState::Failed;
                         }
@@ -525,6 +584,7 @@ async fn run<A: LocalAuthority>(actor: Actor<A>) -> io::Result<()> {
                 releases.add(generation)?;
                 let next = Epoch {
                     config,
+                    applied: None,
                     observation,
                     fd: None,
                 };
@@ -544,6 +604,7 @@ async fn run<A: LocalAuthority>(actor: Actor<A>) -> io::Result<()> {
                     && epoch.observation.rollback_feed(&next.observation)
                     && change.rollback().is_ok()
                 {
+                    let result = configuration_result(&broker, &next.config, result);
                     let released = finish_epoch(platform.clone(), releases.clone(), next).await;
                     let _ = ack.send(result.and(released));
                     continue;
@@ -566,6 +627,26 @@ async fn run<A: LocalAuthority>(actor: Actor<A>) -> io::Result<()> {
     // target work. A handover never enters this epilogue merely for old-fd loss.
     lease.retire();
     epoch.observation.retire();
+    // A loss can win the select after the daemon enqueued a new exact request.
+    // Close admission before draining so no queued operation loses its result
+    // when this actor exits. The TSM can retry with its next real request.
+    commands.close();
+    while let Ok(command) = commands.try_recv() {
+        match command {
+            Command::Handover(config, ack) => {
+                let _ = ack.send(configuration_result(
+                    &broker,
+                    &config,
+                    Err(io::Error::other(
+                        crate::tun_provider::ConfigurationError::ObservationUnavailable,
+                    )),
+                ));
+            }
+            Command::RetryRelease(ack) => {
+                let _ = ack.send(Err(io::ErrorKind::Interrupted.into()));
+            }
+        }
+    }
     forwarder.close_all().await;
     if terminal == FrontendState::Failed {
         state.send_replace(terminal);

@@ -1,7 +1,7 @@
 //! Raw application attachment. The broker owns no descriptor, policy or private
 //! control traffic. Configuration requests, capture leases and transport attempts
 //! have separate lifetimes; retiring a capture cannot cancel its successor request.
-use crate::tun_provider::TunConfig;
+use crate::tun_provider::{ConfigurationError, ConfigurationPurpose, TunConfig};
 use std::{
     collections::VecDeque,
     io,
@@ -70,6 +70,7 @@ pub struct BrokerSnapshot {
 
 struct Configuration {
     id: u64,
+    purpose: ConfigurationPurpose,
     config: TunConfig,
     target_config: TunConfig,
     status: watch::Sender<RequestStatus>,
@@ -108,9 +109,16 @@ impl Configuration {
 #[derive(Clone)]
 enum RequestStatus {
     Pending,
-    Ready(CaptureReceipt),
+    Ready(ConfigurationOutcome),
     Cancelled,
-    Failed,
+    Failed(ConfigurationError),
+}
+
+#[derive(Clone)]
+pub struct ConfigurationOutcome {
+    pub receipt: CaptureReceipt,
+    pub applied: TunConfig,
+    pub cause: Option<ConfigurationError>,
 }
 
 /// Sole cancellation owner, retained across cancellation of `configured()`.
@@ -137,6 +145,7 @@ struct Capture {
     epoch: u64,
     predecessor: Option<u64>,
     config: Option<Arc<Configuration>>,
+    profile: Option<TunConfig>,
     owner: Option<RelayCaptureOwner>,
 }
 
@@ -173,6 +182,9 @@ struct State {
     next_request: u64,
     next_attempt: u64,
     request: Option<Arc<Configuration>>,
+    // Borrow the latest exact cleanup identity even after fd/network loss. The
+    // retained frontend release record, not this weak reference, owns cleanup.
+    last_configuration: Weak<Configuration>,
     capture: Option<Capture>,
     attempts: [Option<Arc<Attempt>>; MAX_TARGETS],
     local_routes: Vec<ipnetwork::IpNetwork>,
@@ -209,7 +221,18 @@ impl State {
                 owner.retire();
             }
             if let Some(config) = capture.config {
-                config.status.send_replace(RequestStatus::Failed);
+                config.status.send_if_modified(|status| {
+                    if matches!(
+                        status,
+                        RequestStatus::Pending
+                            | RequestStatus::Ready(ConfigurationOutcome { cause: None, .. })
+                    ) {
+                        *status = RequestStatus::Failed(AttachmentError::CaptureUnready.into());
+                        true
+                    } else {
+                        false
+                    }
+                });
                 if self
                     .request
                     .as_ref()
@@ -312,6 +335,7 @@ pub struct CaptureEpochChange {
     generation: u64,
     predecessor: RelaySink,
     previous_config: Option<Arc<Configuration>>,
+    previous_profile: Option<TunConfig>,
     sources: RelaySources,
     mtu: u16,
     unbound: Mutex<Option<RelayCaptureGeneration>>,
@@ -365,6 +389,7 @@ impl AttachmentBroker {
             next_request: 0,
             next_attempt: 0,
             request: None,
+            last_configuration: Weak::new(),
             capture: None,
             attempts: std::array::from_fn(|_| None),
             local_routes: Vec::new(),
@@ -482,6 +507,15 @@ impl AttachmentBroker {
         target_config: TunConfig,
         config: TunConfig,
     ) -> Result<ConfigurationRequest, AttachmentError> {
+        self.request_configuration(target_config, config, ConfigurationPurpose::Target)
+    }
+
+    pub fn request_configuration(
+        &self,
+        target_config: TunConfig,
+        config: TunConfig,
+        purpose: ConfigurationPurpose,
+    ) -> Result<ConfigurationRequest, AttachmentError> {
         let storage = self.inner.capture.try_reserve(1024)?;
         let mut state = self.inner.state.lock().expect("attachment state");
         if state.closed {
@@ -490,7 +524,7 @@ impl AttachmentBroker {
         if state.mode != AttachmentMode::ManagedRequired {
             return Err(AttachmentError::Disabled);
         }
-        if state.paused {
+        if state.paused && purpose != ConfigurationPurpose::Blocking {
             return Err(AttachmentError::Closed);
         }
         if state.request.is_some() {
@@ -503,6 +537,7 @@ impl AttachmentBroker {
         let (status_tx, status) = watch::channel(RequestStatus::Pending);
         let request = Arc::new(Configuration {
             id,
+            purpose,
             config,
             target_config,
             status: status_tx,
@@ -515,6 +550,7 @@ impl AttachmentBroker {
             _storage: storage,
         });
         state.next_request = id;
+        state.last_configuration = Arc::downgrade(&request);
         state.request = Some(request.clone());
         self.inner.publish(&state);
         Ok(ConfigurationRequest {
@@ -560,6 +596,7 @@ impl AttachmentBroker {
             epoch: generation.get(),
             predecessor: None,
             config: request.map(|r| r.0.clone()),
+            profile: request.map(|r| r.0.config.clone()),
             owner: None,
         });
         self.inner.publish(&state);
@@ -592,14 +629,10 @@ impl AttachmentBroker {
         if capture.owner.is_some() {
             return Err(AttachmentError::Busy);
         }
-        if let Some(request) = &capture.config
-            && (request.config.mtu != mtu
-                || request
-                    .config
-                    .addresses
-                    .iter()
-                    .any(|ip| !sources.contains(*ip))
-                || request.config.addresses.len()
+        if let Some(profile) = &capture.profile
+            && (profile.mtu != mtu
+                || profile.addresses.iter().any(|ip| !sources.contains(*ip))
+                || profile.addresses.len()
                     != usize::from(sources.ipv4.is_some()) + usize::from(sources.ipv6.is_some()))
         {
             return Err(AttachmentError::Invalid);
@@ -647,12 +680,57 @@ impl AttachmentBroker {
     /// Capture observation belongs to the frontend, not to a target's request.
     /// Superseding/cancelling a target can leave a fully checked sink useful to
     /// Local. Never grant readiness to that obsolete target in that case.
-    pub(crate) fn acknowledge_current_capture_request(
+    pub(crate) fn complete_capture_request(
         &self,
         request: &PendingCaptureRequest,
         receipt: &CaptureReceipt,
+        cause: Option<ConfigurationError>,
     ) -> Result<bool, AttachmentError> {
-        self.acknowledge_projection_inner(request, receipt, None, true)
+        let mut state = self.inner.state.lock().expect("attachment state");
+        if !receipt.matches_capture(&self.inner, &state) {
+            return Err(AttachmentError::CaptureUnready);
+        }
+        if !state
+            .request
+            .as_ref()
+            .is_some_and(|r| Arc::ptr_eq(r, &request.0))
+        {
+            return Ok(false);
+        }
+        let capture = state.capture.as_ref().expect("checked capture");
+        if !capture
+            .config
+            .as_ref()
+            .is_some_and(|r| Arc::ptr_eq(r, &request.0))
+        {
+            return Err(AttachmentError::Stale);
+        }
+        let outcome = ConfigurationOutcome {
+            receipt: CaptureReceipt {
+                inner: receipt.inner.clone(),
+                generation: receipt.generation,
+                configuration: Arc::downgrade(&request.0),
+            },
+            applied: capture.profile.clone().ok_or(AttachmentError::Invalid)?,
+            cause,
+        };
+        request.0.status.send_replace(RequestStatus::Ready(outcome));
+        state.request.take();
+        self.inner.publish(&state);
+        Ok(true)
+    }
+
+    pub fn fail_configuration(&self, request: &PendingCaptureRequest, cause: ConfigurationError) {
+        let mut state = self.inner.state.lock().expect("attachment state");
+        if state
+            .request
+            .as_ref()
+            .is_some_and(|r| Arc::ptr_eq(r, &request.0))
+        {
+            request.0.status.send_replace(RequestStatus::Failed(cause));
+            state.request.take();
+            self.inner.publish(&state);
+        }
     }
 
     fn acknowledge_projection(
@@ -704,18 +782,29 @@ impl AttachmentBroker {
             generation: receipt.generation,
             configuration: Arc::downgrade(&request.0),
         };
-        request.0.status.send_replace(RequestStatus::Ready(receipt));
+        let applied = state
+            .capture
+            .as_ref()
+            .and_then(|capture| capture.profile.clone())
+            .or_else(|| observed_projection.cloned())
+            .unwrap_or_else(|| request.0.config.clone());
+        request
+            .0
+            .status
+            .send_replace(RequestStatus::Ready(ConfigurationOutcome {
+                receipt,
+                applied: applied.clone(),
+                cause: None,
+            }));
         state.capture.as_mut().expect("matching receipt").config = Some(request.0.clone());
+        state.capture.as_mut().expect("matching receipt").profile = Some(applied);
         state.request.take();
         self.inner.publish(&state);
         Ok(true)
     }
 
     pub fn acquire(&self, receipt: &CaptureReceipt) -> Result<TransportPair, AttachmentError> {
-        let request = receipt
-            .configuration
-            .upgrade()
-            .ok_or(AttachmentError::CaptureUnready)?;
+        let request = receipt.target_configuration()?;
         let config = &request.target_config;
         let sources = RelaySources {
             ipv4: config.addresses.iter().find_map(|ip| {
@@ -745,6 +834,7 @@ impl AttachmentBroker {
         sources: RelaySources,
         mtu: u16,
     ) -> Result<TransportPair, AttachmentError> {
+        receipt.target_configuration()?;
         let storage = self.inner.capture.try_reserve(CHANNEL_STORAGE)?;
         let mut state = self.inner.state.lock().expect("attachment state");
         if state.paused && target == RelayTargetId::MULLVAD {
@@ -846,7 +936,9 @@ impl AttachmentBroker {
         });
         TransportCleanup {
             inner: Arc::downgrade(&self.inner),
-            request: request.map(Arc::downgrade).unwrap_or_default(),
+            request: request
+                .map(Arc::downgrade)
+                .unwrap_or_else(|| state.last_configuration.clone()),
         }
     }
 
@@ -884,6 +976,20 @@ impl AttachmentBroker {
 }
 
 impl CaptureReceipt {
+    // Every target shares the same successful configuration admission contract;
+    // a blocking or fallback-error receipt is Local-only regardless of target ID.
+    fn target_configuration(&self) -> Result<Arc<Configuration>, AttachmentError> {
+        let request = self
+            .configuration
+            .upgrade()
+            .ok_or(AttachmentError::CaptureUnready)?;
+        if request.purpose != ConfigurationPurpose::Target
+            || !matches!(&*request.status.borrow(), RequestStatus::Ready(outcome) if outcome.cause.is_none())
+        {
+            return Err(AttachmentError::CaptureUnready);
+        }
+        Ok(request)
+    }
     fn matches(&self, inner: &Arc<Inner>, state: &State) -> bool {
         self.matches_capture(inner, state)
             && state
@@ -920,6 +1026,12 @@ impl CaptureReceipt {
 }
 
 impl PendingCaptureRequest {
+    pub fn purpose(&self) -> ConfigurationPurpose {
+        self.0.purpose
+    }
+    pub fn fail(&self, broker: &AttachmentBroker, cause: ConfigurationError) {
+        broker.fail_configuration(self, cause);
+    }
     pub fn id(&self) -> u64 {
         self.0.id
     }
@@ -971,19 +1083,27 @@ impl ConfigurationRequest {
         self.request
             .update_release(|release| release.transport_joined = true);
     }
-    pub async fn configured(&mut self) -> Result<CaptureReceipt, AttachmentError> {
+    pub async fn configured(&mut self) -> Result<CaptureReceipt, ConfigurationError> {
+        let outcome = self.configured_result().await?;
+        match outcome.cause {
+            Some(error) => Err(error),
+            None => Ok(outcome.receipt),
+        }
+    }
+    pub async fn configured_result(&mut self) -> Result<ConfigurationOutcome, ConfigurationError> {
         loop {
             let status = self.status.borrow_and_update().clone();
             match status {
                 RequestStatus::Pending => {}
-                RequestStatus::Ready(receipt) => {
-                    return receipt
-                        .current()
-                        .then_some(receipt)
-                        .ok_or(AttachmentError::CaptureUnready);
+                RequestStatus::Ready(outcome) => {
+                    return if outcome.receipt.current() || outcome.cause.is_some() {
+                        Ok(outcome)
+                    } else {
+                        Err(AttachmentError::CaptureUnready.into())
+                    };
                 }
-                RequestStatus::Cancelled => return Err(AttachmentError::Closed),
-                RequestStatus::Failed => return Err(AttachmentError::CaptureUnready),
+                RequestStatus::Cancelled => return Err(AttachmentError::Closed.into()),
+                RequestStatus::Failed(cause) => return Err(cause),
             }
             self.status
                 .changed()
@@ -997,6 +1117,16 @@ impl ConfigurationRequest {
 }
 
 impl TransportCleanup {
+    /// TSM invokes this only after its previous tunnel monitor has joined (or
+    /// in Error, where none exists). It is not a public state transition.
+    pub fn tsm_joined(&self) {
+        if let Some(request) = self.request.upgrade() {
+            request.update_release(|release| {
+                release.transport_joined = true;
+                release.handover_joined = true;
+            });
+        }
+    }
     pub fn cancel(&self) {
         if let Some(request) = self.request.upgrade() {
             cancel_configuration(&self.inner, &request);
@@ -1032,6 +1162,22 @@ impl Drop for ConfigurationRequest {
 }
 
 impl CaptureLease {
+    /// The fd owner records the actual Builder profile before binding that exact
+    /// epoch. Requested configuration stays immutable, including fallback cause.
+    pub(crate) fn applied_profile(
+        &self,
+        epoch: u64,
+        profile: TunConfig,
+    ) -> Result<(), AttachmentError> {
+        let mut state = self.inner.state.lock().expect("attachment state");
+        let capture = state
+            .capture
+            .as_mut()
+            .filter(|c| c.generation == self.generation && c.epoch == epoch)
+            .ok_or(AttachmentError::Stale)?;
+        capture.profile = Some(profile);
+        Ok(())
+    }
     pub(crate) fn changes(&self) -> watch::Receiver<BrokerSnapshot> {
         self.inner.changes.subscribe()
     }
@@ -1100,15 +1246,18 @@ impl CaptureLease {
             .ok_or(AttachmentError::CaptureUnready)?;
         owner.suspend_sink(&predecessor)?;
         let previous_config = capture.config.take();
+        let previous_profile = capture.profile.take();
         capture.predecessor = Some(capture.epoch);
         capture.epoch = generation.get();
         capture.config = request.map(|request| request.0.clone());
+        capture.profile = request.map(|request| request.0.config.clone());
         let change = CaptureEpochChange {
             inner: self.inner.clone(),
             session: self.generation,
             generation: generation.get(),
             predecessor,
             previous_config,
+            previous_profile,
             sources,
             mtu,
             unbound: Mutex::new(Some(generation)),
@@ -1349,17 +1498,14 @@ impl CaptureEpochChange {
             .ok_or(AttachmentError::CaptureUnready)?;
         // Validate before consuming the one-shot token so an invalid observation
         // cannot be mistaken for an already adopted descriptor.
-        if sources != self.sources
-            || mtu != self.mtu
-            || capture.config.as_ref().is_some_and(|request| {
-                request.config.mtu != mtu
-                    || request.config.addresses.len()
+        if capture
+            .profile
+            .as_ref()
+            .map_or(sources != self.sources || mtu != self.mtu, |profile| {
+                profile.mtu != mtu
+                    || profile.addresses.len()
                         != usize::from(sources.ipv4.is_some()) + usize::from(sources.ipv6.is_some())
-                    || request
-                        .config
-                        .addresses
-                        .iter()
-                        .any(|ip| !sources.contains(*ip))
+                    || profile.addresses.iter().any(|ip| !sources.contains(*ip))
             })
             || (capture.config.is_some() && network_handle.is_none())
         {
@@ -1439,6 +1585,7 @@ impl CaptureEpochChange {
             .resume_sink(&self.predecessor)?;
         capture.epoch = capture.predecessor.take().ok_or(AttachmentError::Stale)?;
         capture.config = self.previous_config.take();
+        capture.profile = self.previous_profile.take();
         self.completed = true;
         self.inner.publish(&state);
         self.inner.replies.notify_one();

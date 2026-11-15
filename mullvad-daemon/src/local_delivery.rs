@@ -740,7 +740,9 @@ impl<F: FrontendFactory> Delivery<F> {
             self.retry_requested |= external;
             return;
         }
-        let external_retry = std::mem::take(&mut self.retry_requested) || external;
+        let new_operation = matches!(wanted.as_ref(), Some(DeliveryConfig::Secured { request, .. })
+            if self.failed_establishment.as_ref().is_none_or(|failed| !matches!(failed, DeliveryConfig::Secured { request: old, .. } if old.id() == request.id())));
+        let external_retry = std::mem::take(&mut self.retry_requested) || external || new_operation;
         if !self.retry_permitted(wanted.as_ref(), external_retry) {
             return;
         }
@@ -787,6 +789,12 @@ impl<F: FrontendFactory> Delivery<F> {
                         .reconcile_capture(config.authority(&self.broker), true);
                     if let Err(error) = self.owner.as_mut().unwrap().handover(config.clone()) {
                         if error.kind() != io::ErrorKind::WouldBlock {
+                            if let DeliveryConfig::Secured { request, .. } = config {
+                                request.fail(
+                                    &self.broker,
+                                    talpid_tunnel::tun_provider::ConfigurationError::from(error),
+                                );
+                            }
                             self.failed_establishment = Some(config.clone());
                             self.handover_failed = true;
                         }
@@ -855,7 +863,13 @@ impl<F: FrontendFactory> Delivery<F> {
                         }
                     }
                 }
-                Err(_) => {
+                Err(error) => {
+                    if let DeliveryConfig::Secured { request, .. } = &config {
+                        request.fail(
+                            &self.broker,
+                            talpid_tunnel::tun_provider::ConfigurationError::from(error),
+                        );
+                    }
                     self.failed_establishment = Some(config);
                     self.releases = [None, None];
                     self.last_start_failed = true;
@@ -919,6 +933,15 @@ impl<F: FrontendFactory> Delivery<F> {
     /// repeat a failed operation. A release still belongs to the retained owner
     /// even if the desired configuration changes; only external intent retries it.
     fn retry_permitted(&self, wanted: Option<&DeliveryConfig>, external: bool) -> bool {
+        if matches!((self.failed_establishment.as_ref(), wanted),
+            (Some(DeliveryConfig::Secured { request: failed, .. }), Some(DeliveryConfig::Secured { request: wanted, .. }))
+                if failed.id() == wanted.id()
+                    && self.broker.pending_request().is_none_or(|pending| pending.id() != wanted.id()))
+        {
+            // A completed request cannot be replayed. Pre-work owner failures
+            // with a still-pending broker result retain explicit retry intent.
+            return false;
+        }
         external
             || (!self.can_retry_release()
                 && !self

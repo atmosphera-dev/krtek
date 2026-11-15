@@ -142,15 +142,25 @@ impl TransportMode {
 
     pub fn reconfigure<E>(
         self,
+        config: TunConfig,
+        purpose: super::ConfigurationPurpose,
         forced: bool,
         native: impl FnOnce(bool) -> Result<(), E>,
-    ) -> Result<(), E> {
+    ) -> Result<Option<ConfigurationRequest>, E>
+    where
+        E: From<AttachmentError>,
+    {
         match self {
-            Self::Managed { cleanup, .. } => {
+            Self::Managed { broker, cleanup } => {
                 cleanup.cancel();
-                Ok(())
+                cleanup.tsm_joined();
+                let projected = router_config(&config, broker.local_routes());
+                broker
+                    .request_configuration(config, projected, purpose)
+                    .map(Some)
+                    .map_err(E::from)
             }
-            Self::Native => native(forced),
+            Self::Native => native(forced).map(|()| None),
         }
     }
 
@@ -315,18 +325,28 @@ mod tests {
             panic!("native selection")
         };
         TransportMode::selected(Some(&broker))
-            .reconfigure(false, |forced| {
-                assert!(!forced);
-                drop(native()?);
-                Ok::<_, AttachmentError>(())
-            })
+            .reconfigure(
+                config.clone(),
+                super::super::ConfigurationPurpose::Blocking,
+                false,
+                |forced| {
+                    assert!(!forced);
+                    drop(native()?);
+                    Ok::<_, AttachmentError>(())
+                },
+            )
             .unwrap();
         TransportMode::selected(Some(&broker))
-            .reconfigure(true, |forced| {
-                assert!(forced);
-                drop(native()?);
-                Ok::<_, AttachmentError>(())
-            })
+            .reconfigure(
+                config.clone(),
+                super::super::ConfigurationPurpose::ForcedRefresh,
+                true,
+                |forced| {
+                    assert!(forced);
+                    drop(native()?);
+                    Ok::<_, AttachmentError>(())
+                },
+            )
             .unwrap();
         TransportMode::selected(Some(&broker)).close(|| {
             drop(fds);
@@ -343,13 +363,23 @@ mod tests {
                 panic!("managed selection")
             };
             assert_eq!(broker.pending_request().unwrap().config(), &config);
-            TransportMode::selected(Some(&broker))
-                .reconfigure(forced, |_| {
-                    drop(native()?);
-                    Ok::<_, AttachmentError>(())
-                })
+            let operation = TransportMode::selected(Some(&broker))
+                .reconfigure(
+                    config.clone(),
+                    super::super::ConfigurationPurpose::Blocking,
+                    forced,
+                    |_| {
+                        drop(native()?);
+                        Ok::<_, AttachmentError>(())
+                    },
+                )
                 .unwrap();
             assert!(futures::executor::block_on(source.request.configured()).is_err());
+            assert!(
+                operation.is_some(),
+                "cancellation is not a completed configuration"
+            );
+            drop(operation);
             TransportMode::selected(Some(&broker)).close(|| closes.set(closes.get() + 1));
         }
         let UserspaceTun::Managed(mut source) = TransportMode::selected(Some(&broker))

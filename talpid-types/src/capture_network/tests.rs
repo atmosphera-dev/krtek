@@ -41,6 +41,106 @@ fn expected() -> CaptureExpectation {
 }
 
 #[test]
+fn route_subset_readiness_tolerates_incidental_link_properties() {
+    for api in [28, 29, 30, 33] {
+        let feed = CaptureNetworkFeed::new(9);
+        let rx = feed.begin(11).unwrap();
+        let mut expectation = expected();
+        expectation.api_level = api;
+        expectation.owner_uid = (api >= 30).then_some(10181);
+        let mut observation = observed();
+        observation.api_level = api;
+        observation.owner_uid = expectation.owner_uid;
+        assert!(feed.bind(11, expectation));
+        let mut transient = observation.clone();
+        transient.routes.clear();
+        feed.publish(9, 11, transient);
+        assert_eq!(*rx.borrow(), CaptureNetworkState::Pending);
+        observation.routes[0].gateway = Some("10.64.0.1".parse().unwrap());
+        observation.routes[0].route_type = None;
+        observation.routes[0].interface_name.clear();
+        let mut extra = observation.routes[0].clone();
+        extra.destination.address = "203.0.113.0".parse().unwrap();
+        extra.destination.prefix_length = 24;
+        observation.routes.push(extra);
+        observation.routes.reverse();
+        observation.addresses.clear();
+        observation.dns_servers.clear();
+        observation.mtu = None;
+        assert!(feed.publish(9, 11, observation.clone()));
+        assert!(matches!(*rx.borrow(), CaptureNetworkState::Ready(_)));
+        let revoked = Arc::new(AtomicUsize::new(0));
+        let r = revoked.clone();
+        feed.acknowledge(
+            11,
+            Arc::new(move || {
+                r.fetch_add(1, Ordering::SeqCst);
+            }),
+            |_| (),
+        )
+        .unwrap();
+        let mut transient = observation.clone();
+        transient.routes.clear();
+        feed.publish(9, 11, transient);
+        // Route reports no longer control an already fd-bound healthy sink.
+        assert_eq!(revoked.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            feed.with_ready(11, || b"same-fd-consumer"),
+            Some(b"same-fd-consumer")
+        );
+        feed.publish(9, 11, observation);
+        assert_eq!(revoked.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn real_capture_loss_retires_only_exact_epoch() {
+    for loss in [false, true] {
+        let feed = CaptureNetworkFeed::new(9);
+        let rx = feed.begin(11).unwrap();
+        feed.bind(11, expected());
+        feed.publish(9, 11, observed());
+        let revoked = Arc::new(AtomicUsize::new(0));
+        let r = revoked.clone();
+        feed.acknowledge(
+            11,
+            Arc::new(move || {
+                r.fetch_add(1, Ordering::SeqCst);
+            }),
+            |_| (),
+        )
+        .unwrap();
+        let mut wrong = observed();
+        wrong.network_handle += 1;
+        wrong.lost = true;
+        assert!(!feed.publish(9, 11, wrong));
+        assert!(!feed.publish(8, 11, observed()));
+        assert!(!feed.publish(9, 10, observed()));
+        assert_eq!(revoked.load(Ordering::SeqCst), 0);
+        let mut actual = observed();
+        if loss {
+            actual.lost = true;
+        } else {
+            actual.interface_name = "tun-other".into();
+        }
+        assert!(feed.publish(9, 11, actual));
+        assert_eq!(revoked.load(Ordering::SeqCst), 1);
+        assert_eq!(*rx.borrow(), CaptureNetworkState::Lost);
+        assert!(
+            feed.with_ready(11, || panic!("write after exact loss"))
+                .is_none()
+        );
+        assert!(!feed.publish(9, 11, observed()));
+        feed.invalidate(11);
+        let next = feed.begin(12).unwrap();
+        feed.bind(12, expected());
+        feed.publish(9, 12, observed());
+        feed.invalidate(11);
+        assert!(matches!(*next.borrow(), CaptureNetworkState::Ready(_)));
+    }
+}
+
+#[test]
 fn registration_generation_and_fd_binding_refuse_stale_equal_observations() {
     let feed = CaptureNetworkFeed::new(9);
     let mut rx = feed.begin(11).unwrap();
@@ -221,7 +321,7 @@ fn exact_config_and_loss_revoke_before_notification_and_cannot_recover_in_place(
         |o| o.fresh = false,
         |o| o.lost = true,
     ];
-    for mutate in mutations {
+    for (index, mutate) in mutations.into_iter().enumerate() {
         let feed = CaptureNetworkFeed::new(9);
         let mut rx = feed.begin(11).unwrap();
         assert!(feed.bind(11, expected()));
@@ -242,9 +342,15 @@ fn exact_config_and_loss_revoke_before_notification_and_cannot_recover_in_place(
         let mut wrong = observed();
         mutate(&mut wrong);
         assert!(feed.publish(9, 11, wrong));
-        assert_eq!(revocations.load(Ordering::SeqCst), 1);
-        assert_eq!(*rx.borrow(), CaptureNetworkState::Lost);
-        assert!(!feed.publish(9, 11, observed()));
+        if index >= 7 {
+            assert_eq!(revocations.load(Ordering::SeqCst), 1);
+            assert_eq!(*rx.borrow(), CaptureNetworkState::Lost);
+            assert!(!feed.publish(9, 11, observed()));
+        } else {
+            assert_eq!(revocations.load(Ordering::SeqCst), 0);
+            assert!(matches!(*rx.borrow(), CaptureNetworkState::Ready(_)));
+            feed.publish(9, 11, observed());
+        }
         assert!(feed.acknowledge(11, Arc::new(|| {}), |_| ()).is_none());
         feed.invalidate(11);
         assert_eq!(revocations.load(Ordering::SeqCst), 1);
@@ -364,23 +470,19 @@ fn requested_os_projection_has_only_explicit_bookkeeping_and_disabled_family_rou
             vec!["10.64.0.2"],
             vec!["0.0.0.0/0"],
             vec!["10.64.0.1"],
-            vec![("0.0.0.0/0", 1), ("10.64.0.2/32", 1), ("::/0", 7)],
+            vec![("0.0.0.0/0", 1)],
         ),
         (
             vec!["fd42::2"],
             vec!["::/0"],
             vec!["fd42::1"],
-            vec![("0.0.0.0/0", 7), ("::/0", 1), ("fd42::2/128", 1)],
+            vec![("::/0", 1)],
         ),
         (
             vec!["172.27.1.1", "fdf0:ce4a:801d::172:27:1:1"],
             vec!["10.0.2.2/32"],
             vec![],
-            vec![
-                ("10.0.2.2/32", 1),
-                ("172.27.1.1/32", 1),
-                ("fdf0:ce4a:801d::172:27:1:1/128", 1),
-            ],
+            vec![("10.0.2.2/32", 1)],
         ),
     ] {
         let prefix = |text: &str| {
@@ -431,7 +533,7 @@ fn requested_os_projection_has_only_explicit_bookkeeping_and_disabled_family_rou
             route_type: Some(1),
         });
         assert!(feed.publish(9, 11, observation));
-        assert_eq!(*rx.borrow(), CaptureNetworkState::Lost);
+        assert!(matches!(*rx.borrow(), CaptureNetworkState::Ready(_)));
     }
 }
 
@@ -479,7 +581,10 @@ fn api_scoped_projection_requires_every_reported_property_without_inventing_abse
             10181,
             api,
             &["10.64.0.2".parse().unwrap()],
-            &[],
+            &[CapturePrefix {
+                address: "0.0.0.0".parse().unwrap(),
+                prefix_length: 0,
+            }],
             &["10.64.0.1".parse().unwrap()],
             1380,
         )
@@ -508,7 +613,7 @@ fn api_scoped_projection_requires_every_reported_property_without_inventing_abse
             interface_name: "tun7".into(),
             route_type: (api >= 33).then_some(1),
         });
-        assert!(!expected.matches(&wrong));
+        assert!(expected.matches(&wrong));
         wrong = observation.clone();
         wrong.api_level = api + 1;
         assert!(!expected.matches(&wrong));
@@ -517,14 +622,14 @@ fn api_scoped_projection_requires_every_reported_property_without_inventing_abse
         assert!(!expected.matches(&wrong));
         wrong = observation.clone();
         wrong.mtu = if api >= 29 { None } else { Some(1380) };
-        assert!(!expected.matches(&wrong));
+        assert!(expected.matches(&wrong));
         wrong = observation.clone();
         wrong.routes[0].route_type = if api >= 33 { None } else { Some(1) };
-        assert!(!expected.matches(&wrong));
+        assert!(expected.matches(&wrong));
         if api >= 33 {
             wrong = observation;
             wrong.routes[0].route_type = Some(7);
-            assert!(!expected.matches(&wrong));
+            assert!(expected.matches(&wrong));
         }
     }
 }

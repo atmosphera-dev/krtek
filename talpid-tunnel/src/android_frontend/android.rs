@@ -1,13 +1,14 @@
 use super::{CaptureConfig, CaptureHandover, FrontendPlatform};
+use crate::tun_provider::{AppliedTun, ConfigurationError};
 use crate::tun_provider::{
     VpnServiceConfig,
     local_network::{FrontendHandoverConfig, LocalNetworkPlatform},
 };
-use std::{io, os::fd::OwnedFd, sync::Arc};
+use std::{io, sync::Arc};
 use talpid_types::capture_network::{CaptureExpectation, CaptureNetworkFeed, CapturePrefix};
 
 impl FrontendPlatform for LocalNetworkPlatform {
-    fn open(&self, generation: i64, config: &CaptureConfig) -> io::Result<OwnedFd> {
+    fn open(&self, generation: i64, config: &CaptureConfig) -> io::Result<AppliedTun> {
         match config {
             CaptureConfig::Partial(config) => self.open_frontend(generation, config),
             CaptureConfig::Router { config, .. } => {
@@ -17,7 +18,7 @@ impl FrontendPlatform for LocalNetworkPlatform {
                 self.open_secured_frontend(generation, request.config().clone())
             }
         }
-        .map_err(io::Error::other)
+        .map_err(|error| io::Error::other(ConfigurationError::from(error)))
     }
 
     fn capture_feed(&self) -> Arc<CaptureNetworkFeed> {
@@ -39,7 +40,9 @@ impl FrontendPlatform for LocalNetworkPlatform {
         };
         let result = self.handover_frontend(predecessor, generation, config);
         CaptureHandover {
-            descriptor: result.descriptor.map_err(io::Error::other),
+            descriptor: result
+                .descriptor
+                .map_err(|error| io::Error::other(ConfigurationError::from(error))),
             predecessor_retained: result.predecessor_retained,
         }
     }

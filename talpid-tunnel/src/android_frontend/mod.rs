@@ -32,7 +32,11 @@ use tokio::{
 };
 
 pub trait FrontendPlatform: Send + Sync + 'static {
-    fn open(&self, generation: i64, config: &CaptureConfig) -> io::Result<OwnedFd>;
+    fn open(
+        &self,
+        generation: i64,
+        config: &CaptureConfig,
+    ) -> io::Result<crate::tun_provider::AppliedTun>;
     /// Same owner, at most two epochs. Retention requires positive platform
     /// evidence that establish was never entered; an unknown JNI result is loss.
     fn handover(
@@ -60,7 +64,7 @@ pub trait FrontendPlatform: Send + Sync + 'static {
 }
 
 pub struct CaptureHandover {
-    pub descriptor: io::Result<OwnedFd>,
+    pub descriptor: io::Result<crate::tun_provider::AppliedTun>,
     pub predecessor_retained: bool,
 }
 

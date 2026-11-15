@@ -35,6 +35,15 @@ pub enum Error {
 
 impl From<Error> for ErrorStateCause {
     fn from(error: Error) -> ErrorStateCause {
+        #[cfg(target_os = "android")]
+        let error = match error {
+            Error::TunnelMonitoring(talpid_wireguard::Error::TunnelError(
+                talpid_wireguard::TunnelError::ManagedConfiguration(cause),
+            )) => Error::TunnelMonitoring(talpid_wireguard::Error::TunnelError(
+                talpid_wireguard::TunnelError::SetupTunnelDevice(cause.into()),
+            )),
+            error => error,
+        };
         match error {
             Error::EnableIpv6 => ErrorStateCause::Ipv6Unavailable,
 

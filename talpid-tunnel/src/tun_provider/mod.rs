@@ -7,6 +7,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 mod android_config;
 pub mod transport;
 pub use android_config::AndroidTunConfig;
+mod configuration;
+#[cfg(unix)]
+pub use configuration::AppliedTun;
+pub use configuration::{ConfigurationError, ConfigurationPurpose};
 
 /// SOCKS5 control destinations on Mullvad relays, retained by LAN subtraction
 /// and reserved from daemon-owned local delivery.
@@ -131,7 +135,18 @@ pub struct TunConfig {
 
 impl TunConfig {
     pub fn same_android_config(&self, other: &Self) -> bool {
-        AndroidTunConfig::new(self).normalized() == AndroidTunConfig::new(other).normalized()
+        // Full capture's upstream Builder adds dummy DNS for an empty list.
+        // PartialConfig deliberately compares its DNS-free profile separately.
+        let effective = |config: &Self| {
+            let mut config = AndroidTunConfig::new(config).normalized();
+            if config.dns_servers.is_empty() {
+                config
+                    .dns_servers
+                    .push("192.0.2.1".parse().expect("dummy resolver"));
+            }
+            config
+        };
+        effective(self) == effective(other)
     }
 
     /// Return a copy of all gateway addresses

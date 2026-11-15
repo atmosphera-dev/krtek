@@ -232,10 +232,10 @@ impl TunnelState for ErrorState {
             #[cfg(target_os = "android")]
             Some(TunnelCommand::SetExcludedApps(result_tx, paths)) => {
                 if shared_values.set_excluded_paths(paths) {
-                    if let Err(err) = shared_values.restart_tunnel(true) {
-                        let _ =
-                            result_tx.send(Err(crate::split_tunnel::Error::SetExcludedApps(err)));
-                    }
+                    let result = shared_values
+                        .restart_tunnel(true)
+                        .map_err(crate::split_tunnel::Error::SetExcludedApps);
+                    let _ = result_tx.send(result);
                 } else {
                     let _ = result_tx.send(Ok(()));
                 }

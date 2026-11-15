@@ -24,6 +24,8 @@ use talpid_types::{android::AndroidContext, android::InetNetwork};
 /// Errors that occur while setting up VpnService tunnel.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error(transparent)]
+    Managed(super::ConfigurationError),
     #[error("Failed to attach Java VM to tunnel thread")]
     AttachJvmToThread(#[source] jnix::jni::errors::Error),
 
@@ -119,14 +121,23 @@ impl AndroidTunProvider {
 
     /// Retire only transport/config ownership in managed mode. The daemon owns
     /// capture configuration handovers and the independent Local session.
-    pub fn reconfigure_tun(&mut self, forced: bool) -> Result<(), Error> {
-        self.transport().reconfigure(forced, |forced| {
-            if forced {
-                self.open_tun_forced().map(|_| ())
-            } else {
-                self.open_tun().map(|_| ())
-            }
-        })
+    pub fn reconfigure_tun(
+        &mut self,
+        forced: bool,
+    ) -> Result<Option<crate::packet_attachment::ConfigurationRequest>, Error> {
+        let purpose = if forced {
+            super::ConfigurationPurpose::ForcedRefresh
+        } else {
+            super::ConfigurationPurpose::Blocking
+        };
+        self.transport()
+            .reconfigure(self.config.clone(), purpose, forced, |forced| {
+                if forced {
+                    self.open_tun_forced().map(|_| ())
+                } else {
+                    self.open_tun().map(|_| ())
+                }
+            })
     }
 
     /// Returns an open tunnel with the current configuration, if a tunnel already exists with the
@@ -306,6 +317,60 @@ impl AndroidTunProvider {
             Ok(())
         } else {
             Err(Error::TunnelDeviceError)
+        }
+    }
+}
+
+impl From<crate::packet_attachment::AttachmentError> for Error {
+    fn from(error: crate::packet_attachment::AttachmentError) -> Self {
+        Self::Managed(error.into())
+    }
+}
+
+impl From<super::ConfigurationError> for Error {
+    fn from(error: super::ConfigurationError) -> Self {
+        use super::ConfigurationError as C;
+        match error {
+            C::InvalidDnsServers(addresses) => Self::InvalidDnsServers(addresses),
+            C::InvalidIpv6Config {
+                addresses,
+                routes,
+                dns_servers,
+            } => Self::InvalidIpv6Config {
+                addresses,
+                routes: routes.into_iter().map(InetNetwork::from).collect(),
+                dns_servers,
+            },
+            C::NotPrepared => Self::NotPrepared,
+            C::OtherLegacyAlwaysOnVpn => Self::OtherLegacyAlwaysOnVpn,
+            C::OtherAlwaysOnApp { app_name } => Self::OtherAlwaysOnApp { app_name },
+            C::Establish => Self::TunnelDeviceError,
+            C::RoutesTimedOut => Self::RoutesTimedOut,
+            error => Self::Managed(error),
+        }
+    }
+}
+
+impl From<Error> for super::ConfigurationError {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::InvalidDnsServers(addresses) => Self::InvalidDnsServers(addresses),
+            Error::InvalidIpv6Config {
+                addresses,
+                routes,
+                dns_servers,
+            } => Self::InvalidIpv6Config {
+                addresses,
+                routes: routes.iter().map(ipnetwork::IpNetwork::from).collect(),
+                dns_servers,
+            },
+            Error::NotPrepared => Self::NotPrepared,
+            Error::OtherLegacyAlwaysOnVpn => Self::OtherLegacyAlwaysOnVpn,
+            Error::OtherAlwaysOnApp { app_name } => Self::OtherAlwaysOnApp { app_name },
+            Error::TunnelDeviceError => Self::Establish,
+            Error::RoutesTimedOut => Self::RoutesTimedOut,
+            Error::Managed(error) => error,
+            error => Self::Platform(Arc::new(std::io::Error::other(error))),
         }
     }
 }

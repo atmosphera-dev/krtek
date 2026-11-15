@@ -1,10 +1,11 @@
 //! JNI names and socket preparation codes shared with TalpidVpnService.
 use super::{Error, VpnServiceConfig};
+use crate::tun_provider::AppliedTun;
 use jnix::{
     IntoJava, JnixEnv,
     jni::objects::{AutoLocal, JObject, JValue},
 };
-use std::os::fd::{OwnedFd, RawFd};
+use std::os::fd::RawFd;
 use talpid_types::android::AndroidContext;
 mod descriptor;
 mod jni_call;
@@ -63,7 +64,10 @@ fn decode_error(error: descriptor::DecodeError) -> Error {
     }
 }
 
-fn decode_descriptor(env: &jnix::jni::JNIEnv<'_>, result: JObject<'_>) -> Result<RawFd, Error> {
+fn decode_descriptor(
+    env: &jnix::jni::JNIEnv<'_>,
+    result: JObject<'_>,
+) -> Result<descriptor::DecodedDescriptor, Error> {
     use descriptor::OpenResult;
     match descriptor::decode(env, result).map_err(decode_error)? {
         OpenResult::Descriptor(fd) => Ok(fd),
@@ -80,7 +84,7 @@ pub enum FrontendHandoverConfig<'a> {
 }
 
 pub struct FrontendHandoverResult {
-    pub descriptor: Result<OwnedFd, Error>,
+    pub descriptor: Result<AppliedTun, Error>,
     pub predecessor_retained: bool,
 }
 
@@ -133,7 +137,7 @@ impl LocalNetworkPlatform {
         &self,
         generation: i64,
         config: &super::super::PartialConfig,
-    ) -> Result<OwnedFd, Error> {
+    ) -> Result<AppliedTun, Error> {
         let env = JnixEnv::from(
             self.context
                 .jvm
@@ -158,9 +162,19 @@ impl LocalNetworkPlatform {
                 .and_then(|value| value.l())
                 .map_err(|e| Error::CallMethod(name, e))?;
             let result = env.auto_local(result);
-            let raw = decode_descriptor(&env, result.as_obj())?;
-            descriptor::take(&env, self.context.vpn_service.as_obj(), generation, raw)
-                .map_err(decode_error)
+            let decoded = decode_descriptor(&env, result.as_obj())?;
+            descriptor::take(
+                &env,
+                self.context.vpn_service.as_obj(),
+                generation,
+                decoded.raw,
+            )
+            .map(|fd| AppliedTun {
+                fd,
+                profile: decoded.profile,
+                cause: decoded.cause,
+            })
+            .map_err(decode_error)
         })
     }
 
@@ -168,7 +182,7 @@ impl LocalNetworkPlatform {
         &self,
         generation: i64,
         config: crate::tun_provider::TunConfig,
-    ) -> Result<OwnedFd, Error> {
+    ) -> Result<AppliedTun, Error> {
         let env = JnixEnv::from(
             self.context
                 .jvm
@@ -188,9 +202,19 @@ impl LocalNetworkPlatform {
                 .and_then(|v| v.l())
                 .map_err(|e| Error::CallMethod(name, e))?;
             let result = env.auto_local(result);
-            let raw = decode_descriptor(&env, result.as_obj())?;
-            descriptor::take(&env, self.context.vpn_service.as_obj(), generation, raw)
-                .map_err(decode_error)
+            let decoded = decode_descriptor(&env, result.as_obj())?;
+            descriptor::take(
+                &env,
+                self.context.vpn_service.as_obj(),
+                generation,
+                decoded.raw,
+            )
+            .map(|fd| AppliedTun {
+                fd,
+                profile: decoded.profile,
+                cause: decoded.cause,
+            })
+            .map_err(decode_error)
         })
     }
 
@@ -223,7 +247,7 @@ impl LocalNetworkPlatform {
         generation: i64,
         config: FrontendHandoverConfig<'_>,
     ) -> FrontendHandoverResult {
-        let call = || -> Result<(Result<OwnedFd, Error>, bool), Error> {
+        let call = || -> Result<(Result<AppliedTun, Error>, bool), Error> {
             let env = JnixEnv::from(
                 self.context
                     .jvm

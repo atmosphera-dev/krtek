@@ -186,7 +186,7 @@ impl GotaTun {
                     let pair = pending
                         .create(config)
                         .await
-                        .map_err(|e| TunnelError::FatalStartWireguardError(Box::new(e)))?;
+                        .map_err(managed_configuration_error)?;
                     interface_name = pair.owner.interface();
                     (
                         PlaintextSend::Managed(pair.send),
@@ -470,6 +470,21 @@ fn managed_admission_error(
     error: talpid_tunnel::packet_attachment::AttachmentError,
 ) -> TunnelError {
     TunnelError::FatalStartWireguardError(Box::new(error))
+}
+
+#[cfg(any(target_os = "android", test))]
+fn managed_configuration_error(error: std::io::Error) -> TunnelError {
+    use talpid_tunnel::tun_provider::ConfigurationError;
+    let cause = ConfigurationError::from(error);
+    match cause {
+        ConfigurationError::RoutesTimedOut
+        | ConfigurationError::ObservationUnavailable
+        | ConfigurationError::Observation(_)
+        | ConfigurationError::Attachment(
+            talpid_tunnel::packet_attachment::AttachmentError::CaptureUnready,
+        ) => TunnelError::RecoverableStartWireguardError(Box::new(cause)),
+        cause => TunnelError::ManagedConfiguration(cause),
+    }
 }
 
 /// Start a GotaTun tunnel on `tun`.

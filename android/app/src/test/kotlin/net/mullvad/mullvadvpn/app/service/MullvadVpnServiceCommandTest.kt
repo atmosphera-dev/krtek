@@ -245,6 +245,7 @@ class MullvadVpnServiceCommandTest {
         every { descriptor.fd } returns 7
         every { anyConstructed<VpnService.Builder>().establish() } returns descriptor
         val service = if (spy) spyk(create()) else create()
+        service.connectivityListener = mockk(relaxed = true)
         every { service.prepareVpnSafe() } returns Prepared.right()
         if (spy) every { service.packageName } returns PACKAGE
         return service to descriptor

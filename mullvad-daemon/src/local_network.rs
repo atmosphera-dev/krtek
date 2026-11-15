@@ -94,7 +94,30 @@ pub struct LocalNetworkRuntime<F: FrontendFactory = PlatformFactory> {
     suspended: bool,
     phase: Option<TunnelPhase>,
     target_config: Option<talpid_tunnel::packet_attachment::PendingCaptureRequest>,
+    blocking_config: Option<BlockingConfiguration>,
     excluded_packages: Option<Vec<String>>,
+}
+
+/// Keep Error's prepared safe base separate from its current Local projection.
+/// The original operation remains the intent until the effective Local union
+/// changes; a failed request is never replaced just because an input woke us.
+struct BlockingConfiguration {
+    base: talpid_tunnel::tun_provider::TunConfig,
+    projection: DeliveryConfig,
+}
+
+impl BlockingConfiguration {
+    fn reproject(&mut self, routes: Vec<ipnetwork::IpNetwork>) -> DeliveryConfig {
+        let projected = talpid_tunnel::tun_provider::transport::router_config(&self.base, routes);
+        if !self
+            .projection
+            .router_config()
+            .is_some_and(|current| current.same_android_config(&projected))
+        {
+            self.projection = DeliveryConfig::Router(projected);
+        }
+        self.projection.clone()
+    }
 }
 
 impl LocalNetworkRuntime {
@@ -168,6 +191,7 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
             suspended: false,
             phase: None,
             target_config: None,
+            blocking_config: None,
             excluded_packages: None,
         };
         runtime.observation = runtime.observation();
@@ -263,6 +287,9 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
         if routes != self.broker.local_routes() && self.broker.set_local_routes(routes).is_err() {
             self.delivery.fail();
         }
+        if target == TargetState::Unsecured && phase == TunnelPhase::Disconnected {
+            self.blocking_config = None;
+        }
         let partial = || {
             let routes = policy
                 .announced_routes()
@@ -282,11 +309,30 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
             partial()
         } else if self.broker.snapshot().mode == AttachmentMode::ManagedRequired {
             if let Some(request) = self.broker.pending_request() {
-                self.target_config = Some(request.clone());
-                Some(DeliveryConfig::Secured {
+                let config = DeliveryConfig::Secured {
                     broker: self.broker.clone(),
-                    request,
-                })
+                    request: request.clone(),
+                };
+                if request.purpose() == talpid_tunnel::tun_provider::ConfigurationPurpose::Blocking
+                {
+                    self.blocking_config = Some(BlockingConfiguration {
+                        base: request.target_config().clone(),
+                        projection: config.clone(),
+                    });
+                } else {
+                    self.target_config = Some(request);
+                    self.blocking_config = None;
+                }
+                Some(config)
+            } else if self.blocking_config.is_some() || phase == TunnelPhase::Error {
+                // Reproject only Error's current safe base, never cached target
+                // DNS/LAN. Router handover changes Local coverage without issuing
+                // another receipt for the original TSM blocking operation. The
+                // operation also owns the interval before public Error arrives.
+                match self.blocking_config.as_mut() {
+                    Some(config) => Some(config.reproject(self.broker.local_routes())),
+                    None => self.delivery.pending_or_applied_config(),
+                }
             } else if phase != TunnelPhase::Error
                 && !self
                     .delivery
@@ -334,9 +380,7 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
         } else {
             None
         };
-        let successor = self.broker.pending_request().is_some()
-            && self.delivery.release_ready()
-            && !self.delivery.release_failed();
+        let successor = self.broker.pending_request().is_some() && self.delivery.release_ready();
         if !self.shutting_down && (external || !self.delivery.failed() || successor) {
             if external {
                 self.delivery.maintain_config(config).await;
@@ -532,6 +576,7 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
         self.broker.close();
         self.delivery.stop().await?;
         self.target_config = None;
+        self.blocking_config = None;
         Ok(())
     }
 }

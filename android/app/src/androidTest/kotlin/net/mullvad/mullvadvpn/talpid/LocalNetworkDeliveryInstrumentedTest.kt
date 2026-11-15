@@ -2779,8 +2779,10 @@ class LocalNetworkDeliveryInstrumentedTest {
                                     expected,
                                     requiredMtu
                                         ?: if (expectedTunnel == "Connected") options?.mtu?.value
-                                        else null,
+                                        else if (expectedTunnel == "Error") 1380 else null,
                                     addresses.any { ':' in it },
+                                    requiredDns =
+                                        if (expectedTunnel == "Error") setOf("192.0.2.1") else null,
                                 )
                         ) {
                             delay(100)

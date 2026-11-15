@@ -106,7 +106,11 @@ impl FrontendPlatform for PacketPlatform {
     ) -> io::Result<talpid_tunnel::android_frontend::CaptureFormat> {
         talpid_tunnel::android_frontend::CaptureFormat::from_flags(0x1001)
     }
-    fn open(&self, generation: i64, config: &CaptureConfig) -> io::Result<OwnedFd> {
+    fn open(
+        &self,
+        generation: i64,
+        config: &CaptureConfig,
+    ) -> io::Result<talpid_tunnel::tun_provider::AppliedTun> {
         self.application_coverage
             .lock()
             .unwrap()
@@ -130,7 +134,7 @@ impl FrontendPlatform for PacketPlatform {
         *self.peer.lock().unwrap() = Some(peer);
         self.generation.store(generation, SeqCst);
         self.starts.fetch_add(1, SeqCst);
-        Ok(capture.into())
+        Ok(OwnedFd::from(capture).into())
     }
     fn capture_feed(&self) -> Arc<CaptureNetworkFeed> {
         self.feed.clone()
@@ -415,7 +419,7 @@ async fn daemon_route_handover_retains_the_partial_grant_and_same_physical_tcp_s
     {
         if index != 0 {
             drop(request.take());
-            let config = match index {
+            let mut config = match index {
                 1 => DeliveryConfig::Partial(
                     vec!["10.0.2.2/32".into(), "172.16.0.0/16".into()].into(),
                 ),
@@ -472,6 +476,18 @@ async fn daemon_route_handover_retains_the_partial_grant_and_same_physical_tcp_s
                     broker.snapshot()
                 );
                 platform.retain_handover.store(false, SeqCst);
+                assert!(
+                    bounded(request.as_mut().unwrap().configured())
+                        .await
+                        .is_err()
+                );
+                let projection = config.router_config().unwrap().clone();
+                drop(request.take());
+                request = Some(broker.request_capture(projection).unwrap());
+                config = DeliveryConfig::Secured {
+                    broker: broker.clone(),
+                    request: broker.pending_request().unwrap(),
+                };
             }
             delivery.maintain_config(Some(config.clone())).await;
             assert!(
@@ -983,7 +999,11 @@ async fn production_factory_mtu_changes_preserve_local_session_and_cancelled_tar
         entered: tokio::sync::Notify,
     }
     impl FrontendPlatform for Deferred {
-        fn open(&self, g: i64, c: &CaptureConfig) -> io::Result<OwnedFd> {
+        fn open(
+            &self,
+            g: i64,
+            c: &CaptureConfig,
+        ) -> io::Result<talpid_tunnel::tun_provider::AppliedTun> {
             self.platform.open(g, c)
         }
         fn handover(&self, old: i64, g: i64, c: &CaptureConfig) -> CaptureHandover {
@@ -1761,7 +1781,7 @@ async fn exclusion_change_establishes_one_effective_capture() {
         "later.installed.package".to_owned(),
     ];
     h.runtime.set_excluded_packages(packages.clone());
-    h.observe(TunnelPhase::Error);
+    h.enter_blocking_error_with(packages.clone()).await;
     h.runtime.update(&h.policy, h.target, h.phase).await;
     h.settle_capture().await;
     assert_eq!(
@@ -1910,7 +1930,7 @@ async fn runtime_router_keeps_one_local_tcp_udp_consumer_through_held_boundaries
                 h.observe(TunnelPhase::Connecting);
             }
             3 => {
-                h.observe(TunnelPhase::Error);
+                h.enter_blocking_error().await;
             }
             4 | 8 => {
                 h.connect_endpoint().await;
@@ -1931,7 +1951,7 @@ async fn runtime_router_keeps_one_local_tcp_udp_consumer_through_held_boundaries
                 h.transport.take();
                 h.request.take();
                 h.observe(TunnelPhase::Disconnecting);
-                h.observe(TunnelPhase::Error);
+                h.enter_blocking_error().await;
             }
             10 => {
                 h.user_disconnect();
@@ -2045,8 +2065,8 @@ async fn runtime_router_keeps_one_local_tcp_udp_consumer_through_held_boundaries
     bounded(udp_task).await.unwrap();
     assert_eq!(
         h.platform.starts.load(SeqCst),
-        4,
-        "Partial -> Error blocking -> target -> Partial; no pre-Connect blocking capture"
+        5,
+        "Partial -> actual safe Error -> target -> actual safe Error -> Partial; no pre-Connect blocking capture"
     );
     h.close().await;
 }
@@ -2175,6 +2195,38 @@ async fn actual_capture_loss_retries_with_a_fresh_router_not_a_cancelled_target_
 }
 
 impl Handover {
+    async fn enter_blocking_error(&mut self) {
+        self.enter_blocking_error_with(vec![]).await;
+    }
+
+    async fn enter_blocking_error_with(&mut self, excluded_packages: Vec<String>) {
+        use talpid_tunnel::tun_provider::{ConfigurationPurpose, transport::TransportMode};
+        let broker = self.runtime.broker();
+        let mut safe = talpid_tunnel::tun_provider::blocking_config();
+        safe.dns_servers = Some(vec!["192.0.2.1".parse().unwrap()]);
+        safe.excluded_packages = excluded_packages;
+        let mut operation = TransportMode::selected(Some(&broker))
+            .reconfigure::<talpid_tunnel::packet_attachment::AttachmentError>(
+                safe,
+                ConfigurationPurpose::Blocking,
+                false,
+                |_| panic!("managed Error selected Native"),
+            )
+            .unwrap()
+            .unwrap();
+        self.runtime
+            .internal_update(&self.policy, self.target, self.phase)
+            .await;
+        let receipt = self.wait_for_capture_configuration(&mut operation).await;
+        assert!(receipt.current());
+        assert!(broker.acquire(&receipt).is_err());
+        let actual = operation.configured_result().await.unwrap().applied;
+        assert_eq!(actual.mtu, 1380);
+        assert_eq!(actual.dns_servers, Some(vec!["192.0.2.1".parse().unwrap()]));
+        self.request = Some(operation);
+        self.observe(TunnelPhase::Error);
+    }
+
     fn new(policy: LocalNetworkAccess) -> Self {
         let mut harness = Self::unstarted(policy);
         harness.observe(TunnelPhase::Disconnected);
@@ -3011,5 +3063,503 @@ async fn joined_internal_transport_retry_replaces_capture_without_a_tsm_handover
         "internal device retry invented a TSM handover"
     );
     assert_eq!(h.platform.releases.load(SeqCst), 1);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn forced_fifth_attempt_replaces_sink_without_replacing_local_session() {
+    use talpid_tunnel::tun_provider::{ConfigurationPurpose, transport::TransportMode};
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let physical = (tcp.local_addr().unwrap(), udp.local_addr().unwrap());
+    let tcp_task = tokio::spawn(async move {
+        let (mut stream, tuple) = tcp.accept().await.unwrap();
+        for n in 0..=5 {
+            let mut bytes = [0; 8];
+            stream.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(&bytes, format!("{n:08}").as_bytes());
+            assert_eq!(stream.peer_addr().unwrap(), tuple);
+            stream.write_all(&bytes).await.unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), tcp.accept())
+                .await
+                .is_err()
+        );
+    });
+    let udp_task = tokio::spawn(async move {
+        let mut tuple = None;
+        for n in 0..=5 {
+            let mut bytes = [0; 8];
+            let (len, source) = udp.recv_from(&mut bytes).await.unwrap();
+            assert_eq!(len, 8);
+            assert_eq!(&bytes, format!("{n:08}").as_bytes());
+            assert_eq!(*tuple.get_or_insert(source), source, "UDP socket replaced");
+            udp.send_to(&bytes, source).await.unwrap();
+        }
+    });
+    let mut h = Handover::unstarted_with_physical(policy(), physical);
+    h.observe(TunnelPhase::Disconnected);
+    h.connect_endpoint().await;
+    let broker = h.runtime.broker();
+    let session = broker.snapshot().session_generation;
+    let first_epoch = broker.snapshot().capture_generation;
+    let authority = h.platform.authority.lock().unwrap().clone().unwrap();
+    let tcp_flow = flow(Transport::Tcp, 45996);
+    let udp_flow = flow(Transport::Udp, 45997);
+    let grant = authority.authorize(tcp_flow).unwrap();
+    let peer = |h: &Handover| {
+        UnixDatagram::from_std(
+            h.platform
+                .peer
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .try_clone()
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    peer(&h)
+        .send(&tcp_packet(tcp_flow, 100, 0, 2, &[]))
+        .await
+        .unwrap();
+    let syn = capture_reply(&peer(&h)).await;
+    let mut ack = u32::from_be_bytes(syn[24..28].try_into().unwrap()).wrapping_add(1);
+    let mut sequence = 101;
+    for attempt in 0..=5 {
+        if attempt > 0 {
+            let old = h.transport.take().unwrap();
+            let old_request = h.request.take().unwrap();
+            let mut stale = old
+                .control
+                .capability()
+                .packet(
+                    talpid_types::relay_flow::RelayBuffer::copy_from(
+                        b"stale-fifth-writer",
+                        broker.application_buffers().as_ref(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            old.control.detach();
+            drop(old);
+            old_request.transport_joined();
+            if attempt == 5 {
+                let old_epoch = broker.snapshot().capture_generation.unwrap();
+                // The unchanged TSM fifth-attempt branch supplies forced=true;
+                // this invokes its actual provider/broker/actor operation.
+                let mut forced = TransportMode::selected(Some(&broker))
+                    .reconfigure::<talpid_tunnel::packet_attachment::AttachmentError>(
+                        assigned_config(),
+                        ConfigurationPurpose::ForcedRefresh,
+                        true,
+                        |_| panic!("Native refresh"),
+                    )
+                    .unwrap()
+                    .unwrap();
+                h.runtime
+                    .internal_update(&h.policy, h.target, h.phase)
+                    .await;
+                let refreshed = h.wait_for_capture_configuration(&mut forced).await;
+                assert_ne!(
+                    refreshed.generation(),
+                    old_epoch,
+                    "fifth retry reused equal-config fd"
+                );
+                assert!(
+                    broker.acquire(&refreshed).is_err(),
+                    "refresh is not a target"
+                );
+                h.wait_for_capture_release(old_epoch as i64).await;
+                drop(forced);
+            }
+            drop(old_request);
+            h.connect_endpoint().await;
+            assert!(matches!(
+                stale.write(|_| panic!("stale writer reached sink")),
+                talpid_types::relay_flow::RelayWriteOutcome::Stale
+            ));
+            if attempt < 5 {
+                assert_eq!(broker.snapshot().capture_generation, first_epoch);
+                assert_eq!(
+                    h.platform.starts.load(SeqCst),
+                    1,
+                    "nonforced equal retry rebuilt fd"
+                );
+            } else {
+                assert_eq!(h.platform.starts.load(SeqCst), 2);
+            }
+        }
+        assert_eq!(broker.snapshot().session_generation, session);
+        assert!(authority.current(&grant));
+        let capture = peer(&h);
+        let nonce = format!("{attempt:08}");
+        capture
+            .send(&tcp_packet(tcp_flow, sequence, ack, 0x18, nonce.as_bytes()))
+            .await
+            .unwrap();
+        let mut received = Vec::new();
+        while received.len() < 8 {
+            let bytes = capture_reply(&capture).await;
+            let payload = packet::parse(&bytes).unwrap().payload;
+            received.extend_from_slice(payload);
+            ack = ack.wrapping_add(payload.len() as u32);
+        }
+        assert_eq!(received, nonce.as_bytes());
+        sequence += 8;
+        capture
+            .send(&tcp_packet(tcp_flow, sequence, ack, 0x10, &[]))
+            .await
+            .unwrap();
+        capture
+            .send(&udp_packet(udp_flow, nonce.as_bytes()))
+            .await
+            .unwrap();
+        loop {
+            let bytes = capture_reply(&capture).await;
+            let parsed = packet::parse(&bytes).unwrap();
+            if parsed.flow.transport == Transport::Udp {
+                assert_eq!(parsed.payload, nonce.as_bytes());
+                break;
+            }
+        }
+    }
+    bounded(tcp_task).await.unwrap();
+    bounded(udp_task).await.unwrap();
+    h.close().await;
+}
+
+#[tokio::test]
+async fn mullvad_retry_does_not_require_local_feed_event() {
+    use talpid_tunnel::tun_provider::{ConfigurationPurpose, transport::TransportMode};
+    for lose_fd in [false, true] {
+        let mut h = Handover::new(policy());
+        h.connect_endpoint().await;
+        let broker = h.runtime.broker();
+        let old_epoch = h.platform.generation.load(SeqCst);
+        let old = h.transport.take().unwrap();
+        old.control.detach();
+        drop(old);
+        let old_request = h.request.take().unwrap();
+        old_request.transport_joined();
+        // Retain the daemon's deferred release while the next TSM state has
+        // not yet published. Reconfigure must acknowledge this exact identity,
+        // including after synchronous fd/network loss removed broker.capture.
+        h.observe(TunnelPhase::Disconnecting);
+        if lose_fd {
+            let expected = h.platform.expected.lock().unwrap().clone().unwrap();
+            assert!(h.platform.feed.publish(
+                h.platform.feed.registration(),
+                old_epoch,
+                CaptureNetworkObservation {
+                    network_handle: old_epoch << 32,
+                    network: format!("net-{old_epoch}"),
+                    interface_name: expected.interface_name,
+                    owner_uid: expected.owner_uid,
+                    routes: expected.routes,
+                    addresses: expected.addresses,
+                    dns_servers: expected.dns_servers,
+                    mtu: expected.mtu,
+                    fresh: false,
+                    lost: true,
+                    api_level: 33,
+                }
+            ));
+            assert!(!broker.snapshot().capture_ready);
+            bounded(h.runtime.notifications().1).await;
+            h.runtime.owner_changed(&h.policy, h.target, h.phase);
+        } else {
+            h.platform.retain_handover.store(true, SeqCst);
+        }
+        let mut failed_config = assigned_config();
+        failed_config.mtu = 1380;
+        failed_config.dns_servers = Some(vec!["192.0.2.1".parse().unwrap()]);
+        let mut first = TransportMode::selected(Some(&broker))
+            .reconfigure::<talpid_tunnel::packet_attachment::AttachmentError>(
+                failed_config,
+                ConfigurationPurpose::Blocking,
+                false,
+                |_| panic!("Native blocking"),
+            )
+            .unwrap()
+            .unwrap();
+        h.runtime
+            .internal_update(&h.policy, h.target, h.phase)
+            .await;
+        if !lose_fd {
+            bounded(h.runtime.notifications().1).await;
+            assert!(
+                bounded(first.configured()).await.is_err(),
+                "rolled-back operation stayed pending"
+            );
+            let starts = h.platform.starts.load(SeqCst);
+            for _ in 0..3 {
+                h.runtime
+                    .internal_update(&h.policy, h.target, h.phase)
+                    .await;
+            }
+            assert_eq!(
+                h.platform.starts.load(SeqCst),
+                starts,
+                "same failed operation repeated"
+            );
+            h.observe(TunnelPhase::Error);
+            for _ in 0..3 {
+                h.runtime.update(&h.policy, h.target, h.phase).await;
+                h.runtime
+                    .internal_update(&h.policy, h.target, h.phase)
+                    .await;
+                assert!(
+                    h.runtime.failed(),
+                    "an input cleared the failed operation latch"
+                );
+            }
+            assert_eq!(
+                h.platform.starts.load(SeqCst),
+                starts,
+                "Error retried a failed blocking operation"
+            );
+            h.platform.retain_handover.store(false, SeqCst);
+        } else {
+            h.wait_for_capture_configuration(&mut first).await;
+            assert!(
+                h.platform.descriptor_closed(old_epoch),
+                "weak cleanup identity failed to join predecessor"
+            );
+        }
+        first.cancel();
+        first.transport_joined();
+        // A new exact request wakes the daemon through broker notification only.
+        // No Local feed publish, settings update, or public TSM transition.
+        let projected = talpid_tunnel::tun_provider::transport::router_config(
+            &assigned_config(),
+            broker.local_routes(),
+        );
+        let mut next = broker
+            .request_target_capture(assigned_config(), projected)
+            .unwrap();
+        h.runtime
+            .internal_update(&h.policy, h.target, h.phase)
+            .await;
+        let receipt = h.wait_for_capture_configuration(&mut next).await;
+        let mut pair = broker.acquire(&receipt).unwrap();
+        pair.control.activate().unwrap();
+        let mut public = flow(Transport::Udp, 45998);
+        public.destination = "1.1.1.1:443".parse().unwrap();
+        let bytes = udp_packet(public, b"retry-without-local-event");
+        h.platform
+            .peer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .send(&bytes)
+            .unwrap();
+        bounded(pair.receive.recv())
+            .await
+            .unwrap()
+            .handoff(|actual| assert_eq!(actual, bytes))
+            .unwrap();
+        drop(old_request);
+        drop(first);
+        h.request = Some(next);
+        h.transport = Some(pair);
+        h.close().await;
+    }
+    error_local_routes_follow_current_safe_base().await;
+}
+
+async fn error_local_routes_follow_current_safe_base() {
+    use talpid_tunnel::tun_provider::{ConfigurationPurpose, transport::TransportMode};
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let physical = (tcp.local_addr().unwrap(), udp.local_addr().unwrap());
+    let tcp_task = tokio::spawn(async move {
+        let (mut stream, tuple) = tcp.accept().await.unwrap();
+        for stage in 0..4 {
+            let mut bytes = [0; 8];
+            stream.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(&bytes, format!("{stage:08}").as_bytes());
+            assert_eq!(stream.peer_addr().unwrap(), tuple);
+            stream.write_all(&bytes).await.unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), tcp.accept())
+                .await
+                .is_err(),
+            "Error route edit reopened TCP"
+        );
+    });
+    let udp_task = tokio::spawn(async move {
+        let mut tuple = None;
+        for expected in ["udp00000", "udp00001", "udp00002", "newroute", "udp00003"] {
+            let mut bytes = [0; 8];
+            let (len, source) = udp.recv_from(&mut bytes).await.unwrap();
+            assert_eq!(len, 8);
+            assert_eq!(&bytes, expected.as_bytes());
+            if expected != "newroute" {
+                assert_eq!(
+                    *tuple.get_or_insert(source),
+                    source,
+                    "Error route edit replaced eligible UDP socket"
+                );
+            }
+            udp.send_to(&bytes, source).await.unwrap();
+        }
+    });
+    let mut h = Handover::unstarted_with_physical(policy(), physical);
+    h.observe(TunnelPhase::Disconnected);
+    let mut target = assigned_config();
+    target.mtu = 1420;
+    target.dns_servers = Some(vec!["1.1.1.1".parse().unwrap()]);
+    h.connect_endpoint_with(target).await;
+    let broker = h.runtime.broker();
+    let session = broker.snapshot().session_generation;
+    let authority = h.platform.authority.lock().unwrap().clone().unwrap();
+    let tcp_flow = flow(Transport::Tcp, 45986);
+    let udp_flow = flow(Transport::Udp, 45987);
+    let grant = authority.authorize(tcp_flow).unwrap();
+    let peer = |h: &Handover| {
+        UnixDatagram::from_std(
+            h.platform
+                .peer
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .try_clone()
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    peer(&h)
+        .send(&tcp_packet(tcp_flow, 100, 0, 2, &[]))
+        .await
+        .unwrap();
+    let syn = capture_reply(&peer(&h)).await;
+    let mut ack = u32::from_be_bytes(syn[24..28].try_into().unwrap()).wrapping_add(1);
+    let mut sequence = 101;
+    for stage in 0..4 {
+        if stage == 1 {
+            let old = h.transport.take().unwrap();
+            old.control.detach();
+            drop(old);
+            let old = h.request.take().unwrap();
+            old.transport_joined();
+            h.observe(TunnelPhase::Disconnecting);
+            let mut safe = talpid_tunnel::tun_provider::blocking_config();
+            safe.allow_lan = true;
+            safe.excluded_packages = vec!["current.safe.exclusion".into()];
+            safe.dns_servers = Some(vec!["192.0.2.1".parse().unwrap()]);
+            let mut operation = TransportMode::selected(Some(&broker))
+                .reconfigure::<talpid_tunnel::packet_attachment::AttachmentError>(
+                    safe,
+                    ConfigurationPurpose::Blocking,
+                    false,
+                    |_| panic!("Native Error configuration"),
+                )
+                .unwrap()
+                .unwrap();
+            h.runtime
+                .internal_update(&h.policy, h.target, h.phase)
+                .await;
+            h.wait_for_capture_configuration(&mut operation).await;
+            h.request = Some(operation);
+            drop(old);
+            h.observe(TunnelPhase::Error);
+        } else if stage == 2 {
+            h.policy.rules[0].cidrs.push("10.0.2.3/32".parse().unwrap());
+        } else if stage == 3 {
+            h.policy.rules[0]
+                .cidrs
+                .retain(|prefix| prefix.to_string() != "10.0.2.3/32");
+        }
+        h.runtime.update(&h.policy, h.target, h.phase).await;
+        h.settle_capture().await;
+        assert_eq!(broker.snapshot().session_generation, session);
+        assert!(authority.current(&grant));
+        let actual = h.platform.opened.lock().unwrap().last().unwrap().clone();
+        if stage > 0 {
+            assert_eq!(h.phase, TunnelPhase::Error, "Local edit left Error");
+            assert_eq!(actual.mtu, 1380);
+            assert_eq!(actual.dns_servers, Some(vec!["192.0.2.1".parse().unwrap()]));
+            assert_eq!(actual.excluded_packages, vec!["current.safe.exclusion"]);
+            assert!(
+                !actual
+                    .routes
+                    .iter()
+                    .any(|r| r.contains("10.0.2.4".parse().unwrap())),
+                "Error reused cached target Allow LAN"
+            );
+            assert_eq!(
+                actual
+                    .routes
+                    .iter()
+                    .any(|r| r.contains("10.0.2.3".parse().unwrap())),
+                stage == 2,
+                "Error Local route addition/removal did not reach actual platform config"
+            );
+            assert!(
+                broker.pending_request().is_none(),
+                "Local edit manufactured a blocking receipt"
+            );
+            assert!(!broker.snapshot().ordinary_ready);
+        }
+        assert!(
+            actual
+                .routes
+                .iter()
+                .any(|r| r.contains("10.0.2.2".parse().unwrap()))
+        );
+        let capture = peer(&h);
+        let nonce = format!("{stage:08}");
+        capture
+            .send(&tcp_packet(tcp_flow, sequence, ack, 0x18, nonce.as_bytes()))
+            .await
+            .unwrap();
+        let mut received = Vec::new();
+        while received.len() < 8 {
+            let bytes = capture_reply(&capture).await;
+            let payload = packet::parse(&bytes).unwrap().payload;
+            received.extend_from_slice(payload);
+            ack = ack.wrapping_add(payload.len() as u32);
+        }
+        assert_eq!(received, nonce.as_bytes());
+        sequence += 8;
+        capture
+            .send(&tcp_packet(tcp_flow, sequence, ack, 0x10, &[]))
+            .await
+            .unwrap();
+        let udp_nonce = format!("udp{stage:05}");
+        capture
+            .send(&udp_packet(udp_flow, udp_nonce.as_bytes()))
+            .await
+            .unwrap();
+        loop {
+            let bytes = capture_reply(&capture).await;
+            let parsed = packet::parse(&bytes).unwrap();
+            if parsed.flow.transport == Transport::Udp {
+                assert_eq!(parsed.payload, udp_nonce.as_bytes());
+                break;
+            }
+        }
+        if stage == 2 {
+            let mut added = flow(Transport::Udp, 45988);
+            added.destination = "10.0.2.3:18080".parse().unwrap();
+            capture.send(&udp_packet(added, b"newroute")).await.unwrap();
+            assert_eq!(
+                packet::parse(&capture_reply(&capture).await)
+                    .unwrap()
+                    .payload,
+                b"newroute",
+                "new Error route did not deliver end-consumer nonce"
+            );
+        }
+        assert_eq!(h.platform.starts.load(SeqCst), stage + 1);
+    }
+    bounded(tcp_task).await.unwrap();
+    bounded(udp_task).await.unwrap();
     h.close().await;
 }

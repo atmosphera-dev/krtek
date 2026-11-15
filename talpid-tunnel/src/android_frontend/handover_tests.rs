@@ -6,26 +6,30 @@ use crate::{
 use std::{collections::BTreeMap, path::PathBuf, sync::atomic::AtomicI64};
 use talpid_types::capture_network::{CaptureNetworkObservation, CapturePrefix};
 
-struct EpochPlatform {
+pub(super) struct EpochPlatform {
     feed: Arc<CaptureNetworkFeed>,
-    expected: Mutex<BTreeMap<i64, CaptureExpectation>>,
-    descriptors: Mutex<BTreeMap<i64, (PathBuf, PathBuf)>>,
+    pub(super) expected: Mutex<BTreeMap<i64, CaptureExpectation>>,
+    pub(super) descriptors: Mutex<BTreeMap<i64, (PathBuf, PathBuf)>>,
     peers: mpsc::UnboundedSender<OwnedFd>,
     released: Mutex<Vec<i64>>,
     changed: tokio::sync::Notify,
-    pause: Mutex<Option<Arc<Pause>>>,
+    pub(super) pause: Mutex<Option<Arc<Pause>>>,
+    pub(super) open_pause: Mutex<Option<Arc<Pause>>>,
+    pub(super) applied: Mutex<Option<crate::tun_provider::AndroidTunConfig>>,
+    pub(super) cause: Mutex<Option<crate::tun_provider::ConfigurationError>>,
+    pub(super) establish_error: Mutex<Option<crate::tun_provider::ConfigurationError>>,
     close_pause: Mutex<Option<Arc<Pause>>>,
     finish_attempts: AtomicUsize,
     fail_before: AtomicBool,
     fail_after: AtomicBool,
     fail_release: AtomicI64,
     format_calls: AtomicUsize,
-    fault: Mutex<Option<&'static str>>,
+    pub(super) fault: Mutex<Option<&'static str>>,
     fill: AtomicBool,
     filled: Mutex<BTreeMap<i64, usize>>,
 }
 impl EpochPlatform {
-    fn new() -> (Arc<Self>, mpsc::UnboundedReceiver<OwnedFd>) {
+    pub(super) fn new() -> (Arc<Self>, mpsc::UnboundedReceiver<OwnedFd>) {
         let (peers, receiver) = mpsc::unbounded_channel();
         (
             Arc::new(Self {
@@ -36,6 +40,10 @@ impl EpochPlatform {
                 released: Mutex::new(Vec::new()),
                 changed: tokio::sync::Notify::new(),
                 pause: Mutex::new(None),
+                open_pause: Mutex::new(None),
+                applied: Mutex::new(None),
+                cause: Mutex::new(None),
+                establish_error: Mutex::new(None),
                 close_pause: Mutex::new(None),
                 finish_attempts: AtomicUsize::new(0),
                 fail_before: AtomicBool::new(false),
@@ -76,7 +84,7 @@ impl EpochPlatform {
                 api_level: expected.api_level,
             })
     }
-    async fn finished(&self, generation: i64) {
+    pub(super) async fn finished(&self, generation: i64) {
         bounded(async {
             loop {
                 let changed = self.changed.notified();
@@ -90,7 +98,11 @@ impl EpochPlatform {
     }
 }
 impl FrontendPlatform for EpochPlatform {
-    fn open(&self, generation: i64, _: &CaptureConfig) -> io::Result<OwnedFd> {
+    fn open(
+        &self,
+        generation: i64,
+        _: &CaptureConfig,
+    ) -> io::Result<crate::tun_provider::AppliedTun> {
         let (fd, peer) = pair();
         if self.fill.load(SeqCst) {
             socket2::SockRef::from(&fd).set_send_buffer_size(4096)?;
@@ -111,7 +123,17 @@ impl FrontendPlatform for EpochPlatform {
             .unwrap()
             .insert(generation, (path.clone(), std::fs::read_link(path)?));
         self.peers.send(peer).unwrap();
-        Ok(fd)
+        if let Some(pause) = self.open_pause.lock().unwrap().take() {
+            pause.enter();
+        }
+        if let Some(cause) = self.establish_error.lock().unwrap().clone() {
+            return Err(io::Error::other(cause));
+        }
+        Ok(crate::tun_provider::AppliedTun {
+            fd,
+            profile: self.applied.lock().unwrap().clone(),
+            cause: self.cause.lock().unwrap().clone(),
+        })
     }
     fn handover(
         &self,
@@ -513,15 +535,18 @@ async fn sink_mtu_changes_preserve_local_session_and_retire_only_stale_writes() 
             config.addresses.truncate(1);
             config.routes.retain(ipnetwork::IpNetwork::is_ipv4);
         }
-        let (next_request, next_config) = secured(&broker, config.clone());
+        let (mut next_request, next_config) = secured(&broker, config.clone());
         // A failed pre-establish observation cannot mutate current sink metadata
         // or retire the independent Local connection/socket.
         platform.fail_before.store(true, SeqCst);
         owner.handover(next_config.clone()).unwrap();
         assert!(bounded(owner.ready()).await.is_err());
+        assert!(bounded(next_request.configured()).await.is_err());
         assert!(old_receipt.current());
         app.nonce(&peer, b"after-mtu-rollback").await;
         platform.fail_before.store(false, SeqCst);
+        drop(next_request);
+        let (next_request, next_config) = secured(&broker, config);
         owner.handover(next_config).unwrap();
         bounded(owner.ready()).await.unwrap();
         peer = AsyncFd::new(bounded(peers.recv()).await.unwrap()).unwrap();
@@ -1170,15 +1195,7 @@ async fn successor_readiness_requires_its_exact_observation_after_reordered_mism
             },
             observed,
         );
-        if matches!(fault, "routes" | "source" | "dns" | "mtu") {
-            // A mismatched current configuration is loss, not a pending receipt
-            // which a later equal callback can resurrect.
-            assert!(bounded(owner.ready()).await.is_err(), "{fault}");
-            bounded(owner.stop()).await.unwrap();
-            assert!(request.configured().await.is_err());
-            assert!(!platform.publish(generation, false));
-            assert!(!broker.snapshot().capture_ready);
-        } else {
+        if !matches!(fault, "source" | "dns" | "mtu") {
             assert!(
                 tokio::time::timeout(Duration::from_millis(20), owner.ready())
                     .await
@@ -1188,29 +1205,31 @@ async fn successor_readiness_requires_its_exact_observation_after_reordered_mism
             assert!(!broker.snapshot().capture_ready);
             assert!(platform.released.lock().unwrap().is_empty());
             assert!(platform.publish(generation, false));
-            bounded(owner.ready()).await.unwrap();
-            let receipt = bounded(request.configured()).await.unwrap();
-            assert!(receipt.current());
-            let mut another_netid = expected;
-            another_netid.network_handle += 1;
-            assert!(!platform.feed.publish(117, generation, another_netid));
-            assert!(
-                receipt.current(),
-                "late different netId changed the pinned receipt"
-            );
-            let (udp_peer, mut hits, echo) = udp_echo(false).await;
-            let local = flow(udp_peer, Transport::Udp, 49301);
-            send(&peer, &udp(local, b"exact-successor-consumer")).await;
-            bounded(hits.recv()).await.unwrap();
-            assert_eq!(
-                packet::parse(&bounded(receive(&peer)).await)
-                    .unwrap()
-                    .payload,
-                b"exact-successor-consumer"
-            );
-            bounded(owner.stop()).await.unwrap();
-            echo.abort();
         }
+        // Incidental source/DNS/MTU reports do not own the fd's applied
+        // metadata. Missing initial routes can recover on this same epoch.
+        bounded(owner.ready()).await.unwrap();
+        let receipt = bounded(request.configured()).await.unwrap();
+        assert!(receipt.current());
+        let mut another_netid = expected;
+        another_netid.network_handle += 1;
+        assert!(!platform.feed.publish(117, generation, another_netid));
+        assert!(
+            receipt.current(),
+            "late different netId changed the pinned receipt"
+        );
+        let (udp_peer, mut hits, echo) = udp_echo(false).await;
+        let local = flow(udp_peer, Transport::Udp, 49301);
+        send(&peer, &udp(local, b"exact-successor-consumer")).await;
+        bounded(hits.recv()).await.unwrap();
+        assert_eq!(
+            packet::parse(&bounded(receive(&peer)).await)
+                .unwrap()
+                .payload,
+            b"exact-successor-consumer"
+        );
+        bounded(owner.stop()).await.unwrap();
+        echo.abort();
         assert_eq!(platform.released.lock().unwrap().len(), 2);
         drop(old_peer);
     }

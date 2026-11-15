@@ -151,7 +151,7 @@ async fn epoch_handover_retains_session_targets_and_exact_cleanup_without_reusin
     pair.send.try_send(b"retained-target-return").unwrap();
     let mut reply = lease.reply().await.unwrap();
     let (_, old_receipt) = match &*request.status.borrow() {
-        RequestStatus::Ready(receipt) => ((), receipt.clone()),
+        RequestStatus::Ready(outcome) => ((), outcome.receipt.clone()),
         _ => panic!("initial receipt missing"),
     };
     let (mut successor, pending) = f.request();
@@ -368,7 +368,7 @@ async fn cancelled_wait_retains_owner_and_stale_ack_cannot_satisfy_identical_new
     );
     assert!(matches!(
         request.configured().await,
-        Err(AttachmentError::Closed)
+        Err(ConfigurationError::Attachment(AttachmentError::Closed))
     ));
     lease.retire();
     assert!(
@@ -521,7 +521,7 @@ async fn reply_wait_remains_quiescent_without_a_target_then_accepts_only_its_suc
     );
     assert!(lease.capability().unwrap().current());
     let receipt = match &*request.status.borrow() {
-        RequestStatus::Ready(receipt) => receipt.clone(),
+        RequestStatus::Ready(outcome) => outcome.receipt.clone(),
         _ => panic!("configured request"),
     };
     let next = f.broker.acquire(&receipt).unwrap();
@@ -627,7 +627,9 @@ async fn absent_failed_closed_and_native_selections_never_fall_back_to_native_ca
     lease.retire();
     assert!(matches!(
         request.configured().await,
-        Err(AttachmentError::CaptureUnready)
+        Err(ConfigurationError::Attachment(
+            AttachmentError::CaptureUnready
+        ))
     ));
     assert_eq!(f.broker.snapshot().mode, AttachmentMode::ManagedRequired);
     assert!(!f.broker.snapshot().capture_ready);

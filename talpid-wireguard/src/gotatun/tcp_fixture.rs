@@ -65,6 +65,321 @@ fn tun_config(config: &Config) -> tun_provider::TunConfig {
     tun
 }
 
+#[tokio::test(start_paused = true)]
+async fn managed_route_timeout_preserves_upstream_recoverable_start_cause() {
+    use std::os::fd::{BorrowedFd, OwnedFd};
+    use std::sync::atomic::{AtomicI64, Ordering::SeqCst};
+    use talpid_lan_forwarder::{Disposition, Flow, Forwarder, LocalAuthority, Refused};
+    use talpid_tunnel::{
+        android_frontend::{
+            CaptureConfig, CaptureFormat, CaptureHandover, FrontendOwner, FrontendPlatform,
+        },
+        tun_provider::ConfigurationError,
+    };
+    use talpid_types::capture_network::{
+        CaptureExpectation, CaptureNetworkFeed, CaptureNetworkObservation, CapturePrefix,
+    };
+    struct NoLocal;
+    impl LocalAuthority for NoLocal {
+        type Grant = ();
+        fn disposition(&self, _: std::net::IpAddr) -> Disposition {
+            Disposition::Drop
+        }
+        fn authorize(&self, _: Flow) -> Result<(), Refused> {
+            Err(Refused::Denied)
+        }
+        fn prepare(&self, _: &socket2::Socket, _: &()) -> Result<(), Refused> {
+            panic!("Local not requested")
+        }
+        fn current(&self, _: &()) -> bool {
+            false
+        }
+        fn physical_destination(&self, _: &(), _: Flow) -> std::net::SocketAddr {
+            panic!("Local not requested")
+        }
+    }
+    struct Routes {
+        feed: Arc<CaptureNetworkFeed>,
+        expected: Mutex<Option<CaptureExpectation>>,
+        generation: AtomicI64,
+        bound: tokio::sync::Notify,
+        peers: Mutex<Vec<std::os::unix::net::UnixDatagram>>,
+    }
+    impl Routes {
+        fn publish(&self, ready: bool) {
+            self.report(ready, false);
+        }
+        fn report(&self, ready: bool, lost: bool) {
+            let e = self.expected.lock().unwrap().clone().unwrap();
+            let generation = self.generation.load(SeqCst);
+            let changed = self.feed.publish(
+                71,
+                generation,
+                CaptureNetworkObservation {
+                    network_handle: 99,
+                    network: "99".into(),
+                    interface_name: e.interface_name,
+                    owner_uid: e.owner_uid,
+                    routes: if ready { e.routes } else { vec![] },
+                    addresses: e.addresses,
+                    dns_servers: e.dns_servers,
+                    mtu: e.mtu,
+                    fresh: !lost,
+                    lost,
+                    api_level: 33,
+                },
+            );
+            assert_eq!(
+                changed, ready,
+                "an unchanged Pending report is accepted without publishing a change"
+            );
+        }
+    }
+    impl FrontendPlatform for Routes {
+        fn open(&self, _: i64, _: &CaptureConfig) -> io::Result<tun_provider::AppliedTun> {
+            let (fd, peer) = std::os::unix::net::UnixDatagram::pair()?;
+            fd.set_nonblocking(true)?;
+            self.peers.lock().unwrap().push(peer);
+            Ok(OwnedFd::from(fd).into())
+        }
+        fn handover(&self, _: i64, _: i64, _: &CaptureConfig) -> CaptureHandover {
+            panic!("new owner after timeout")
+        }
+        fn capture_format(&self, _: BorrowedFd<'_>) -> io::Result<CaptureFormat> {
+            CaptureFormat::from_flags(0x1001)
+        }
+        fn interface_name(&self, _: BorrowedFd<'_>) -> io::Result<String> {
+            Ok("tun-routes".into())
+        }
+        fn capture_feed(&self) -> Arc<CaptureNetworkFeed> {
+            self.feed.clone()
+        }
+        fn expectation(
+            &self,
+            config: &CaptureConfig,
+            name: String,
+        ) -> io::Result<CaptureExpectation> {
+            let c = config.secured_config().unwrap();
+            let e = CaptureExpectation::requested(
+                name,
+                1000,
+                33,
+                &c.addresses,
+                &c.routes
+                    .iter()
+                    .map(|r| CapturePrefix {
+                        address: r.network(),
+                        prefix_length: r.prefix().into(),
+                    })
+                    .collect::<Vec<_>>(),
+                c.dns_servers.as_deref().unwrap(),
+                c.mtu,
+            )
+            .unwrap();
+            *self.expected.lock().unwrap() = Some(e.clone());
+            Ok(e)
+        }
+        fn bind(&self, generation: i64, _: &str) -> io::Result<bool> {
+            self.generation.store(generation, SeqCst);
+            self.publish(false);
+            self.bound.notify_one();
+            Ok(true)
+        }
+        fn closed(&self, _: i64) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let platform = Arc::new(Routes {
+        feed: CaptureNetworkFeed::new(71),
+        expected: Mutex::new(None),
+        generation: 0.into(),
+        bound: tokio::sync::Notify::new(),
+        peers: Mutex::new(vec![]),
+    });
+    let (broker, root, control) = broker();
+    let config = config();
+    for case in [
+        "timeout",
+        "recover",
+        "lost-before-receipt",
+        "lost-after-receipt",
+    ] {
+        let began = tokio::time::Instant::now();
+        let target = tun_config(&config);
+        let capture_config = tun_provider::transport::router_config(&target, vec![]);
+        let request = broker
+            .request_target_capture(target.clone(), capture_config.clone())
+            .unwrap();
+        let mut pending = PendingManaged::new(tun_provider::transport::ManagedTun {
+            broker: broker.clone(),
+            config: target,
+            capture_config,
+            request,
+        });
+        let capture = CaptureConfig::Secured {
+            broker: broker.clone(),
+            request: broker.pending_request().unwrap(),
+            disposition: Arc::new(|_| {
+                talpid_tunnel::android_frontend::CaptureDisposition::Drop(
+                    talpid_tunnel::android_frontend::CaptureDropReason::NoTarget,
+                )
+            }),
+        };
+        let (_updates, updates) = tokio::sync::watch::channel(0);
+        let mut owner = FrontendOwner::start(
+            platform.clone(),
+            capture,
+            Forwarder::with_mtu(
+                Arc::new(NoLocal),
+                Arc::new(BufferBudget::new(30 * 1024 * 1024)),
+                config.mtu.into(),
+            )
+            .unwrap(),
+            updates,
+            broker.clone(),
+        )
+        .unwrap();
+        tokio::select! {
+            biased;
+            _ = platform.bound.notified() => {},
+            result = owner.ready() => panic!("frontend terminated before bind: {result:?}"),
+        }
+        // Poll both owners before moving the clock: platform acquisition has no
+        // separate 15/30s deadline, only the new-fd route wait's upstream 2s.
+        tokio::task::yield_now().await;
+        assert!(futures::FutureExt::now_or_never(pending.create(&config)).is_none());
+        tokio::time::advance(Duration::from_millis(1999)).await;
+        assert!(futures::FutureExt::now_or_never(pending.create(&config)).is_none());
+        if case != "timeout" {
+            platform.publish(true);
+            owner.ready().await.unwrap();
+            if case.starts_with("lost-") {
+                let revoke = || {
+                    platform.report(true, true);
+                    assert!(
+                        !broker.snapshot().capture_ready,
+                        "loss did not revoke synchronously"
+                    );
+                };
+                let result = if case == "lost-after-receipt" {
+                    let (release, held) = tokio::sync::oneshot::channel();
+                    pending.after_receipt = Some(held);
+                    let mut create = Box::pin(pending.create(&config));
+                    // Owner.ready already published the exact current receipt.
+                    // This poll consumes it and parks at the existing seam,
+                    // before broker.acquire and all control/device allocation.
+                    assert!(futures::FutureExt::now_or_never(create.as_mut()).is_none());
+                    assert!(broker.snapshot().capture_ready);
+                    assert!(broker.snapshot().attachment.is_none());
+                    assert_eq!(control.used(), 0);
+                    revoke();
+                    release.send(()).unwrap();
+                    create.await
+                } else {
+                    revoke();
+                    pending.create(&config).await
+                };
+                let error = match result {
+                    Err(error) => error,
+                    Ok(_) => panic!("lost fd acquired a transport"),
+                };
+                let TunnelError::RecoverableStartWireguardError(cause) =
+                    managed_configuration_error(error)
+                else {
+                    panic!("capture loss lost recoverable start classification")
+                };
+                assert!(matches!(
+                    cause.downcast_ref::<ConfigurationError>(),
+                    Some(ConfigurationError::Attachment(
+                        AttachmentError::CaptureUnready
+                    ))
+                ));
+                assert!(broker.snapshot().attachment.is_none());
+                assert!(!broker.snapshot().ordinary_ready);
+                assert_eq!(control.used(), 0);
+            } else {
+                let pair = pending.create(&config).await.unwrap();
+                pair.owner.stop().await;
+                drop(pair);
+            }
+        } else {
+            tokio::time::advance(Duration::from_millis(1)).await;
+            let error = match pending.create(&config).await {
+                Err(error) => error,
+                Ok(_) => panic!("missing routes acquired a device"),
+            };
+            assert!(matches!(
+                error
+                    .get_ref()
+                    .and_then(|e| e.downcast_ref::<ConfigurationError>()),
+                Some(ConfigurationError::RoutesTimedOut)
+            ));
+            let TunnelError::RecoverableStartWireguardError(cause) =
+                managed_configuration_error(error)
+            else {
+                panic!("route timeout lost recoverable classification")
+            };
+            assert!(matches!(
+                cause.downcast_ref::<ConfigurationError>(),
+                Some(ConfigurationError::RoutesTimedOut)
+            ));
+            assert!(owner.ready().await.is_err());
+            assert_eq!(began.elapsed(), Duration::from_secs(2));
+        }
+        owner.stop().await.unwrap();
+        drop(pending);
+        assert_eq!(control.used(), 0);
+    }
+    let dns = vec!["1.1.1.1".parse().unwrap()];
+    for cause in [
+        ConfigurationError::InvalidDnsServers(dns.clone()),
+        ConfigurationError::NotPrepared,
+        ConfigurationError::OtherLegacyAlwaysOnVpn,
+        ConfigurationError::OtherAlwaysOnApp {
+            app_name: "other.vpn".into(),
+        },
+    ] {
+        let expected = cause.to_string();
+        let TunnelError::ManagedConfiguration(actual) =
+            managed_configuration_error(io::Error::other(cause))
+        else {
+            panic!("known cause erased")
+        };
+        assert_eq!(actual.to_string(), expected);
+    }
+    let TunnelError::ManagedConfiguration(ConfigurationError::InvalidDnsServers(actual)) =
+        managed_configuration_error(io::Error::other(ConfigurationError::InvalidDnsServers(
+            dns.clone(),
+        )))
+    else {
+        panic!("TSM lost actionable DNS cause")
+    };
+    assert_eq!(actual, dns);
+    for attachment in [
+        AttachmentError::Disabled,
+        AttachmentError::CaptureUnready,
+        AttachmentError::OrdinaryUnready,
+        AttachmentError::Stale,
+        AttachmentError::Full,
+        AttachmentError::Closed,
+        AttachmentError::Busy,
+        AttachmentError::Invalid,
+    ] {
+        assert!(
+            matches!(ConfigurationError::from(io::Error::other(attachment)), ConfigurationError::Attachment(actual) if actual == attachment)
+        );
+        assert!(
+            matches!(ConfigurationError::from(io::Error::other(ConfigurationError::from(attachment))), ConfigurationError::Attachment(actual) if actual == attachment)
+        );
+    }
+    drop((broker, control));
+    assert_eq!(
+        root.used(),
+        0,
+        "configuration/acquisition failure retained a region owner"
+    );
+}
+
 fn fixed_config(config: &Config) -> tun_provider::TunConfig {
     let mut tun = tun_config(config);
     tun.addresses = vec![

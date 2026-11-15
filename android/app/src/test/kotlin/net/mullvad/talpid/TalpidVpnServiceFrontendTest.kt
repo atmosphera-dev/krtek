@@ -6,6 +6,7 @@ import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import arrow.core.left
 import arrow.core.right
 import io.mockk.every
 import io.mockk.mockk
@@ -91,6 +92,201 @@ class TalpidVpnServiceFrontendTest {
         every { anyConstructed<NetworkRequest.Builder>().removeCapability(any()) } returns request
         every { request.addTransportType(any()) } returns request
         every { request.build() } returns mockk()
+    }
+
+    @Test
+    fun `should return typed errors with the established fallback descriptor`() {
+        enableCaptureObservation()
+        val base =
+            TalpidVpnServiceFallbackDnsTest.baseTunConfig.copy(
+                dnsServers = arrayListOf(InetAddress.getByName("1.1.1.1"))
+            )
+        for ((index, ipv6) in listOf(false, true).withIndex()) {
+            every { anyConstructed<VpnService.Builder>().addDnsServer(any<InetAddress>()) } throws
+                IllegalArgumentException("invalid DNS")
+            val config =
+                if (ipv6) base.copy(dnsServers = arrayListOf(InetAddress.getByName("::1")))
+                else base
+            val generation = 700L + index
+            val result = service.openSecuredFrontend(generation, config)
+            assertTrue(result.isOpen)
+            if (ipv6) {
+                assertTrue(result is CreateTunResult.InvalidIpv6Config)
+                assertEquals(config.addresses, result.addresses)
+                assertEquals(7, result.tunFd)
+            } else {
+                assertTrue(result is CreateTunResult.InvalidDnsServers)
+                assertEquals(config.dnsServers, result.addresses)
+                assertEquals(7, result.tunFd)
+            }
+            val applied =
+                result.javaClass.getMethod("getAppliedConfig").invoke(result)
+                    as net.mullvad.talpid.model.TunConfig
+            assertEquals(
+                listOf(InetAddress.getByName(TalpidVpnService.FALLBACK_DUMMY_DNS_SERVER)),
+                applied.dnsServers,
+            )
+            if (ipv6) {
+                assertEquals(1280, applied.mtu)
+                assertEquals(
+                    setOf(
+                        InetAddress.getByName("172.27.1.1"),
+                        InetAddress.getByName("fdf0:ce4a:801d::172:27:1:1"),
+                    ),
+                    applied.addresses.toSet(),
+                )
+                assertEquals(setOf(0), applied.routes.map { it.prefixLength.toInt() }.toSet())
+            } else {
+                assertEquals(config.addresses, applied.addresses)
+                assertEquals(config.mtu, applied.mtu)
+            }
+            // Revocation must not lose a descriptor-bearing error's exact owner.
+            service.onRevoke()
+            assertTrue(service.isLocalFrontendActive())
+            service.finishLocalFrontend(generation)
+            assertFalse(service.isLocalFrontendActive())
+        }
+        verify(exactly = 2) { anyConstructed<VpnService.Builder>().establish() }
+        for ((index, error) in
+            listOf(
+                    net.mullvad.mullvadvpn.lib.model.PrepareError.NotPrepared(mockk()) to
+                        CreateTunResult.NotPrepared,
+                    net.mullvad.mullvadvpn.lib.model.PrepareError.OtherLegacyAlwaysOnVpn to
+                        CreateTunResult.OtherLegacyAlwaysOnVpn,
+                    net.mullvad.mullvadvpn.lib.model.PrepareError.OtherAlwaysOnApp("other") to
+                        CreateTunResult.OtherAlwaysOnApp("other"),
+                )
+                .withIndex()) {
+            every { service.prepareVpnSafe() } returns error.first.left()
+            assertEquals(error.second, service.openSecuredFrontend(710L + index, base))
+            assertFalse(service.isLocalFrontendActive())
+        }
+        every { service.prepareVpnSafe() } returns Prepared.right()
+        every { anyConstructed<VpnService.Builder>().establish() } returns null
+        assertEquals(CreateTunResult.EstablishError, service.openSecuredFrontend(720, base))
+        assertFalse(service.isLocalFrontendActive())
+    }
+
+    @Test
+    fun `should apply current safe blocking configuration and report failure`() {
+        enableCaptureObservation()
+        val dummy = InetAddress.getByName(TalpidVpnService.FALLBACK_DUMMY_DNS_SERVER)
+        val safe =
+            TalpidVpnServiceFallbackDnsTest.baseTunConfig.copy(
+                addresses =
+                    arrayListOf(
+                        InetAddress.getByName("172.27.1.1"),
+                        InetAddress.getByName("fdf0:ce4a:801d::172:27:1:1"),
+                    ),
+                routes =
+                    arrayListOf(
+                        net.mullvad.talpid.model.InetNetwork(InetAddress.getByName("0.0.0.0"), 0),
+                        net.mullvad.talpid.model.InetNetwork(InetAddress.getByName("::"), 0),
+                    ),
+                dnsServers = arrayListOf(dummy),
+                mtu = 1380,
+                excludedPackages = arrayListOf("current.excluded"),
+            )
+        assertEquals(CreateTunResult.Success(7), service.openSecuredFrontend(730, safe))
+        val next = safe.copy(excludedPackages = arrayListOf("new.excluded"))
+        assertEquals(
+            CreateTunResult.Success(7),
+            service.handoverSecuredFrontend(730, 731, next).result,
+        )
+        service.finishLocalFrontend(730)
+        every { anyConstructed<VpnService.Builder>().establish() } returns null
+        val failed = service.handoverSecuredFrontend(731, 732, safe)
+        assertEquals(CreateTunResult.EstablishError, failed.result)
+        assertFalse(failed.predecessorRetained)
+        service.finishLocalFrontend(731)
+        service.finishLocalFrontend(732)
+        verify(exactly = 3) { anyConstructed<VpnService.Builder>().setMtu(1380) }
+        verify(exactly = 3) { anyConstructed<VpnService.Builder>().addDnsServer(dummy) }
+        verify(exactly = 1) {
+            anyConstructed<VpnService.Builder>().addDisallowedApplication("new.excluded")
+        }
+        assertFalse(service.isLocalFrontendActive())
+    }
+
+    @Test
+    fun `should invalidate default network cache on managed establish and close`() {
+        enableCaptureObservation()
+        val listener = ConnectivityListener(mockk(), mockk())
+        every { service getProperty "connectivityListener" } returns listener
+        @Suppress("UNCHECKED_CAST")
+        val state =
+            ConnectivityListener::class
+                .java
+                .getDeclaredField("_mutableNetworkState")
+                .apply {
+                    isAccessible = true
+                }
+                .get(listener)
+                as kotlinx.coroutines.flow.MutableStateFlow<net.mullvad.talpid.model.NetworkState?>
+        fun stale() {
+            state.value =
+                net.mullvad.talpid.model.NetworkState(
+                    123,
+                    arrayListOf<net.mullvad.talpid.model.RouteInfo>(),
+                    arrayListOf(InetAddress.getByName("10.0.2.53")),
+                )
+            assertEquals(1, listener.currentDnsServers.size)
+        }
+        stale()
+        val config =
+            TalpidVpnServiceFallbackDnsTest.baseTunConfig.copy(
+                dnsServers = arrayListOf(InetAddress.getByName("1.1.1.1"))
+            )
+        service.openSecuredFrontend(740, config)
+        assertEquals(null, listener.currentDefaultNetworkState)
+        assertTrue(listener.currentDnsServers.isEmpty())
+        stale()
+        service.finishLocalFrontend(740)
+        assertEquals(null, listener.currentDefaultNetworkState)
+        assertTrue(listener.currentDnsServers.isEmpty())
+        stale()
+        service.openLocalFrontend(741, arrayOf("10.0.2.2/32"))
+        assertEquals(null, listener.currentDefaultNetworkState)
+        stale()
+        service.finishLocalFrontend(741)
+        assertEquals(null, listener.currentDefaultNetworkState)
+    }
+
+    @Test
+    fun `should preserve empty DNS fallback and DNS specific recovery inputs`() {
+        enableCaptureObservation()
+        val base = TalpidVpnServiceFallbackDnsTest.baseTunConfig.copy(dnsServers = arrayListOf())
+        assertTrue(service.openSecuredFrontend(750, base).isOpen)
+        verify(exactly = 1) {
+            anyConstructed<VpnService.Builder>()
+                .addDnsServer(TalpidVpnService.FALLBACK_DUMMY_DNS_SERVER)
+        }
+        val bad = InetAddress.getByName("1.1.1.1")
+        every { anyConstructed<VpnService.Builder>().addDnsServer(bad) } throws
+            IllegalArgumentException("DNS rejected")
+        val rejected =
+            service
+                .handoverSecuredFrontend(750, 751, base.copy(dnsServers = arrayListOf(bad)))
+                .result
+        assertTrue(rejected is CreateTunResult.InvalidDnsServers)
+        assertEquals(arrayListOf(bad), rejected.addresses)
+        service.finishLocalFrontend(750)
+        every { anyConstructed<VpnService.Builder>().addDnsServer(bad) } returns
+            mockk(relaxed = true)
+        assertEquals(
+            CreateTunResult.Success(7),
+            service
+                .handoverSecuredFrontend(751, 752, base.copy(dnsServers = arrayListOf(bad)))
+                .result,
+        )
+        service.finishLocalFrontend(751)
+        service.finishLocalFrontend(752)
+        service.openLocalFrontend(753, arrayOf("10.0.2.2/32"))
+        verify(exactly = 2) {
+            anyConstructed<VpnService.Builder>()
+                .addDnsServer(TalpidVpnService.FALLBACK_DUMMY_DNS_SERVER)
+        }
+        service.finishLocalFrontend(753)
     }
 
     @Test

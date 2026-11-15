@@ -12,13 +12,14 @@ use talpid_types::{
 };
 use tokio::sync::{oneshot, watch};
 
-pub(super) fn failure(error: impl std::fmt::Debug) -> io::Error {
-    io::Error::other(format!("{error:?}"))
+pub(super) fn failure(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
+    io::Error::other(error)
 }
 
 /// Epoch-only observation. The owner retains the logical lease across drops of
 /// these records; an old observer can invalidate only its own feed generation.
 pub(super) struct Observation {
+    pub cause: Option<crate::tun_provider::ConfigurationError>,
     pub generation: i64,
     feed: Option<Arc<CaptureNetworkFeed>>,
     pub updates: Option<watch::Receiver<CaptureNetworkState>>,
@@ -49,16 +50,22 @@ impl Observation {
         let updates = match predecessor.and_then(|old| old.feed.as_ref().map(|feed| (old, feed))) {
             Some((old, feed)) => feed
                 .begin_handover(old.generation, managed.then_some(generation))
-                .ok_or_else(|| io::Error::other("Capture observation handover unavailable"))?,
+                .ok_or_else(|| {
+                    io::Error::other(
+                        crate::tun_provider::ConfigurationError::ObservationUnavailable,
+                    )
+                })?,
             None => match &feed {
-                Some(feed) => Some(
-                    feed.begin(generation)
-                        .ok_or_else(|| io::Error::other("Capture observation unavailable"))?,
-                ),
+                Some(feed) => Some(feed.begin(generation).ok_or_else(|| {
+                    io::Error::other(
+                        crate::tun_provider::ConfigurationError::ObservationUnavailable,
+                    )
+                })?),
                 None => None,
             },
         };
         Ok(Self {
+            cause: None,
             generation,
             feed,
             updates,
@@ -82,10 +89,30 @@ impl Observation {
         fd: BorrowedFd<'_>,
         format: CaptureFormat,
     ) -> io::Result<()> {
+        if config.sources().ipv6.is_some() && config.mtu() < crate::MIN_IPV6_MTU {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Applied IPv6 capture MTU below minimum",
+            ));
+        }
+        self.sources = config.sources();
+        self.mtu = config.mtu();
+        if let Some(profile) = config.secured_config() {
+            self.lease
+                .applied_profile(self.generation as u64, profile.clone())
+                .map_err(failure)?;
+        }
         self.format = Some(format);
         self.interface = platform.interface_name(fd)?;
         if let Some(feed) = &self.feed {
-            let expected = platform.expectation(config, self.interface.clone())?;
+            let observation_failure = |error| {
+                io::Error::other(crate::tun_provider::ConfigurationError::Observation(
+                    Arc::new(error),
+                ))
+            };
+            let expected = platform
+                .expectation(config, self.interface.clone())
+                .map_err(observation_failure)?;
             if expected.addresses.len()
                 != usize::from(self.sources.ipv4.is_some())
                     + usize::from(self.sources.ipv6.is_some())
@@ -94,9 +121,13 @@ impl Observation {
                     .iter()
                     .any(|p| !self.sources.contains(p.address))
                 || !feed.bind(self.generation, expected.clone())
-                || !platform.bind(self.generation, &self.interface)?
+                || !platform
+                    .bind(self.generation, &self.interface)
+                    .map_err(observation_failure)?
             {
-                return Err(io::Error::other("Capture interface binding failed"));
+                return Err(io::Error::other(
+                    crate::tun_provider::ConfigurationError::ObservationUnavailable,
+                ));
             }
             self.requested_routes = expected.routes;
         }
@@ -116,7 +147,7 @@ impl Observation {
                 let snapshot = *broker_updates.borrow();
                 if snapshot.closed || snapshot.capture_generation != Some(self.generation as u64) {
                     return Err(io::Error::other(
-                        "Capture epoch retired before acknowledgement",
+                        crate::tun_provider::ConfigurationError::ObservationUnavailable,
                     ));
                 }
                 // A target's cancellation is not loss of this owned, exact
@@ -130,19 +161,21 @@ impl Observation {
                         return self.acknowledge(config, change);
                     }
                     Some(CaptureNetworkState::Lost) => {
-                        return Err(io::Error::other("Capture observation lost"));
+                        return Err(io::Error::other(
+                            crate::tun_provider::ConfigurationError::ObservationUnavailable,
+                        ));
                     }
                     Some(CaptureNetworkState::Pending) => {}
                 }
                 tokio::select! {
-                    result = async { updates.as_mut().expect("managed updates").changed().await } => result.map_err(io::Error::other)?,
+                    result = async { updates.as_mut().expect("managed updates").changed().await } => result.map_err(|error| io::Error::other(crate::tun_provider::ConfigurationError::Observation(Arc::new(io::Error::other(error)))))?,
                     _ = broker_updates.changed() => {},
                 }
             }
         };
         tokio::select! {
             _ = stop => Err(io::ErrorKind::Interrupted.into()),
-            result = tokio::time::timeout(Duration::from_secs(15), wait) => result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Capture observation timed out"))?,
+            result = tokio::time::timeout(Duration::from_secs(2), wait) => result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, crate::tun_provider::ConfigurationError::RoutesTimedOut))?,
         }
     }
 
@@ -169,7 +202,7 @@ impl Observation {
             } = config
             {
                 broker
-                    .acknowledge_current_capture_request(request, &receipt)
+                    .complete_capture_request(request, &receipt, self.cause.clone())
                     .map_err(failure)?;
             }
             *self.sink.lock().expect("capture sink") =

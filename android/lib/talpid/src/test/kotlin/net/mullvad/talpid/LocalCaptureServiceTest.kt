@@ -367,21 +367,60 @@ class LocalCaptureServiceTest {
     }
 
     @Test
-    fun `should refuse inexact secured configuration before establishment`() {
-        for (invalid in
+    fun `should preserve full configuration fallback and Builder validation`() {
+        every { anyConstructed<VpnService.Builder>().setMtu(match { it <= 0 }) } throws
+            IllegalArgumentException("platform MTU validation")
+        every { anyConstructed<VpnService.Builder>().addRoute(any<String>(), 0) } returns
+            mockk(relaxed = true)
+        every {
+            anyConstructed<VpnService.Builder>()
+                .addDnsServer(TalpidVpnService.FALLBACK_DUMMY_DNS_SERVER)
+        } returns mockk(relaxed = true)
+        for ((index, invalid) in
             listOf(
-                config.copy(addresses = arrayListOf()),
-                config.copy(addresses = arrayListOf(ip("0.0.0.0"))),
-                config.copy(routes = arrayListOf()),
-                config.copy(dnsServers = arrayListOf()),
-                config.copy(mtu = 0),
-                config.copy(mtu = -1),
-                config.copy(addresses = arrayListOf(ip("10.64.0.2"))),
-            )) {
-            assertEquals(CreateTunResult.EstablishError, service.openSecuredFrontend(11, invalid))
+                    config.copy(addresses = arrayListOf()),
+                    config.copy(addresses = arrayListOf(ip("0.0.0.0"))),
+                    config.copy(routes = arrayListOf()),
+                    config.copy(dnsServers = arrayListOf()),
+                    config.copy(mtu = 0),
+                    config.copy(mtu = -1),
+                    config.copy(addresses = arrayListOf(ip("10.64.0.2"))),
+                )
+                .withIndex()) {
+            val generation = 100L + index
+            val result = service.openSecuredFrontend(generation, invalid)
+            when (index) {
+                4,
+                5 -> assertEquals(CreateTunResult.EstablishError, result)
+                3 -> {
+                    assertTrue(result is CreateTunResult.Success && result.isOpen)
+                    assertEquals(7, result.tunFd)
+                    val applied = checkNotNull(result.appliedConfig)
+                    assertEquals(
+                        listOf(ip(TalpidVpnService.FALLBACK_DUMMY_DNS_SERVER)),
+                        applied.dnsServers,
+                    )
+                    assertTrue(service.isLocalFrontendActive())
+                }
+                else -> {
+                    assertTrue(result is CreateTunResult.InvalidIpv6Config && result.isOpen)
+                    assertEquals(7, result.tunFd)
+                    assertEquals(invalid.addresses, result.addresses)
+                    assertEquals(1280, result.appliedConfig?.mtu)
+                    assertEquals(
+                        setOf(ip("172.27.1.1"), ip("fdf0:ce4a:801d::172:27:1:1")),
+                        result.appliedConfig?.addresses?.toSet(),
+                    )
+                    assertEquals(invalid.excludedPackages, result.appliedConfig?.excludedPackages)
+                    assertTrue(service.isLocalFrontendActive())
+                }
+            }
+            service.finishLocalFrontend(generation)
             assertFalse(service.isLocalFrontendActive())
         }
-        verify(exactly = 0) { anyConstructed<VpnService.Builder>().establish() }
+        verify(exactly = 5) { anyConstructed<VpnService.Builder>().establish() }
+        verify(exactly = 5) { descriptor.close() }
+        verify(exactly = 0) { descriptor.detachFd() }
     }
 
     @Test

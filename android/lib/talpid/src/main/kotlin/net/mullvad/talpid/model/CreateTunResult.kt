@@ -6,7 +6,7 @@ import java.util.ArrayList
 sealed interface CreateTunResult {
     val isOpen: Boolean
 
-    data class Success(val tunFd: Int) : CreateTunResult {
+    data class Success(val tunFd: Int, val appliedConfig: TunConfig? = null) : CreateTunResult {
         override val isOpen = true
     }
 
@@ -30,8 +30,16 @@ sealed interface CreateTunResult {
         override val isOpen: Boolean = false
     }
 
-    data class InvalidDnsServers(val addresses: ArrayList<InetAddress>, val tunFd: Int) : Error {
-        constructor(addresses: List<InetAddress>, tunFd: Int) : this(ArrayList(addresses), tunFd)
+    data class InvalidDnsServers(
+        val addresses: ArrayList<InetAddress>,
+        val tunFd: Int,
+        val appliedConfig: TunConfig? = null,
+    ) : Error {
+        constructor(
+            addresses: List<InetAddress>,
+            tunFd: Int,
+            appliedConfig: TunConfig? = null,
+        ) : this(ArrayList(addresses), tunFd, appliedConfig)
 
         override val isOpen = true
     }
@@ -41,17 +49,20 @@ sealed interface CreateTunResult {
         val routes: ArrayList<InetNetwork>,
         val dnsServers: ArrayList<InetAddress>,
         val tunFd: Int,
+        val appliedConfig: TunConfig? = null,
     ) : Error {
         constructor(
             addresses: List<InetAddress>,
             routes: List<InetNetwork>,
             dnsServers: List<InetAddress>,
             tunFd: Int,
+            appliedConfig: TunConfig? = null,
         ) : this(
             addresses = ArrayList(addresses),
             routes = ArrayList(routes),
             dnsServers = ArrayList(dnsServers),
             tunFd = tunFd,
+            appliedConfig = appliedConfig,
         )
 
         override val isOpen = true

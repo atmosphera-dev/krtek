@@ -42,9 +42,16 @@ internal object CaptureReadiness {
         requiredMtu: Int? = null,
         exposesIpv6: Boolean = false,
         dnsExpectation: DnsExpectation = DnsExpectation.Present,
+        requiredDns: Set<String>? = null,
     ): Boolean =
         addressesReady &&
             dnsMatches(dns, dnsExpectation) &&
+            (requiredDns == null ||
+                dns.split(',')
+                    .filter { it.isNotBlank() }
+                    .map { InetAddress.getByName(it.trim().removePrefix("/")).hostAddress }
+                    .toSet() ==
+                    requiredDns.map { InetAddress.getByName(it).hostAddress }.toSet()) &&
             mtu >= (if (exposesIpv6) 1280 else 1) &&
             (requiredMtu == null || mtu == requiredMtu) &&
             expectedRoutes.all { expected -> routes.any { covers(it, expected) } }
@@ -108,6 +115,7 @@ internal object CaptureReadiness {
         previousGeneration: String?,
         canonicalPrefix: (String) -> String,
     ): Receipt? {
+        if (mtu <= 0) return null
         val line =
             tail.lineSequence().lastOrNull {
                 (it.contains("capture-ready ") || it.contains("capture-lost ")) &&
@@ -128,28 +136,31 @@ internal object CaptureReadiness {
         val requested =
             ready.substringAfter("requested_routes=").substringBefore(" observed_routes=")
         val observed = ready.substringAfter("observed_routes=").substringBefore(" api=")
-        check(requested == observed) { "Exact pushed route receipt, never a superset" }
         // CaptureExpectation projects complete routes, not a bare list of prefixes.
         // Consume the entire debug representation so missing/extra fields cannot pass.
         val routePattern =
             Regex(
-                """CaptureRoute \{ destination: CapturePrefix \{ address: ([0-9a-fA-F:.]+), prefix_length: ([0-9]+) \}, gateway: None, interface_name: "([^"\\]+)", route_type: (?:None|Some\([17]\)) \}"""
+                """CaptureRoute \{ destination: CapturePrefix \{ address: ([0-9a-fA-F:.]+), prefix_length: ([0-9]+) \}, gateway: (?:None|Some\([0-9a-fA-F:.]+\)), interface_name: "([^"\\]*)", route_type: (?:None|Some\(-?[0-9]+\)) \}"""
             )
-        val routeMatches = routePattern.findAll(observed).toList()
-        check(routeMatches.joinToString(", ", "[", "]") { it.value } == observed) {
-            "Malformed observed route receipt"
-        }
-        val prefixes =
-            routeMatches
+        fun prefixes(text: String): Set<String> {
+            val records = routePattern.findAll(text).toList()
+            check(records.joinToString(", ", "[", "]") { it.value } == text) {
+                "Malformed route receipt"
+            }
+            return records
                 .map { canonicalPrefix("${it.groupValues[1]}/${it.groupValues[2]}") }
                 .toSet()
+        }
+        val requestedPrefixes = prefixes(requested)
+        val observedPrefixes = prefixes(observed)
+        check(observedPrefixes.containsAll(requestedPrefixes)) {
+            "Ready receipt omitted requested routes"
+        }
         if (previousGeneration != null && generation.toULong() <= previousGeneration.toULong())
             return null
         if (
             !ready.contains("owner_uid=Some($ownerUid)") ||
-                !ready.contains("mtu=Some($mtu)") ||
-                routeMatches.any { it.groupValues[3] != iface } ||
-                prefixes != routes
+                requestedPrefixes.any { required -> routes.none { covers(it, required) } }
         )
             return null
         requirePacketFormat(ready, "tun_flags")

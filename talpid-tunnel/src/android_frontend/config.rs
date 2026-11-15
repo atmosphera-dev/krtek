@@ -35,6 +35,25 @@ pub enum CaptureConfig {
 }
 
 impl CaptureConfig {
+    pub(super) fn applied(&self, profile: crate::tun_provider::AndroidTunConfig) -> Self {
+        let mut config = self.secured_config().expect("full applied profile").clone();
+        config.addresses = profile.addresses;
+        config.routes = profile.routes;
+        config.dns_servers = Some(profile.dns_servers);
+        config.excluded_packages = profile.excluded_packages;
+        config.mtu = profile.mtu;
+        config.allow_lan = false;
+        let disposition = match self {
+            Self::Router { disposition, .. } | Self::Secured { disposition, .. } => {
+                disposition.clone()
+            }
+            Self::Partial(_) => unreachable!(),
+        };
+        Self::Router {
+            config,
+            disposition,
+        }
+    }
     pub fn sources(&self) -> RelaySources {
         match self.secured_config() {
             Some(config) => RelaySources {

@@ -747,8 +747,27 @@ impl SharedTunnelStateValues {
     pub fn restart_tunnel(&self, blocking: bool) -> Result<(), talpid_tunnel::tun_provider::Error> {
         self.prepare_tun_config(blocking);
 
-        match self.tun_provider.lock().unwrap().reconfigure_tun(false) {
-            Ok(_tun) => Ok(()),
+        self.reconfigure_tunnel(false)
+    }
+
+    /// The TSM thread awaits owned platform work without holding the provider
+    /// lock. The daemon actor stays free to service the broker request.
+    #[cfg(target_os = "android")]
+    pub fn reconfigure_tunnel(
+        &self,
+        forced: bool,
+    ) -> Result<(), talpid_tunnel::tun_provider::Error> {
+        let operation = self.tun_provider.lock().unwrap().reconfigure_tun(forced);
+        let result = operation.and_then(|request| match request {
+            None => Ok(()),
+            Some(mut request) => self
+                .runtime
+                .block_on(request.configured())
+                .map(|_| ())
+                .map_err(Into::into),
+        });
+        match result {
+            Ok(()) => Ok(()),
             Err(error) => {
                 log::error!(
                     "{}",

@@ -76,7 +76,7 @@ impl PendingManaged {
     pub(super) fn request(broker: AttachmentBroker, config: TunConfig) -> io::Result<Self> {
         talpid_tunnel::tun_provider::transport::ManagedTun::request(broker, config)
             .map(Self::new)
-            .map_err(|_| unavailable())
+            .map_err(io::Error::other)
     }
 
     /// Retry uses a fresh configuration request, receipt and sole receiver.
@@ -98,21 +98,23 @@ impl PendingManaged {
             self.request = Some(
                 self.broker
                     .request_target_capture(self.config.clone(), self.capture_config.clone())
-                    .map_err(|_| unavailable())?,
+                    .map_err(io::Error::other)?,
             );
         }
-        let receipt = tokio::time::timeout(
-            Duration::from_secs(30),
-            self.request.as_mut().expect("request owner").configured(),
-        )
-        .await
-        .map_err(|_| unavailable())?
-        .map_err(|_| unavailable())?;
+        // Platform acquisition is owned/joined, not an independent admission
+        // deadline. The fd owner's new-route wait has upstream's2s boundary.
+        let receipt = self
+            .request
+            .as_mut()
+            .expect("request owner")
+            .configured()
+            .await
+            .map_err(io::Error::other)?;
         #[cfg(test)]
         if let Some(resume) = self.after_receipt.take() {
             resume.await.map_err(|_| unavailable())?;
         }
-        let pair = self.broker.acquire(&receipt).map_err(|_| unavailable())?;
+        let pair = self.broker.acquire(&receipt).map_err(io::Error::other)?;
         let source = config.tunnel_ipv4().ok_or_else(unavailable)?;
         let identity = pair.control.capability();
         if identity.sources().ipv4 != Some(source)

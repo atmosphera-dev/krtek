@@ -147,7 +147,7 @@ class CaptureReadinessTest {
     @Test
     fun staleConfigurationReceiptsAreNotReady() {
         assertNull(sample(ready().replace("owner_uid=Some(10181)", "owner_uid=Some(10180)")))
-        assertNull(sample(ready().replace("mtu=Some(1380)", "mtu=Some(1280)")))
+        assertNotNull(sample(ready().replace("mtu=Some(1380)", "mtu=Some(1280)")))
         assertNull(sample(ready().replace("10.0.2.2", "10.0.2.3")))
     }
 
@@ -209,7 +209,41 @@ class CaptureReadinessTest {
             )
         )
         assertNotNull(sample(ready().replace("Some(1)", "None")))
-        assertNull(sample(ready().replace("interface_name: \"tun0\"", "interface_name: \"tun1\"")))
+        assertNotNull(
+            sample(ready().replace("interface_name: \"tun0\"", "interface_name: \"tun1\""))
+        )
+        assertNotNull(sample(ready(observed = encoded.dropLast(1) + ", " + encoded.drop(1))))
+        assertNotNull(
+            sample(
+                ready(
+                    observed =
+                        encoded
+                            .replace("gateway: None", "gateway: Some(10.0.2.1)")
+                            .replace("Some(1)", "Some(7)")
+                )
+            )
+        )
+        assertTrue(
+            CaptureReadiness.configurationReady(
+                true,
+                "/192.0.2.1",
+                1380,
+                routes,
+                routes,
+                requiredMtu = 1380,
+                requiredDns = setOf("192.0.2.1"),
+            )
+        )
+        assertFalse(
+            CaptureReadiness.configurationReady(
+                true,
+                "/10.64.0.1",
+                1380,
+                routes,
+                routes,
+                requiredDns = setOf("192.0.2.1"),
+            )
+        )
     }
 
     @Test

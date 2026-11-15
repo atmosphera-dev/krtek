@@ -6325,6 +6325,7 @@ dependencies = [
  "surge-ping",
  "talpid-dbus",
  "talpid-error",
+ "talpid-lan-forwarder",
  "talpid-net",
  "talpid-netstack",
  "talpid-routing",

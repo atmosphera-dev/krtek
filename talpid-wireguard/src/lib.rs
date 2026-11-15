@@ -1248,6 +1248,11 @@ pub enum TunnelError {
     #[error("Failed to setup a tunnel device")]
     SetupTunnelDevice(#[source] tun_provider::Error),
 
+    /// The actual managed Android configuration result, including safe fallback causes.
+    #[cfg(any(target_os = "android", test))]
+    #[error("Managed Android configuration failed")]
+    ManagedConfiguration(#[source] tun_provider::ConfigurationError),
+
     /// Failed to setup a tunnel device.
     #[cfg(windows)]
     #[error("Failed to config IP interfaces on tunnel device")]

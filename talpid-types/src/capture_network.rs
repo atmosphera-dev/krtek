@@ -1,5 +1,5 @@
 //! Capture-owned VPN observations, separate from physical-network eligibility.
-//! A generation is retired synchronously on mismatch/loss, before notifying its
+//! A generation is retired synchronously on identity loss, before notifying its
 //! async owner. No platform/JNI work is performed while holding the feed lock.
 #[cfg(target_os = "android")]
 use jnix::FromJava;
@@ -60,11 +60,9 @@ pub struct CaptureExpectation {
 }
 
 impl CaptureExpectation {
-    /// Android Vpn.makeLinkProperties binds every route to the interface and
-    /// adds an unreachable default only for a completely unconfigured family.
-    /// ConnectivityService.processLinkPropertiesFromAgent then calls
-    /// LinkProperties.ensureDirectlyConnectedRoutes for each interface address.
-    /// No other routes are permitted by this projection.
+    /// Expected routes use upstream Android Route's destination-prefix semantics.
+    /// Platform-added connected/unreachable routes and optional report fields are
+    /// diagnostics, not additional configuration requirements.
     pub fn requested(
         interface_name: String,
         owner_uid: i32,
@@ -94,7 +92,7 @@ impl CaptureExpectation {
             })
             .collect();
         let mut projected = Vec::new();
-        for prefix in routes.iter().chain(&addresses) {
+        for prefix in routes {
             let bits = u8::try_from(prefix.prefix_length).ok()?;
             let network = ipnetwork::IpNetwork::new(prefix.address, bits).ok()?;
             if network.network() != prefix.address {
@@ -106,29 +104,6 @@ impl CaptureExpectation {
                 interface_name: interface_name.clone(),
                 route_type: (api_level >= 33).then_some(1),
             });
-        }
-        for unspecified in [
-            IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED),
-            IpAddr::from(std::net::Ipv6Addr::UNSPECIFIED),
-        ] {
-            let configured = addresses
-                .iter()
-                .chain(routes)
-                .any(|p| p.address.is_ipv4() == unspecified.is_ipv4())
-                || dns_servers
-                    .iter()
-                    .any(|ip| ip.is_ipv4() == unspecified.is_ipv4());
-            if !configured {
-                projected.push(CaptureRoute {
-                    destination: CapturePrefix {
-                        address: unspecified,
-                        prefix_length: 0,
-                    },
-                    gateway: None,
-                    interface_name: interface_name.clone(),
-                    route_type: (api_level >= 33).then_some(7),
-                });
-            }
         }
         projected.sort();
         projected.dedup();
@@ -144,24 +119,21 @@ impl CaptureExpectation {
     }
 
     fn matches(&self, observation: &CaptureNetworkObservation) -> bool {
-        fn same_set<T: Ord + Clone>(a: &[T], b: &[T]) -> bool {
-            let mut a = a.to_vec();
-            let mut b = b.to_vec();
-            a.sort();
-            b.sort();
-            a.dedup();
-            b.dedup();
-            a == b
-        }
+        self.owns(observation)
+            && self.routes.iter().all(|expected| {
+                observation
+                    .routes
+                    .iter()
+                    .any(|actual| actual.destination == expected.destination)
+            })
+    }
+
+    fn owns(&self, observation: &CaptureNetworkObservation) -> bool {
         observation.fresh
             && !observation.lost
             && observation.api_level == self.api_level
             && observation.owner_uid == self.owner_uid
             && observation.interface_name == self.interface_name
-            && observation.mtu == self.mtu
-            && same_set(&self.routes, &observation.routes)
-            && same_set(&self.addresses, &observation.addresses)
-            && same_set(&self.dns_servers, &observation.dns_servers)
     }
 }
 
@@ -408,11 +380,13 @@ impl CaptureNetworkFeed {
             }
             generation.handle = Some(observation.network_handle);
         }
-        let next = if expected.matches(&observation) {
-            CaptureNetworkState::Ready(Arc::new(observation))
-        } else {
+        let next = if !expected.owns(&observation) {
             Self::revoke(generation);
             CaptureNetworkState::Lost
+        } else if generation.revoke.is_some() || expected.matches(&observation) {
+            CaptureNetworkState::Ready(Arc::new(observation))
+        } else {
+            CaptureNetworkState::Pending
         };
         Self::set_state(generation, next)
     }

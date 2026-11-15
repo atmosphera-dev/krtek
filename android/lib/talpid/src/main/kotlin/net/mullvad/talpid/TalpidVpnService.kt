@@ -129,18 +129,11 @@ open class TalpidVpnService : LifecycleVpnService() {
             }
         }
 
-    /**
-     * Assigned capture uses the normal safe Builder primitives, never synthetic fallback fields.
-     */
+    /** Managed capture retains the upstream safe fallback and its sole descriptor. */
     @Suppress("Unused")
     fun openSecuredFrontend(generation: Long, config: TunConfig): CreateTunResult =
         synchronized(this) {
-            if (
-                !supportsCaptureObservation() ||
-                    !config.validSecuredFields() ||
-                    !config.validIpv6Routes()
-            )
-                return EstablishError
+            if (!supportsCaptureObservation()) return EstablishError
             openFrontend(generation) { createSecuredFrontend(generation, config) {} }
         }
 
@@ -170,11 +163,7 @@ open class TalpidVpnService : LifecycleVpnService() {
         config: TunConfig,
     ): CaptureHandoverResult =
         synchronized(this) {
-            if (
-                !supportsCaptureObservation() ||
-                    !config.validSecuredFields() ||
-                    !config.validIpv6Routes()
-            )
+            if (!supportsCaptureObservation())
                 return CaptureHandoverResult(
                     EstablishError,
                     localFrontendOwnership.predecessorCurrent(predecessor),
@@ -206,17 +195,12 @@ open class TalpidVpnService : LifecycleVpnService() {
             }
         // Both obligations remain native-owned, including failure/acknowledgement
         // loss. Only an exact finish after joined fd closure may release either.
-        if (enteredEstablish && result !is CreateTunResult.Success)
+        if (enteredEstablish && !result.isOpen)
             localFrontendOwnership.establishmentFailed(generation)
         return CaptureHandoverResult(result, !enteredEstablish)
     }
 
     private fun supportsCaptureObservation() = captureRegistration > 0L
-
-    private fun TunConfig.validSecuredFields() =
-        listOf(addresses, routes, dnsServers).all { it.isNotEmpty() } &&
-            addresses.none { it.isAnyLocalAddress || it.isMulticastAddress } &&
-            mtu > 0
 
     private fun openFrontend(generation: Long, create: () -> CreateTunResult): CreateTunResult {
         if (!localFrontendOwnership.tryFrontend(generation)) return EstablishError
@@ -226,7 +210,7 @@ open class TalpidVpnService : LifecycleVpnService() {
             } catch (_: RuntimeException) {
                 EstablishError
             }
-        if (result !is CreateTunResult.Success) {
+        if (!result.isOpen) {
             // No detached fd exists. Keep ownership if callback release fails.
             finishLocalFrontend(generation)
         }
@@ -286,10 +270,44 @@ open class TalpidVpnService : LifecycleVpnService() {
     ): CreateTunResult = either {
         prepareVpnSafe().mapLeft { it.toCreateTunError() }.bind()
         val builder = Builder()
-        builder.configureWith(config).mapLeft { EstablishError }.bind()
+        val configured = builder.configureWith(config, managed = true)
+        val errors = configured.fold({ it.toList() }, { emptyList() })
+        val invalidDns =
+            errors.filterIsInstance<ConfigError.InvalidDns>().flatMap { it.addresses }.toSet()
+        val dns =
+            config.dnsServers
+                .filterNot { it in invalidDns }
+                .ifEmpty {
+                    listOf(InetAddress.getByName(FALLBACK_DUMMY_DNS_SERVER))
+                }
+        val applied =
+            if (errors.any { it is ConfigError.InvalidIpv6 }) {
+                config.copy(
+                    addresses =
+                        arrayListOf(
+                            InetAddress.getByName(MANAGED_ADDRESS_IPV4),
+                            InetAddress.getByName(MANAGED_ADDRESS_IPV6),
+                        ),
+                    routes =
+                        arrayListOf(
+                            InetNetwork(InetAddress.getByName(ROUTE_ALL_IPV4), 0),
+                            InetNetwork(InetAddress.getByName(ROUTE_ALL_IPV6), 0),
+                        ),
+                    mtu = BLOCKING_MTU,
+                    dnsServers = ArrayList(dns),
+                )
+            } else config.copy(dnsServers = ArrayList(dns))
         establishing()
+        connectivityListener.invalidateNetworkStateCache()
         val descriptor = builder.establishSafe().mapLeft { EstablishError }.bind()
         frontendEstablished(generation, descriptor, observeCapture = true)
+        val override = applied.takeIf { it != config }
+        configured
+            .mapLeft {
+                it.maxBy { error -> error.priority }.toCreateTunError(descriptor.fd, override)
+            }
+            .bind()
+        CreateTunResult.Success(descriptor.fd, override)
     }
         .merge()
 
@@ -310,6 +328,7 @@ open class TalpidVpnService : LifecycleVpnService() {
         builder.setMeteredIfSupported(false)
         builder.excludeApplications(excludedPackages.asList())
         establishing()
+        connectivityListener.invalidateNetworkStateCache()
         val descriptor = builder.establishSafe().mapLeft { EstablishError }.bind()
         frontendEstablished(generation, descriptor, observeCapture = false)
     }
@@ -319,6 +338,7 @@ open class TalpidVpnService : LifecycleVpnService() {
     fun finishLocalFrontend(generation: Long): Unit =
         synchronized(this) {
             if (!localFrontendOwnership.owns(generation)) return
+            connectivityListener.invalidateNetworkStateCache()
             captureObservers[generation]?.invalidate()
             pendingCaptureDescriptors[generation]?.close()
             pendingCaptureDescriptors.remove(generation)
@@ -415,7 +435,10 @@ open class TalpidVpnService : LifecycleVpnService() {
     }
 
     @OptIn(ExperimentalRaiseAccumulateApi::class)
-    private fun Builder.configureWith(config: TunConfig): Either<Nel<ConfigError>, Unit> = either {
+    private fun Builder.configureWith(
+        config: TunConfig,
+        managed: Boolean = false,
+    ): Either<Nel<ConfigError>, Unit> = either {
         setMtu(config.mtu)
         setBlocking(false)
         setMeteredIfSupported(false)
@@ -423,7 +446,7 @@ open class TalpidVpnService : LifecycleVpnService() {
         excludeApplications(config.excludedPackages)
 
         accumulate {
-            accumulating { addAddressesAndRoutesSafe(config).bind() }
+            accumulating { addAddressesAndRoutesSafe(config, managed).bind() }
             accumulating { addDnsServersSafe(config).bind() }
         }
     }
@@ -441,9 +464,9 @@ open class TalpidVpnService : LifecycleVpnService() {
     }
 
     // Blocking fallback for when we receive an invalid IPv6 config
-    private fun Builder.invalidIpv6Setup() {
-        addAddress(BLOCKING_ADDRESS_IPV4, IPV4_PREFIX_LENGTH)
-        addAddress(BLOCKING_ADDRESS_IPV6, IPV6_PREFIX_LENGTH)
+    private fun Builder.invalidIpv6Setup(managed: Boolean) {
+        addAddress(if (managed) MANAGED_ADDRESS_IPV4 else BLOCKING_ADDRESS_IPV4, IPV4_PREFIX_LENGTH)
+        addAddress(if (managed) MANAGED_ADDRESS_IPV6 else BLOCKING_ADDRESS_IPV6, IPV6_PREFIX_LENGTH)
         addRoute(ROUTE_ALL_IPV4, 0)
         addRoute(ROUTE_ALL_IPV6, 0)
         // IPv6 have a minimum mtu of 1280, the daemon can send a lower mtu if IPv6 is disabled
@@ -474,7 +497,7 @@ open class TalpidVpnService : LifecycleVpnService() {
             is PrepareError.OtherAlwaysOnApp -> OtherAlwaysOnApp(appName)
         }
 
-    private fun ConfigError.toCreateTunError(tunFd: Int) =
+    private fun ConfigError.toCreateTunError(tunFd: Int, appliedConfig: TunConfig? = null) =
         when (this) {
             is ConfigError.InvalidIpv6 ->
                 CreateTunResult.InvalidIpv6Config(
@@ -482,8 +505,14 @@ open class TalpidVpnService : LifecycleVpnService() {
                     routes = routes,
                     dnsServers = dnsServers,
                     tunFd = tunFd,
+                    appliedConfig = appliedConfig,
                 )
-            is ConfigError.InvalidDns -> InvalidDnsServers(addresses = addresses, tunFd = tunFd)
+            is ConfigError.InvalidDns ->
+                InvalidDnsServers(
+                    addresses = addresses,
+                    tunFd = tunFd,
+                    appliedConfig = appliedConfig,
+                )
         }
 
     private fun Builder.addDnsServersSafe(
@@ -525,7 +554,8 @@ open class TalpidVpnService : LifecycleVpnService() {
             }
 
     private fun Builder.addAddressesAndRoutesSafe(
-        config: TunConfig
+        config: TunConfig,
+        managed: Boolean = false,
     ): Either<ConfigError.InvalidIpv6, Builder> =
         if (config.validIpv6Routes()) {
             config.addresses.forEach { addAddress(it, it.prefixLength()) }
@@ -536,7 +566,7 @@ open class TalpidVpnService : LifecycleVpnService() {
             Logger.e("IPv6 address: ${config.hasIpv6Address}")
             Logger.e("IPv6 route: ${config.hasIpv6Route}")
             Logger.e("IPv6 DnsServer: ${config.hasIpv6DnsServer}")
-            invalidIpv6Setup()
+            invalidIpv6Setup(managed)
             ConfigError.InvalidIpv6(
                     addresses = config.addresses,
                     routes = config.routes,
@@ -560,6 +590,8 @@ open class TalpidVpnService : LifecycleVpnService() {
         const val ROUTE_ALL_IPV6 = "::"
         const val BLOCKING_MTU = 1280
         private const val LOCAL_ONLY_MTU = 1280
+        private const val MANAGED_ADDRESS_IPV4 = "172.27.1.1"
+        private const val MANAGED_ADDRESS_IPV6 = "fdf0:ce4a:801d::172:27:1:1"
 
         private const val IPV4_PREFIX_LENGTH = 32
         private const val IPV6_PREFIX_LENGTH = 128

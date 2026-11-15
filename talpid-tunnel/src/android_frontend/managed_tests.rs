@@ -19,6 +19,447 @@ fn assigned() -> TunConfig {
     config
 }
 
+fn configuration(broker: &AttachmentBroker) -> CaptureConfig {
+    CaptureConfig::Secured {
+        broker: broker.clone(),
+        request: broker.pending_request().unwrap(),
+        disposition: Arc::new(|destination| {
+            if destination.is_loopback() {
+                CaptureDisposition::Local
+            } else {
+                CaptureDisposition::Drop(CaptureDropReason::NoTarget)
+            }
+        }),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocking_receipt_attests_applied_current_safe_configuration() {
+    use crate::tun_provider::{
+        AndroidTunConfig, ConfigurationError, ConfigurationPurpose, transport::TransportMode,
+    };
+    for previous_target in [false, true] {
+        for allow_lan in [false, true] {
+            for fails in [false, true] {
+                let (platform, mut peers) = super::handover::EpochPlatform::new();
+                let broker = broker();
+                broker.set_mode(AttachmentMode::ManagedRequired).unwrap();
+                broker
+                    .set_local_routes(vec!["10.0.2.2/32".parse().unwrap()])
+                    .unwrap();
+                let (_updates, updates) = watch::channel(0);
+                let mut old = None;
+                let mut previous = None;
+                let mut owner = if previous_target {
+                    old = Some(
+                        broker
+                            .request_capture(crate::tun_provider::transport::router_config(
+                                &assigned(),
+                                vec![],
+                            ))
+                            .unwrap(),
+                    );
+                    previous = broker.pending_request();
+                    let mut owner = FrontendOwner::start(
+                        platform.clone(),
+                        configuration(&broker),
+                        managed_forwarder(Arc::new(Authority::default())),
+                        updates.clone(),
+                        broker.clone(),
+                    )
+                    .unwrap();
+                    bounded(owner.ready()).await.unwrap();
+                    bounded(old.as_mut().unwrap().configured()).await.unwrap();
+                    // The actual joined reconfigure boundary, not a future public
+                    // Error transition, must discharge this exact predecessor.
+                    previous.as_ref().unwrap().defer_release();
+                    assert!(!previous.as_ref().unwrap().release_ready());
+                    Some(owner)
+                } else {
+                    None
+                };
+                let predecessor_epoch = broker.snapshot().capture_generation;
+                let mut cleanup_state = owner.as_ref().map(FrontendOwner::state);
+                let mut safe = blocking_config();
+                safe.dns_servers = Some(vec!["192.0.2.1".parse().unwrap()]);
+                safe.allow_lan = allow_lan;
+                safe.excluded_packages = vec![format!("current.excluded.{allow_lan}")];
+                let expected =
+                    crate::tun_provider::transport::router_config(&safe, broker.local_routes());
+                let mut operation = TransportMode::selected(Some(&broker))
+                    .reconfigure::<crate::packet_attachment::AttachmentError>(
+                        safe,
+                        ConfigurationPurpose::Blocking,
+                        false,
+                        |_| panic!("managed blocking opened Native"),
+                    )
+                    .unwrap()
+                    .unwrap();
+                let pending = broker.pending_request().unwrap();
+                assert!(
+                    previous
+                        .as_ref()
+                        .is_none_or(|request| request.release_ready())
+                );
+                assert_eq!(pending.purpose(), ConfigurationPurpose::Blocking);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(20), operation.configured())
+                        .await
+                        .is_err(),
+                    "cancel was reported as blocking success"
+                );
+                if let Some(old) = old.as_mut() {
+                    assert!(old.configured().await.is_err());
+                }
+                if fails {
+                    *platform.establish_error.lock().unwrap() = Some(ConfigurationError::Establish);
+                }
+                if let Some(owner) = owner.as_mut() {
+                    owner.handover(configuration(&broker)).unwrap();
+                } else {
+                    owner = Some(
+                        FrontendOwner::start(
+                            platform.clone(),
+                            configuration(&broker),
+                            managed_forwarder(Arc::new(Authority::default())),
+                            updates,
+                            broker.clone(),
+                        )
+                        .unwrap(),
+                    );
+                }
+                let owner = owner.as_mut().unwrap();
+                if fails {
+                    assert!(bounded(owner.ready()).await.is_err());
+                    assert!(matches!(
+                        bounded(operation.configured()).await,
+                        Err(ConfigurationError::Establish)
+                    ));
+                    assert!(!broker.snapshot().capture_ready);
+                } else {
+                    bounded(owner.ready()).await.unwrap();
+                    let result = bounded(operation.configured_result()).await.unwrap();
+                    assert!(result.receipt.current() && result.cause.is_none());
+                    assert_eq!(result.applied, expected);
+                    assert_eq!(result.applied.mtu, 1380);
+                    assert_eq!(
+                        result.applied.dns_servers,
+                        Some(vec!["192.0.2.1".parse().unwrap()])
+                    );
+                    assert_eq!(
+                        result.applied.excluded_packages,
+                        vec![format!("current.excluded.{allow_lan}")]
+                    );
+                    let routed = |ip: &str| {
+                        result
+                            .applied
+                            .routes
+                            .iter()
+                            .any(|route| route.contains(ip.parse().unwrap()))
+                    };
+                    assert!(routed("1.1.1.1") && routed("10.0.2.2"));
+                    assert_eq!(routed("10.0.2.3"), !allow_lan);
+                    assert_eq!(
+                        result.applied.addresses,
+                        vec![
+                            std::net::IpAddr::from(crate::tun_provider::transport::ROUTER_IPV4),
+                            std::net::IpAddr::from(crate::tun_provider::transport::ROUTER_IPV6)
+                        ]
+                    );
+                    assert_eq!(
+                        AndroidTunConfig::new(&result.applied),
+                        AndroidTunConfig::new(&expected)
+                    );
+                    let observed = platform
+                        .expected
+                        .lock()
+                        .unwrap()
+                        .get(&(result.receipt.generation() as i64))
+                        .unwrap()
+                        .clone();
+                    assert_eq!(observed.mtu, Some(1380));
+                    assert_eq!(
+                        observed.dns_servers,
+                        vec!["192.0.2.1".parse::<std::net::IpAddr>().unwrap()]
+                    );
+                    assert!(
+                        broker.acquire(&result.receipt).is_err(),
+                        "blocking capture acquired ordinary target"
+                    );
+                    assert!(
+                        broker
+                            .acquire_target(
+                                &result.receipt,
+                                talpid_types::relay_flow::RelayTargetId::new(2).unwrap(),
+                                crate::tun_provider::transport::ROUTER_SOURCES,
+                                result.applied.mtu
+                            )
+                            .is_err(),
+                        "blocking capture acquired another ordinary target"
+                    );
+                    if let Some(generation) = predecessor_epoch {
+                        platform.finished(generation as i64).await;
+                        // Platform finish precedes the actor's retained-change
+                        // acknowledgement. Join both before asking for epoch3.
+                        bounded(cleanup_state.as_mut().unwrap().changed())
+                            .await
+                            .unwrap();
+                    }
+                    let old_epoch = result.receipt.generation();
+                    let mut changed = blocking_config();
+                    changed.allow_lan = !allow_lan;
+                    changed.dns_servers = Some(vec!["192.0.2.1".parse().unwrap()]);
+                    changed.excluded_packages = vec!["changed.while.error".into()];
+                    let mut current = TransportMode::selected(Some(&broker))
+                        .reconfigure::<crate::packet_attachment::AttachmentError>(
+                            changed,
+                            ConfigurationPurpose::Blocking,
+                            false,
+                            |_| panic!("Native Error edit"),
+                        )
+                        .unwrap()
+                        .unwrap();
+                    owner.handover(configuration(&broker)).unwrap();
+                    bounded(owner.ready()).await.unwrap();
+                    let current = current.configured_result().await.unwrap();
+                    assert_eq!(
+                        current.applied.excluded_packages,
+                        vec!["changed.while.error"]
+                    );
+                    assert_eq!(current.applied.mtu, 1380);
+                    assert_eq!(
+                        current
+                            .applied
+                            .routes
+                            .iter()
+                            .any(|r| r.contains("10.0.2.3".parse().unwrap())),
+                        allow_lan
+                    );
+                    platform.finished(old_epoch as i64).await;
+                }
+                bounded(owner.stop()).await.unwrap();
+                while let Ok(fd) = peers.try_recv() {
+                    drop(fd);
+                }
+                assert!(pending.release_ready());
+            }
+        }
+    }
+    let mut empty = crate::tun_provider::transport::router_blocking_config(vec![]);
+    let dummy = empty.clone();
+    empty.dns_servers = Some(vec![]);
+    assert!(empty.same_android_config(&dummy));
+    let (platform, _peers) = super::handover::EpochPlatform::new();
+    *platform.applied.lock().unwrap() = Some(AndroidTunConfig::new(&dummy));
+    let broker = broker();
+    broker.set_mode(AttachmentMode::ManagedRequired).unwrap();
+    let mut initial = broker.request_capture(empty.clone()).unwrap();
+    let (_updates, updates) = watch::channel(0);
+    let mut owner = FrontendOwner::start(
+        platform.clone(),
+        configuration(&broker),
+        managed_forwarder(Arc::new(Authority::default())),
+        updates,
+        broker.clone(),
+    )
+    .unwrap();
+    bounded(owner.ready()).await.unwrap();
+    let first = initial.configured_result().await.unwrap();
+    assert_eq!(first.applied.dns_servers, dummy.dns_servers);
+    drop(initial);
+    let mut next = broker.request_capture(empty).unwrap();
+    owner.handover(configuration(&broker)).unwrap();
+    bounded(owner.ready()).await.unwrap();
+    let next = next.configured_result().await.unwrap();
+    assert_eq!(next.receipt.generation(), first.receipt.generation());
+    assert_eq!(
+        next.applied.dns_servers, dummy.dns_servers,
+        "equal-profile reuse attested requested rather than actual DNS"
+    );
+    assert_eq!(
+        platform.descriptors.lock().unwrap().len(),
+        1,
+        "empty-vs-dummy DNS rebuilt fd"
+    );
+    bounded(owner.stop()).await.unwrap();
+    let partial = crate::tun_provider::PartialConfig::from(vec!["10.0.2.2/32".into()]);
+    assert!(partial.same_android_config(&partial.clone()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallback_descriptor_and_typed_configuration_cause_survive_cancellation() {
+    use crate::tun_provider::{AndroidTunConfig, ConfigurationError};
+    for case in [
+        "dns",
+        "ipv6",
+        "not-prepared",
+        "legacy",
+        "always-on",
+        "establish",
+    ] {
+        for cancelled in [false, true] {
+            let (platform, mut peers) = super::handover::EpochPlatform::new();
+            let capture = talpid_netstack::buffer_budget::BufferBudget::new(2 * 1024 * 1024);
+            let application = talpid_netstack::buffer_budget::BufferBudget::new(22 * 1024 * 1024);
+            let control = talpid_netstack::buffer_budget::BufferBudget::new(8 * 1024 * 1024);
+            let broker = AttachmentBroker::new(
+                Arc::new(application.clone()),
+                Arc::new(capture.clone()),
+                Arc::new(control.clone()),
+            )
+            .unwrap();
+            broker.set_mode(AttachmentMode::ManagedRequired).unwrap();
+            let mut requested = crate::tun_provider::transport::router_config(&assigned(), vec![]);
+            if case == "ipv6" {
+                requested.mtu = 576;
+            }
+            let cause = match case {
+                "dns" => ConfigurationError::InvalidDnsServers(vec!["1.1.1.1".parse().unwrap()]),
+                "ipv6" => ConfigurationError::InvalidIpv6Config {
+                    addresses: requested.addresses.clone(),
+                    routes: requested.routes.clone(),
+                    dns_servers: requested.dns_servers.clone().unwrap(),
+                },
+                "not-prepared" => ConfigurationError::NotPrepared,
+                "legacy" => ConfigurationError::OtherLegacyAlwaysOnVpn,
+                "always-on" => ConfigurationError::OtherAlwaysOnApp {
+                    app_name: "other.vpn".into(),
+                },
+                _ => ConfigurationError::Establish,
+            };
+            let fallback = matches!(case, "dns" | "ipv6");
+            let mut actual = crate::tun_provider::transport::router_blocking_config(vec![]);
+            if case == "ipv6" {
+                actual.mtu = 1280;
+            }
+            if fallback {
+                *platform.applied.lock().unwrap() = Some(AndroidTunConfig::new(&actual));
+                *platform.cause.lock().unwrap() = Some(cause.clone());
+            } else {
+                *platform.establish_error.lock().unwrap() = Some(cause.clone());
+            }
+            let pause = Arc::new(Pause::default());
+            let _release = Release(pause.clone());
+            *platform.open_pause.lock().unwrap() = Some(pause.clone());
+            let mut request = broker.request_capture(requested.clone()).unwrap();
+            let (_updates, updates) = watch::channel(0);
+            let mut owner = FrontendOwner::start(
+                platform.clone(),
+                configuration(&broker),
+                managed_forwarder(Arc::new(Authority::default())),
+                updates,
+                broker.clone(),
+            )
+            .unwrap();
+            bounded(pause.entered.notified()).await;
+            let descriptor = platform
+                .descriptors
+                .lock()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            assert_eq!(std::fs::read_link(&descriptor.0).unwrap(), descriptor.1);
+            let successor = if cancelled {
+                request.cancel();
+                Some(broker.request_capture(requested.clone()).unwrap())
+            } else {
+                None
+            };
+            pause.unblock();
+            if fallback {
+                bounded(owner.ready()).await.unwrap();
+                let peer = AsyncFd::new(bounded(peers.recv()).await.unwrap()).unwrap();
+                if !cancelled {
+                    let outcome = bounded(request.configured_result()).await.unwrap();
+                    assert_eq!(
+                        AndroidTunConfig::new(&outcome.applied),
+                        AndroidTunConfig::new(&actual)
+                    );
+                    assert_eq!(
+                        outcome.applied.ipv6_gateway, requested.ipv6_gateway,
+                        "relay-only metadata is not part of Builder profile"
+                    );
+                    assert_eq!(
+                        outcome.cause.as_ref().unwrap().to_string(),
+                        cause.to_string()
+                    );
+                    assert_eq!(
+                        std::mem::discriminant(outcome.cause.as_ref().unwrap()),
+                        std::mem::discriminant(&cause)
+                    );
+                    assert!(broker.acquire(&outcome.receipt).is_err());
+                    assert!(
+                        broker
+                            .acquire_target(
+                                &outcome.receipt,
+                                talpid_types::relay_flow::RelayTargetId::new(2).unwrap(),
+                                crate::tun_provider::transport::ROUTER_SOURCES,
+                                outcome.applied.mtu
+                            )
+                            .is_err(),
+                        "fallback error acquired another ordinary target"
+                    );
+                    assert_eq!(
+                        request.configured().await.err().unwrap().to_string(),
+                        cause.to_string()
+                    );
+                }
+                // A typed target failure does not discard the safe Local fd.
+                let (address, mut hits, echo) = udp_echo(false).await;
+                send(
+                    &peer,
+                    &udp(
+                        flow(address, Transport::Udp, 48901),
+                        b"fallback-local-consumer",
+                    ),
+                )
+                .await;
+                assert_eq!(
+                    bounded(hits.recv()).await.unwrap(),
+                    b"fallback-local-consumer"
+                );
+                assert_eq!(
+                    packet::parse(&bounded(receive(&peer)).await)
+                        .unwrap()
+                        .payload,
+                    b"fallback-local-consumer"
+                );
+                echo.abort();
+            } else {
+                assert!(bounded(owner.ready()).await.is_err());
+                if !cancelled {
+                    assert_eq!(
+                        request.configured().await.err().unwrap().to_string(),
+                        cause.to_string()
+                    );
+                }
+                assert!(!broker.snapshot().capture_ready);
+            }
+            if let Some(mut successor) = successor {
+                assert!(request.configured().await.is_err());
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(20), successor.configured())
+                        .await
+                        .is_err(),
+                    "late result certified successor"
+                );
+                successor.cancel();
+            }
+            bounded(owner.stop()).await.unwrap();
+            assert_ne!(std::fs::read_link(&descriptor.0).ok(), Some(descriptor.1));
+            drop(owner);
+            drop(request);
+            drop(broker);
+            assert_eq!(
+                (application.used(), capture.used(), control.used()),
+                (0, 0, 0)
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn unsupported_capture_formats_never_admit_packets_and_retain_failed_release() {
     for flags in [0, 1, 0x1002, 0x5001, 0x1401] {
@@ -60,8 +501,17 @@ async fn unsupported_capture_formats_never_admit_packets_and_retain_failed_relea
             .unwrap();
             let error = bounded(owner.ready()).await.unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            let cause = error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<crate::tun_provider::ConfigurationError>()
+                .unwrap();
+            let crate::tun_provider::ConfigurationError::Platform(original) = cause else {
+                panic!("lost unsupported-format source")
+            };
+            assert_eq!(original.kind(), io::ErrorKind::Unsupported);
             assert!(
-                error
+                original
                     .get_ref()
                     .unwrap()
                     .downcast_ref::<UnsupportedCaptureFormat>()

@@ -36,6 +36,7 @@ tunnel-obfuscation = { path = "../tunnel-obfuscation", features = ["gotatun"] }
 [dev-dependencies]
 insta = { workspace = true }
 proptest = { workspace = true }
+talpid-lan-forwarder = { path = "../talpid-lan-forwarder" }
 smoltcp = { version = "0.13", default-features = false, features = ["medium-ip", "proto-ipv4", "socket-tcp", "std"] }
 tokio = { workspace = true, features = ["test-util"] }
 
