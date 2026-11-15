@@ -63,7 +63,7 @@
     <string name="auto_connect_carousel_first_slide_top_text">自动连接和锁定模式设置可以在 Android 系统设置中找到，请按照本指南启用其中一项或两项。</string>
     <string name="auto_connect_carousel_second_slide_bottom_text">2. 要启用自动连接，请点击“始终开启 VPN”旁边的开关。</string>
     <string name="auto_connect_carousel_second_slide_top_text">自动连接在 Android 系统设置中称为“始终开启 VPN”，此功能可确保您始终连接到 VPN 隧道并在重新启动后自动连接。</string>
-    <string name="auto_connect_carousel_third_slide_bottom_text">3. 要启用锁定模式，请点击“屏蔽未使用 VPN 的所有连接”旁边的开关。<br /><br /><b>警告：此设置会屏蔽分割应用和“本地网络共享”功能。</b></string>
+    <string name="auto_connect_carousel_third_slide_bottom_text">3. 要启用锁定模式，请点击“屏蔽未使用 VPN 的所有连接”旁边的开关。<br /><br /><b>警告：此设置会屏蔽已排除的应用，以及连接期间绕过 VPN 的旧版本地网络功能。未排除应用的本地规则独立于此设置。</b></string>
     <string name="auto_connect_carousel_third_slide_top_text">在 Android 系统设置中，锁定模式被称为“屏蔽未使用 VPN 的所有连接”。该模式可以最大限度地减少泄露，但是也有一些已知的限制，要了解详情，请点击</string>
     <string name="auto_connect_carousel_third_slide_top_text_website_link">（点击此处）</string>
     <string name="automatic">自动</string>
@@ -297,7 +297,7 @@
     <string name="local_network_sharing_info2"><b>这可能会影响您的匿名性</b>。请避免在公共或不可信的网络上使用此功能，否则您的设备可能会对他人可见。</string>
     <string name="local_network_sharing_info3">该应用允许本地组播、广播网络流量以及往返于私有 IP 范围的流量绕过 VPN 隧道。</string>
     <string name="local_network_sharing_info4"><b>私有 IP 范围</b></string>
-    <string name="local_network_sharing_info_block_connections_warning"><b>注意</b>：“本地网络共享”与“屏蔽未使用 VPN 的所有连接”不兼容。</string>
+    <string name="local_network_sharing_info_block_connections_warning"><b>注意</b>：连接期间绕过 VPN 的旧版本地网络功能与“屏蔽未使用 VPN 的所有连接”不兼容。本地规则独立于此设置。</string>
     <string name="location_added">%1$s（已添加）</string>
     <string name="location_was_added_to_list">%1$s已添加到“%2$s”中</string>
     <string name="location_was_removed_from_list">%1$s已从“%2$s”中移除</string>
@@ -553,4 +553,17 @@
     <string name="you_can_add_more_time_play">您可以通过帐户视图添加更多时间，以继续使用 VPN。</string>
     <string name="your_device">您的设备</string>
     <string name="your_device_with_location">您的设备 (%1$s)</string>
+    <string name="problem_report_github_description">%1$s 通过 GitHub 公开议题提供支持。打开链接会将已检查的文本分享给浏览器和 GitHub。切勿包含您的帐号。</string>
+    <string name="problem_report_message_hint">消息</string>
+    <string name="open_github_issue">打开 GitHub 议题</string>
+    <string name="problem_report_public_logs_notice">不会自动附加日志或帐号数据。请在决定分享日志之前检查其内容。</string>
+    <string name="report_problem_message_is_empty">请输入消息</string>
+    <string name="problem_report_review">检查议题</string>
+    <string name="problem_report_review_title">议题检查</string>
+    <string name="problem_report_copy">复制议题文本</string>
+    <string name="problem_report_copy_fallback">请复制完整文本，打开 GitHub，然后粘贴到新议题中。</string>
+    <string name="browser_unavailable">没有可用的浏览器。请复制此链接并在浏览器中打开。</string>
+    <string name="unable_to_reach_api_github_message">如果问题仍然存在，请打开 GitHub 寻求帮助。不会附加报告或设备详细信息。</string>
+    <string name="report_on_github">在 GitHub 上报告</string>
+    <string name="android_16_upgrade_warning_support_message">请重启设备并尝试重新连接。如果仍无法解决，请在 %s 报告此问题。</string>
 </resources>

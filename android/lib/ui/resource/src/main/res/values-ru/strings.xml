@@ -63,7 +63,7 @@
     <string name="auto_connect_carousel_first_slide_top_text">Настройки автоподключения и режима блокировки можно найти в системных настройках Android. Чтобы включить их, следуйте этой инструкции.</string>
     <string name="auto_connect_carousel_second_slide_bottom_text">2. Чтобы включить автоподключение, нажмите на переключатель возле пункта «Постоянная VPN».</string>
     <string name="auto_connect_carousel_second_slide_top_text">В системных настройках Android автоподключение называется «Постоянная VPN». Эта опция обеспечивает постоянное подключение к туннелю VPN и автоподключение после перезапуска.</string>
-    <string name="auto_connect_carousel_third_slide_bottom_text">3. Чтобы включить режим блокировки, нажмите на переключатель рядом с пунктом «Блокировать соединения без VPN».<br /><br /><b>Предупреждение: этот параметр блокирует приложения из списка раздельного туннелирования и функцию «Обмен данными в локальной сети».</b></string>
+    <string name="auto_connect_carousel_third_slide_bottom_text">3. Чтобы включить режим блокировки, нажмите на переключатель рядом с пунктом «Блокировать соединения без VPN».<br /><br /><b>Предупреждение: этот параметр блокирует исключённые приложения и прежний обход VPN для локальной сети во время подключения. Локальные правила для включённых приложений работают независимо.</b></string>
     <string name="auto_connect_carousel_third_slide_top_text">В системных настройках Android режим блокировки называется «Блокировать соединения без VPN». Он помогает минимизировать утечки, однако имеет ряд известных ограничений, прочитать подробнее о которых можно</string>
     <string name="auto_connect_carousel_third_slide_top_text_website_link">здесь</string>
     <string name="automatic">Автоматически</string>
@@ -297,7 +297,7 @@
     <string name="local_network_sharing_info2"><b>Это может повлиять на вашу анонимность.</b> Не включайте эту функцию в общедоступных или ненадежных сетях, иначе ваше устройство могут увидеть другие пользователи.</string>
     <string name="local_network_sharing_info3">Приложение позволяет обходить VPN-туннель многоадресному и широковещательному трафику в локальной сети, а также трафику к частным диапазонам IP-адресов и от них.</string>
     <string name="local_network_sharing_info4"><b>Диапазоны частных IP-адресов</b></string>
-    <string name="local_network_sharing_info_block_connections_warning"><b>Внимание:</b> обмен данными в локальной сети несовместим с функцией «Блокировать соединения без VPN».</string>
+    <string name="local_network_sharing_info_block_connections_warning"><b>Внимание:</b> прежний обход VPN для локальной сети во время подключения несовместим с функцией «Блокировать соединения без VPN». Локальные правила работают независимо.</string>
     <string name="location_added">%1$s (добавлено)</string>
     <string name="location_was_added_to_list">Местоположение %1$s добавлено в список «%2$s»</string>
     <string name="location_was_removed_from_list">Местоположение %1$s удалено из списка «%2$s»</string>
@@ -553,4 +553,17 @@
     <string name="you_can_add_more_time_play">Чтобы продолжить пользоваться VPN, добавьте время через раздел учетной записи.</string>
     <string name="your_device">Ваше устройство</string>
     <string name="your_device_with_location">Ваше устройство (%1$s)</string>
+    <string name="problem_report_github_description">Поддержка %1$s использует общедоступные обращения в GitHub. При открытии ссылки проверенный текст передаётся браузеру и GitHub. Никогда не указывайте номер счёта.</string>
+    <string name="problem_report_message_hint">Сообщение</string>
+    <string name="open_github_issue">Открыть обращение GitHub</string>
+    <string name="problem_report_public_logs_notice">Журналы и данные счёта не прикладываются автоматически. Просмотрите журналы, прежде чем решите ими поделиться.</string>
+    <string name="report_problem_message_is_empty">Введите сообщение</string>
+    <string name="problem_report_review">Проверить обращение</string>
+    <string name="problem_report_review_title">Проверка обращения</string>
+    <string name="problem_report_copy">Копировать текст</string>
+    <string name="problem_report_copy_fallback">Скопируйте весь текст, откройте GitHub и вставьте его в новое обращение.</string>
+    <string name="browser_unavailable">Нет доступного браузера. Скопируйте ссылку и откройте её в браузере.</string>
+    <string name="unable_to_reach_api_github_message">Если проблема сохраняется, откройте GitHub для получения помощи. Отчёт и сведения об устройстве не прикладываются.</string>
+    <string name="report_on_github">Сообщить в GitHub</string>
+    <string name="android_16_upgrade_warning_support_message">Перезагрузите устройство и попробуйте подключиться снова. Если это не поможет, сообщите о проблеме на %s.</string>
 </resources>

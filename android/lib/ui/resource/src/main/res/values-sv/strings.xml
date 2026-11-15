@@ -63,7 +63,7 @@
     <string name="auto_connect_carousel_first_slide_top_text">Inställningar för Anslut automatiskt och Låsningsläge finns i Androids systeminställningar. Följ guiden för att aktivera en av dem eller båda.</string>
     <string name="auto_connect_carousel_second_slide_bottom_text">2. Om du vill aktivera Anslut automatiskt klickar du på växlingsknappen bredvid \"Alltid på-VPN\".</string>
     <string name="auto_connect_carousel_second_slide_top_text">Anslut automatiskt kallas Alltid på-VPN i Androids systeminställningar och ser till att du är ansluten till VPN-tunneln oavbrutet och ansluter automatiskt efter omstart.</string>
-    <string name="auto_connect_carousel_third_slide_bottom_text">3. Om du vill aktivera Låsningsläge klickar du på växlingsknappen bredvid \"Blockera anslutningar utan VPN\".<br /><br /><b>Varning! Den här inställningen blockerar delade appar och funktionen Lokal nätverksdelning.</b></string>
+    <string name="auto_connect_carousel_third_slide_bottom_text">3. Om du vill aktivera Låsningsläge klickar du på växlingsknappen bredvid \"Blockera anslutningar utan VPN\".<br /><br /><b>Varning! Den här inställningen blockerar uteslutna appar och den äldre lokala nätverksförbikopplingen under VPN-anslutning. Lokala regler för inkluderade appar är oberoende.</b></string>
     <string name="auto_connect_carousel_third_slide_top_text">Låsningsläget kallas \"Blockera anslutningar utan VPN\" i systeminställningarna på Android. Det minimerar läckor men det finns några kända begränsningar som du kan läsa mer om</string>
     <string name="auto_connect_carousel_third_slide_top_text_website_link">här</string>
     <string name="automatic">Automatisk</string>
@@ -297,7 +297,7 @@
     <string name="local_network_sharing_info2"><b>Det här kan påverka din anonymitet.</b> Undvik att aktivera det här på offentliga eller opålitliga nätverk eftersom din enhet kan bli synlig för andra.</string>
     <string name="local_network_sharing_info3">Appen tillåter lokal multisändning och sändning av nätverkstrafik samt trafik till och från privata IP-intervall för att kringgå VPN-tunneln.</string>
     <string name="local_network_sharing_info4"><b>Privata IP-intervall</b></string>
-    <string name="local_network_sharing_info_block_connections_warning"><b>Obs!</b> Lokal nätverksdelning är inte kompatibel med \"Blockera anslutningar utan VPN\".</string>
+    <string name="local_network_sharing_info_block_connections_warning"><b>Obs!</b> Den äldre lokala nätverksförbikopplingen under VPN-anslutning är inte kompatibel med \"Blockera anslutningar utan VPN\". Lokala regler är oberoende.</string>
     <string name="location_added">%1$s (har lagts till)</string>
     <string name="location_was_added_to_list">%1$s har lagts till i \"%2$s\"</string>
     <string name="location_was_removed_from_list">%1$s har tagits bort från \"%2$s\"</string>
@@ -553,4 +553,17 @@
     <string name="you_can_add_more_time_play">Du kan lägga till mer tid via kontovyn för att fortsätta använda VPN.</string>
     <string name="your_device">Din enhet</string>
     <string name="your_device_with_location">Din enhet (%1$s)</string>
+    <string name="problem_report_github_description">Support för %1$s använder offentliga GitHub-ärenden. När länken öppnas delas den granskade texten med din webbläsare och GitHub. Ta aldrig med ditt kontonummer.</string>
+    <string name="problem_report_message_hint">Meddelande</string>
+    <string name="open_github_issue">Öppna GitHub-ärende</string>
+    <string name="problem_report_public_logs_notice">Inga loggar eller kontouppgifter bifogas automatiskt. Granska loggarna innan du väljer att dela dem.</string>
+    <string name="report_problem_message_is_empty">Ange ett meddelande</string>
+    <string name="problem_report_review">Granska ärende</string>
+    <string name="problem_report_review_title">Ärendegranskning</string>
+    <string name="problem_report_copy">Kopiera ärendetext</string>
+    <string name="problem_report_copy_fallback">Kopiera hela texten, öppna GitHub och klistra in den i ett nytt ärende.</string>
+    <string name="browser_unavailable">Ingen webbläsare tillgänglig. Kopiera länken och öppna den i en webbläsare.</string>
+    <string name="unable_to_reach_api_github_message">Om problemet kvarstår kan du öppna GitHub för att få hjälp. Ingen rapport eller enhetsinformation bifogas.</string>
+    <string name="report_on_github">Rapportera på GitHub</string>
+    <string name="android_16_upgrade_warning_support_message">Starta om enheten och försök ansluta igen. Om det inte fungerar rapporterar du problemet på %s.</string>
 </resources>

@@ -6,6 +6,8 @@ import android.content.Context
 import java.io.File
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -13,14 +15,21 @@ import net.mullvad.mullvadvpn.lib.payment.model.PaymentStatus
 
 const val PROBLEM_REPORT_LOGS_FILE = "problem_report.txt"
 
+// Every edit has its own identity, including editing back to identical text. A previous
+// review cannot become current again when a StateFlow collector misses intermediate edits.
+class ProblemReportDraft(val description: String)
+
 class ProblemReportRepository(
     context: Context,
     kermitFileLogDirName: String,
     private val paymentLogic: PaymentLogic,
     val dispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) {
-    init {
-        System.loadLibrary("mullvad_jni")
+    private val _problemReport = MutableStateFlow(ProblemReportDraft(""))
+    val problemReport = _problemReport.asStateFlow()
+
+    fun setDescription(description: String) {
+        _problemReport.value = ProblemReportDraft(description)
     }
 
     private val logDirectory = File(context.filesDir.toURI())
@@ -33,6 +42,8 @@ class ProblemReportRepository(
 
             // Lock to avoid potential truncation of the log file that the daemon creates
             collectReportMutex.withLock {
+                // Draft editing does not depend on the native log collector.
+                System.loadLibrary("mullvad_jni")
                 // Delete any old report
                 deleteLogs()
 

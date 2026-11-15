@@ -63,7 +63,7 @@
     <string name="auto_connect_carousel_first_slide_top_text">자동 연결 및 잠금 모드 설정은 Android 시스템 설정에서 찾을 수 있습니다. 이 가이드에 따라 하나 또는 둘 다를 활성화하세요.</string>
     <string name="auto_connect_carousel_second_slide_bottom_text">2. 자동 연결을 활성화하려면 \"상시 접속 VPN\" 옆에 있는 토글을 클릭합니다.</string>
     <string name="auto_connect_carousel_second_slide_top_text">자동 연결은 Android 시스템 설정에서 상시 접속 VPN이라고 하며 VPN 터널에 지속적으로 연결되고 다시 시작한 후 자동 연결되게 해줍니다.</string>
-    <string name="auto_connect_carousel_third_slide_bottom_text">3. 잠금 모드를 활성화하려면 \"VPN 없이 연결 차단\" 옆에 있는 토글을 클릭합니다.<br /><br /><b>경고: 이 설정은 분할 앱과 로컬 네트워크 공유 기능을 차단합니다.</b></string>
+    <string name="auto_connect_carousel_third_slide_bottom_text">3. 잠금 모드를 활성화하려면 \"VPN 없이 연결 차단\" 옆에 있는 토글을 클릭합니다.<br /><br /><b>경고: 이 설정은 제외된 앱과 VPN 연결 중 기존 로컬 네트워크 우회 기능을 차단합니다. 포함된 앱의 로컬 규칙은 별개입니다.</b></string>
     <string name="auto_connect_carousel_third_slide_top_text">잠금 모드는 Android 시스템 설정에서 \"VPN 없이 연결 차단\"이라고 합니다. 유출을 최소화하는 데 도움이 되지만, 몇 가지 알려진 제한 사항이 있습니다. 다음에서 자세한 내용을 확인하세요.</string>
     <string name="auto_connect_carousel_third_slide_top_text_website_link">여기</string>
     <string name="automatic">자동</string>
@@ -297,7 +297,7 @@
     <string name="local_network_sharing_info2"><b>이 기능은 익명성에 영향을 미칠 수 있습니다.</b> 사용 중인 장치가 다른 사람들에게 표시될 수 있으므로 공공 네트워크 또는 신뢰할 수 없는 네트워크에서 활성화하지 마세요.</string>
     <string name="local_network_sharing_info3">본 앱은 사설 IP 대역을 오가는 트래픽은 물론 로컬 멀티캐스트 및 브로드캐스트 네트워크 트래픽을 허용하여 VPN 터널을 우회합니다.</string>
     <string name="local_network_sharing_info4"><b>사설 IP 대역</b></string>
-    <string name="local_network_sharing_info_block_connections_warning"><b>주의:</b> 로컬 네트워크 공유는 \"VPN 없이 연결 차단\"과 호환되지 않습니다.</string>
+    <string name="local_network_sharing_info_block_connections_warning"><b>주의:</b> VPN 연결 중 기존 로컬 네트워크 우회 기능은 \"VPN 없이 연결 차단\"과 호환되지 않습니다. 로컬 규칙은 별개입니다.</string>
     <string name="location_added">%1$s(추가됨)</string>
     <string name="location_was_added_to_list">%1$s이(가) \"%2$s\"에 추가되었습니다</string>
     <string name="location_was_removed_from_list">%1$s이(가) \"%2$s\"에서 제거되었습니다</string>
@@ -553,4 +553,17 @@
     <string name="you_can_add_more_time_play">계정 창에서 더 많은 시간을 추가하여 VPN을 계속 사용할 수 있습니다.</string>
     <string name="your_device">내 장치</string>
     <string name="your_device_with_location">내 장치(%1$s)</string>
+    <string name="problem_report_github_description">%1$s 지원은 GitHub의 공개 이슈를 사용합니다. 링크를 열면 검토한 텍스트가 브라우저 및 GitHub와 공유됩니다. 계정 번호를 절대 포함하지 마세요.</string>
+    <string name="problem_report_message_hint">메시지</string>
+    <string name="open_github_issue">GitHub 이슈 열기</string>
+    <string name="problem_report_public_logs_notice">로그나 계정 데이터는 자동으로 첨부되지 않습니다. 공유하기로 선택하기 전에 로그를 검토하세요.</string>
+    <string name="report_problem_message_is_empty">메시지를 입력하세요</string>
+    <string name="problem_report_review">이슈 검토</string>
+    <string name="problem_report_review_title">이슈 검토</string>
+    <string name="problem_report_copy">이슈 텍스트 복사</string>
+    <string name="problem_report_copy_fallback">전체 텍스트를 복사하고 GitHub를 연 다음 새 이슈에 붙여 넣으세요.</string>
+    <string name="browser_unavailable">사용 가능한 브라우저가 없습니다. 이 링크를 복사하여 브라우저에서 여세요.</string>
+    <string name="unable_to_reach_api_github_message">문제가 계속되면 GitHub를 열어 도움을 받으세요. 보고서나 기기 세부 정보는 첨부되지 않습니다.</string>
+    <string name="report_on_github">GitHub에 보고</string>
+    <string name="android_16_upgrade_warning_support_message">기기를 다시 시작하고 연결을 다시 시도하세요. 해결되지 않으면 %s에서 문제를 보고하세요.</string>
 </resources>

@@ -63,7 +63,7 @@
     <string name="auto_connect_carousel_first_slide_top_text">自動連線和鎖定模式設定皆可在 Android 系統設定中找到，請按照本指南的指示，啟用其中一項或兩項設定。</string>
     <string name="auto_connect_carousel_second_slide_bottom_text">2. 若要啟用自動連線，請按一下「一律啟用 VPN」旁邊的開關。</string>
     <string name="auto_connect_carousel_second_slide_top_text">自動連線在 Android 系統設定中稱為「始終啟用 VPN」，此功能可確保您始終與 VPN 通道連線，並且會在重新啟動後自動連線。</string>
-    <string name="auto_connect_carousel_third_slide_bottom_text">3. 若要啟用鎖定模式，請按一下「在沒有 VPN 的情況下封鎖連線」旁邊的開關。<br /><br /><b>警告：此設定會封鎖分割應用程式和「本機網路共享」功能。</b></string>
+    <string name="auto_connect_carousel_third_slide_bottom_text">3. 若要啟用鎖定模式，請按一下「在沒有 VPN 的情況下封鎖連線」旁邊的開關。<br /><br /><b>警告：此設定會封鎖已排除的應用程式，以及連線期間繞過 VPN 的舊版本機網路功能。未排除應用程式的本機規則不受此設定影響。</b></string>
     <string name="auto_connect_carousel_third_slide_top_text">在 Android 系統設定中，鎖定模式稱為「在沒有 VPN 的情況下封鎖連線」。這有助於讓洩漏的情形降至最低。然而，也有一些已知的侷限性。如需進一步的相關資訊，請按一下</string>
     <string name="auto_connect_carousel_third_slide_top_text_website_link">此處</string>
     <string name="automatic">自動</string>
@@ -297,7 +297,7 @@
     <string name="local_network_sharing_info2"><b>這可能會影響您的匿名性。</b>若使用公開或不受信任的網路，請避免啟用此功能，否則其他人可能會看到您的裝置。</string>
     <string name="local_network_sharing_info3">此應用程式允許本機多點傳送與廣播網路流量，以及往返私人 IP 範圍的流量繞過 VPN 通道。</string>
     <string name="local_network_sharing_info4"><b>私人 IP 範圍</b></string>
-    <string name="local_network_sharing_info_block_connections_warning"><b>注意：</b>本機網路共享與「在沒有 VPN 的情況下封鎖連線」不相容。</string>
+    <string name="local_network_sharing_info_block_connections_warning"><b>注意：</b>連線期間繞過 VPN 的舊版本機網路功能與「在沒有 VPN 的情況下封鎖連線」不相容。本機規則不受此設定影響。</string>
     <string name="location_added">%1$s (已新增)</string>
     <string name="location_was_added_to_list">已將 %1$s 新增至「%2$s」</string>
     <string name="location_was_removed_from_list">已將 %1$s 從「%2$s」中移除</string>
@@ -553,4 +553,17 @@
     <string name="you_can_add_more_time_play">您可以在帳戶畫面中增加時間，以繼續使用 VPN。</string>
     <string name="your_device">您的裝置</string>
     <string name="your_device_with_location">您的裝置 (%1$s)</string>
+    <string name="problem_report_github_description">%1$s 透過 GitHub 公開議題提供支援。開啟連結會將已檢查的文字分享給瀏覽器和 GitHub。切勿包含您的帳號。</string>
+    <string name="problem_report_message_hint">訊息</string>
+    <string name="open_github_issue">開啟 GitHub 議題</string>
+    <string name="problem_report_public_logs_notice">不會自動附加記錄或帳號資料。請在決定分享記錄之前檢查其內容。</string>
+    <string name="report_problem_message_is_empty">請輸入訊息</string>
+    <string name="problem_report_review">檢查議題</string>
+    <string name="problem_report_review_title">議題檢查</string>
+    <string name="problem_report_copy">複製議題文字</string>
+    <string name="problem_report_copy_fallback">請複製完整文字，開啟 GitHub，然後貼到新議題中。</string>
+    <string name="browser_unavailable">沒有可用的瀏覽器。請複製此連結並在瀏覽器中開啟。</string>
+    <string name="unable_to_reach_api_github_message">如果問題持續發生，請開啟 GitHub 尋求協助。不會附加報告或裝置詳細資訊。</string>
+    <string name="report_on_github">在 GitHub 上回報</string>
+    <string name="android_16_upgrade_warning_support_message">請重新啟動裝置並嘗試再次連線。如果仍無法解決，請在 %s 回報此問題。</string>
 </resources>

@@ -63,7 +63,7 @@
     <string name="auto_connect_carousel_first_slide_top_text">Automaattisen yhdistämisen ja lukitustilan asetukset löytyvät Androidin järjestelmäasetuksista. Voit ottaa jommankumman tai molemmat käyttöön tämän oppaan ohjeilla.</string>
     <string name="auto_connect_carousel_second_slide_bottom_text">2. Ota automaattinen yhteyden muodostus käyttöön napsauttamalla \"Aina päällä oleva VPN\" -kohdan vieressä olevaa valintapainiketta.</string>
     <string name="auto_connect_carousel_second_slide_top_text">Automaattista yhdistämistä kutsutaan aina päällä olevaksi VPN-yhteydeksi Androidin järjestelmäasetuksissa. Se varmistaa, että olet jatkuvasti yhteydessä VPN-tunneliin, sekä muodostaa yhteyden automaattisesti aina uudelleenkäynnistyksen jälkeen.</string>
-    <string name="auto_connect_carousel_third_slide_bottom_text">3. Ota lukitustila käyttöön napsauttamalla kohdan \"Estä yhteydet ilman VPN:ää\" vieressä olevaa kytkintä.<br /><br /><b>Varoitus: Tämä asetus estää jaetut sovellukset ja paikallisen verkon jakamisominaisuuden.</b></string>
+    <string name="auto_connect_carousel_third_slide_bottom_text">3. Ota lukitustila käyttöön napsauttamalla kohdan \"Estä yhteydet ilman VPN:ää\" vieressä olevaa kytkintä.<br /><br /><b>Varoitus: Tämä asetus estää pois suljetut sovellukset ja aiemman lähiverkon VPN-ohituksen yhteyden aikana. Mukana olevien sovellusten paikalliset säännöt ovat erillisiä.</b></string>
     <string name="auto_connect_carousel_third_slide_top_text">Lukitustila löytyy Android-järjestelmäasetuksista nimellä \"Estä yhteydet ilman VPN:ää\". Lukitustila auttaa minimoimaan vuodot, mutta siihen liittyy myös muutamia tunnettuja rajoituksia. Voit lukea niistä lisää</string>
     <string name="auto_connect_carousel_third_slide_top_text_website_link">täältä</string>
     <string name="automatic">Automaattinen</string>
@@ -297,7 +297,7 @@
     <string name="local_network_sharing_info2"><b>Tämä saattaa vaikuttaa anonymiteettiisi.</b> Vältä asetuksen käyttämistä julkisissa tai epäluotettavissa verkoissa, sillä laitteesi saattaa näkyä muille.</string>
     <string name="local_network_sharing_info3">Sovellus sallii VPN-tunnelin ohittamisen paikalliselle lähetys- ja monilähetysverkkoliikenteelle sekä liikenteelle yksityisille IP-alueille ja yksityisiltä IP-alueilta.</string>
     <string name="local_network_sharing_info4"><b>Yksityiset IP-alueet</b></string>
-    <string name="local_network_sharing_info_block_connections_warning"><b>Huomio:</b> paikallisen verkon jakaminen ei sovi yhteen Estä yhteydet ilman VPN:ää -asetuksen kanssa.</string>
+    <string name="local_network_sharing_info_block_connections_warning"><b>Huomio:</b> aiempi lähiverkon VPN-ohitus yhteyden aikana ei sovi yhteen Estä yhteydet ilman VPN:ää -asetuksen kanssa. Paikalliset säännöt ovat erillisiä.</string>
     <string name="location_added">%1$s (lisätty)</string>
     <string name="location_was_added_to_list">%1$s lisättiin luetteloon \"%2$s\"</string>
     <string name="location_was_removed_from_list">%1$s poistettiin luettelosta \"%2$s\"</string>
@@ -553,4 +553,17 @@
     <string name="you_can_add_more_time_play">Voit jatkaa VPN:n käyttöä lisäämällä aikaa tilinäkymän kautta.</string>
     <string name="your_device">Laitteesi</string>
     <string name="your_device_with_location">Laitteesi (%1$s)</string>
+    <string name="problem_report_github_description">Sovelluksen %1$s tuki käyttää julkisia GitHub-ongelmaraportteja. Linkin avaaminen jakaa tarkistetun tekstin selaimellesi ja GitHubille. Älä koskaan sisällytä tilinumeroasi.</string>
+    <string name="problem_report_message_hint">Viesti</string>
+    <string name="open_github_issue">Avaa GitHub-raportti</string>
+    <string name="problem_report_public_logs_notice">Lokeja tai tilitietoja ei liitetä automaattisesti. Tarkista lokit ennen kuin päätät jakaa ne.</string>
+    <string name="report_problem_message_is_empty">Syötä viesti</string>
+    <string name="problem_report_review">Tarkista raportti</string>
+    <string name="problem_report_review_title">Raportin tarkistus</string>
+    <string name="problem_report_copy">Kopioi raportin teksti</string>
+    <string name="problem_report_copy_fallback">Kopioi koko teksti, avaa GitHub ja liitä teksti uuteen ongelmaraporttiin.</string>
+    <string name="browser_unavailable">Selainta ei ole saatavilla. Kopioi tämä linkki ja avaa se selaimessa.</string>
+    <string name="unable_to_reach_api_github_message">Jos ongelma jatkuu, avaa GitHub saadaksesi apua. Raporttia tai laitteen tietoja ei liitetä.</string>
+    <string name="report_on_github">Ilmoita GitHubissa</string>
+    <string name="android_16_upgrade_warning_support_message">Käynnistä laite uudelleen ja yritä muodostaa yhteys uudelleen. Jos se ei auta, ilmoita ongelmasta osoitteessa %s.</string>
 </resources>

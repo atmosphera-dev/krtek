@@ -12,7 +12,7 @@ import net.mullvad.mullvadvpn.lib.common.compose.createCopyToClipboardHandle
 import net.mullvad.mullvadvpn.lib.ui.resource.R
 
 @Composable
-fun CopyableLink(url: String, modifier: Modifier = Modifier) {
+fun CopyableLink(url: String, modifier: Modifier = Modifier, onCopy: (() -> Unit)? = null) {
     val copyToClipboard = createCopyToClipboardHandle(isSensitive = true)
     Column(modifier = modifier) {
         Text(
@@ -22,7 +22,7 @@ fun CopyableLink(url: String, modifier: Modifier = Modifier) {
         SelectionContainer {
             Text(text = url, color = MaterialTheme.colorScheme.onSurface)
         }
-        TextButton(onClick = { copyToClipboard(url, null) }) {
+        TextButton(onClick = onCopy ?: { copyToClipboard(url, null) }) {
             Text(text = stringResource(R.string.copy))
         }
     }

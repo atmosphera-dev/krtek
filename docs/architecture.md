@@ -66,6 +66,32 @@ See [this document](relay-selector.md).
 
 ### Problem reports
 
+On Android, Krtek support goes to the shared GitHub issues URL, not the Mullvad
+report-upload or email endpoints. `ProblemReportRepository` owns the complete
+in-process description for its lifetime. Navigation, ViewModel teardown, local
+log deletion, copying and browser launch never clear that description. Drafts
+are not persisted across process death.
+
+The report editor requires a nonblank description, then creates an immutable
+`SupportIssueExport` for explicit review. The displayed title and complete body
+(including the device details) are the browser and clipboard inputs, with no
+hidden redaction or shortening. Editing invalidates the review, including a
+queued export. Each repository edit has a new draft identity, so returning to
+identical text cannot revive a prior review even if flow collection conflates
+the intermediate edit. The public-disclosure warning precedes review/export. A complete
+prefill above the existing 4096-character URL bound uses a bare new-issue link
+and complete-body copy instead. A browser launch cannot attest submission.
+Other help entry points use the bare issues link without exporting hidden
+device or report data. Logs remain locally collected/viewed/deleted; sharing
+them is a separate user action, never an automatic issue attachment.
+
+Extensive management-event logging retains upstream non-Local payload details.
+Its immutable logging projection removes Local policy before formatting
+Settings, and uses a scoped summary for Local status. Unknown envelope/Settings
+bytes are omitted because they can contain unrecognized Local data; subscriber
+messages are not modified. This is private on-device diagnostics, not automatic
+public disclosure.
+
 
 ## Talpid part of daemon
 

@@ -62,7 +62,7 @@
     <string name="auto_connect_carousel_first_slide_top_text">يمكن العثور على إعدادات \"الاتصال التلقائي\" و\"وضع التأمين\" في إعدادات نظام Android. اتَّبع هذا الدليل لتفعيل أحدهما أو كليهما.</string>
     <string name="auto_connect_carousel_second_slide_bottom_text">2. لتفعيل الاتصال التلقائي، انقر على زر التبديل بجوار \"تشغيل VPN دائمًا\".</string>
     <string name="auto_connect_carousel_second_slide_top_text">يُطلق على الاتصال التلقائي اسم \"تشغيل VPN دائمًا\" في إعدادات نظام Android، ويتأكد من اتصالك الدائم بنفق VPN ويتصل تلقائيًا بعد إعادة التشغيل.</string>
-    <string name="auto_connect_carousel_third_slide_bottom_text">3. لتفعيل وضع التأمين، انقر على زر التبديل بجوار \"حظر الاتصالات دون VPN\". <br /><br /><b>تحذير: يحظر هذا الإعداد التطبيقات المُقسَّمة وميزة مشاركة الشبكة المحلية.</b></string>
+    <string name="auto_connect_carousel_third_slide_bottom_text">3. لتفعيل وضع التأمين، انقر على زر التبديل بجوار \"حظر الاتصالات دون VPN\". <br /><br /><b>تحذير: يحظر هذا الإعداد التطبيقات المستثناة وتجاوز VPN القديم للشبكة المحلية أثناء الاتصال. قواعد الشبكة المحلية للتطبيقات المشمولة مستقلة عن ذلك.</b></string>
     <string name="auto_connect_carousel_third_slide_top_text">يُسمَّى \"وضع التأمين\" باسم \"حظر الاتصالات دون VPN\" في إعدادات نظام Android. يساعد هذا الوضع في تقليل التسريبات، لكن لديه بعض القيود المعروفة التي يمكنك قراءة المزيد عنها</string>
     <string name="auto_connect_carousel_third_slide_top_text_website_link">هنا</string>
     <string name="automatic">تلقائي</string>
@@ -287,7 +287,7 @@
     <string name="local_network_sharing_info2"><b>قد يؤثر ذلك على إخفاء هويتك.</b> تجنب تمكين هذا الإعداد على الشبكات العامة أو غير الموثوق بها، نظرًا لأن جهازك قد يكون مرئيًا للآخرين.</string>
     <string name="local_network_sharing_info3">يسمح التطبيق بحركة بيانات الشبكة المحلية للإرسال المتعدد والبث، بالإضافة إلى حركة البيانات إلى نطاقات IP الخاصة ومنها، لتجاوز قناة VPN.</string>
     <string name="local_network_sharing_info4"><b>نطاقات عناوين IP الخاصة</b></string>
-    <string name="local_network_sharing_info_block_connections_warning"><b>تنبيه:</b> مشاركة الشبكة المحلية لا يتوافق مع ميزة “حظر الاتصالات من دون VPN”.</string>
+    <string name="local_network_sharing_info_block_connections_warning"><b>تنبيه:</b> تجاوز VPN القديم للشبكة المحلية أثناء الاتصال غير متوافق مع \"حظر الاتصالات من دون VPN\". قواعد الشبكة المحلية مستقلة عن ذلك.</string>
     <string name="location_added">%1$s (تمت إضافته)</string>
     <string name="location_was_added_to_list">تمت إضافة %1$s إلى \"%2$s\"</string>
     <string name="location_was_removed_from_list">تمت إزالة %1$s من \"%2$s\"</string>
@@ -526,4 +526,17 @@
     <string name="you_can_add_more_time_play">يمكنك إضافة المزيد من الوقت من خلال طريقة عرض الحساب لمتابعة استخدام VPN.</string>
     <string name="your_device">جهازك</string>
     <string name="your_device_with_location">جهازك (%1$s)</string>
+    <string name="problem_report_github_description">يستخدم دعم %1$s بلاغات GitHub العامة. يؤدي فتح الرابط إلى مشاركة النص الذي راجعته مع متصفحك وGitHub. لا تدرج رقم حسابك أبدا.</string>
+    <string name="problem_report_message_hint">الرسالة</string>
+    <string name="open_github_issue">فتح بلاغ GitHub</string>
+    <string name="problem_report_public_logs_notice">لا ترفق السجلات أو بيانات الحساب تلقائيا. راجع السجلات قبل أن تختار مشاركتها.</string>
+    <string name="report_problem_message_is_empty">الرجاء إدخال رسالة</string>
+    <string name="problem_report_review">مراجعة البلاغ</string>
+    <string name="problem_report_review_title">مراجعة البلاغ</string>
+    <string name="problem_report_copy">نسخ نص البلاغ</string>
+    <string name="problem_report_copy_fallback">انسخ النص كاملا، وافتح GitHub، ثم الصقه في بلاغ جديد.</string>
+    <string name="browser_unavailable">لا يوجد متصفح متاح. انسخ هذا الرابط وافتحه في متصفح.</string>
+    <string name="unable_to_reach_api_github_message">إذا استمرت المشكلة، فافتح GitHub للحصول على المساعدة. لا ترفق أي تقارير أو تفاصيل عن الجهاز.</string>
+    <string name="report_on_github">الإبلاغ على GitHub</string>
+    <string name="android_16_upgrade_warning_support_message">أعد تشغيل جهازك وحاول الاتصال مرة أخرى. إذا لم ينجح ذلك، فأبلغ عن المشكلة على %s.</string>
 </resources>

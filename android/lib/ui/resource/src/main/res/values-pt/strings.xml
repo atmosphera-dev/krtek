@@ -63,7 +63,7 @@
     <string name="auto_connect_carousel_first_slide_top_text">As definições da ligação automática e do modo de bloqueio podem ser encontradas nas definições do sistema Android. Siga este guia para ativar uma ou ambas as funcionalidades.</string>
     <string name="auto_connect_carousel_second_slide_bottom_text">2. Para ativar a ligação automática, clique no botão de alternar junto a \"VPN sempre ligada\".</string>
     <string name="auto_connect_carousel_second_slide_top_text">A ligação automática é designada por VPN sempre ligada nas definições do sistema Android e assegura que está constantemente ligado ao túnel VPN e ligar-se-á automaticamente após o reinício.</string>
-    <string name="auto_connect_carousel_third_slide_bottom_text">3. Para ativar o modo de bloqueio, clique no botão de alternância junto a \"Bloquear ligações sem VPN\".<br /><br /><b>Aviso: esta definição bloqueia as aplicações divididas e a funcionalidade de Partilha de Rede Local.</b></string>
+    <string name="auto_connect_carousel_third_slide_bottom_text">3. Para ativar o modo de bloqueio, clique no botão de alternância junto a \"Bloquear ligações sem VPN\".<br /><br /><b>Aviso: esta definição bloqueia as aplicações excluídas e o desvio antigo da VPN para a rede local durante a ligação. As regras locais para aplicações incluídas são independentes.</b></string>
     <string name="auto_connect_carousel_third_slide_top_text">O modo de bloqueio é designado por \"Bloquear ligações sem VPN\" nas definições do sistema Android. Ajuda a minimizar fugas, mas tem algumas limitações conhecidas sobre as quais pode ler mais</string>
     <string name="auto_connect_carousel_third_slide_top_text_website_link">aqui</string>
     <string name="automatic">Automático</string>
@@ -297,7 +297,7 @@
     <string name="local_network_sharing_info2"><b>Pode afetar o seu anonimato.</b> Evite ativar em redes públicas ou não fidedignas, pois o seu dispositivo poderá ficar visível para outras pessoas.</string>
     <string name="local_network_sharing_info3">A aplicação permite que o tráfego local de rede multicast e broadcast, bem como o tráfego de e para intervalos de IP privados, contorne o túnel VPN.</string>
     <string name="local_network_sharing_info4"><b>Intervalos de IP privados</b></string>
-    <string name="local_network_sharing_info_block_connections_warning"><b>Atenção:</b> a partilha de rede local não é compatível com a opção \"Bloquear ligações sem VPN\".</string>
+    <string name="local_network_sharing_info_block_connections_warning"><b>Atenção:</b> o desvio antigo da VPN para a rede local durante a ligação não é compatível com \"Bloquear ligações sem VPN\". As regras locais são independentes.</string>
     <string name="location_added">%1$s (adicionado)</string>
     <string name="location_was_added_to_list">%1$s foi adicionado a \"%2$s\"</string>
     <string name="location_was_removed_from_list">%1$s foi removido de \"%2$s\"</string>
@@ -553,4 +553,17 @@
     <string name="you_can_add_more_time_play">Pode adicionar mais tempo através da vista de conta para continuar a utilizar a VPN.</string>
     <string name="your_device">O seu dispositivo</string>
     <string name="your_device_with_location">O seu dispositivo (%1$s)</string>
+    <string name="problem_report_github_description">O apoio ao %1$s utiliza problemas públicos no GitHub. Abrir a ligação partilha o texto revisto com o navegador e o GitHub. Nunca inclua o número da sua conta.</string>
+    <string name="problem_report_message_hint">Mensagem</string>
+    <string name="open_github_issue">Abrir problema no GitHub</string>
+    <string name="problem_report_public_logs_notice">Não são anexados registos nem dados da conta automaticamente. Reveja os registos antes de decidir partilhá-los.</string>
+    <string name="report_problem_message_is_empty">Introduza uma mensagem</string>
+    <string name="problem_report_review">Rever problema</string>
+    <string name="problem_report_review_title">Revisão do problema</string>
+    <string name="problem_report_copy">Copiar texto</string>
+    <string name="problem_report_copy_fallback">Copie o texto completo, abra o GitHub e cole-o num novo problema.</string>
+    <string name="browser_unavailable">Não há nenhum navegador disponível. Copie esta ligação e abra-a num navegador.</string>
+    <string name="unable_to_reach_api_github_message">Se o problema persistir, abra o GitHub para obter ajuda. Não são anexados relatórios nem detalhes do dispositivo.</string>
+    <string name="report_on_github">Comunicar no GitHub</string>
+    <string name="android_16_upgrade_warning_support_message">Reinicie o dispositivo e tente ligar novamente. Se não funcionar, comunique o problema em %s.</string>
 </resources>

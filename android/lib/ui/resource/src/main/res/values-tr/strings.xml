@@ -63,7 +63,7 @@
     <string name="auto_connect_carousel_first_slide_top_text">Otomatik Bağlantı ve Kilitleme modu ayarları Android sistem ayarlarında yer alır. Bu ayarlardan birini veya her ikisini de etkinleştirmek için bu kılavuza göz atın.</string>
     <string name="auto_connect_carousel_second_slide_bottom_text">2. Otomatik bağlantıyı etkinleştirmek için \"VPN her zaman açık\" seçeneğinin yanındaki düğmeye tıklayın.</string>
     <string name="auto_connect_carousel_second_slide_top_text">Otomatik bağlantı, Android sistem ayarlarında VPN her zaman açık olarak gösterilir ve VPN tüneline sürekli bağlı olmanızı ve yeniden başlatma sonrası otomatik olarak bağlanmanızı sağlar.</string>
-    <string name="auto_connect_carousel_third_slide_bottom_text">3. Kilitleme modunu etkinleştirmek için \"VPN üzerinden olmayan bağlantıları engelle\" seçeneğinin yanındaki düğmeye tıklayın.<br /><br /><b>Uyarı: Bu ayar, bölünmüş uygulamaları ve Yerel Ağ Paylaşımı özelliğini engeller.</b></string>
+    <string name="auto_connect_carousel_third_slide_bottom_text">3. Kilitleme modunu etkinleştirmek için \"VPN üzerinden olmayan bağlantıları engelle\" seçeneğinin yanındaki düğmeye tıklayın.<br /><br /><b>Uyarı: Bu ayar, hariç tutulan uygulamaları ve bağlıyken eski yerel ağ VPN atlamasını engeller. Dahil edilen uygulamaların yerel kuralları bağımsızdır.</b></string>
     <string name="auto_connect_carousel_third_slide_top_text">Android sistem ayarlarında \"Kilitleme modu VPN üzerinden olmayan bağlantıları engelle\" olarak adlandırılmıştır. Bu özellik, sızıntıları en aza indirmeye yardımcı olsa da ayrıntılar konusunda bilgi edinmeniz gereken bazı bilinen sınırlamaları vardır</string>
     <string name="auto_connect_carousel_third_slide_top_text_website_link">burada</string>
     <string name="automatic">Otomatik</string>
@@ -297,7 +297,7 @@
     <string name="local_network_sharing_info2"><b>Bu durum anonimliğinizi etkileyebilir.</b> Cihazınız başkaları tarafından görülebileceğinden bu özelliği güvenli olmayan veya herkese açık ağlarda etkinleştirmeyin.</string>
     <string name="local_network_sharing_info3">Bu uygulama, yerel çok noktaya yayın ve yayın ağ trafiğinin yanı sıra özel IP aralıklarına giden ve bu aralıklardan gelen trafiğin VPN tünelini atlamasına olanak tanır.</string>
     <string name="local_network_sharing_info4"><b>Özel IP aralıkları</b></string>
-    <string name="local_network_sharing_info_block_connections_warning"><b>Dikkat:</b> Yerel ağ paylaşımı, \"VPN üzerinden olmayan bağlantıları engelle\" seçeneğiyle uyumlu değil.</string>
+    <string name="local_network_sharing_info_block_connections_warning"><b>Dikkat:</b> Bağlıyken eski yerel ağ VPN atlaması, \"VPN üzerinden olmayan bağlantıları engelle\" seçeneğiyle uyumlu değildir. Yerel kurallar bağımsızdır.</string>
     <string name="location_added">%1$s (eklendi)</string>
     <string name="location_was_added_to_list">%1$s, \"%2$s\" listesine eklendi</string>
     <string name="location_was_removed_from_list">%1$s, \"%2$s\" listesinden kaldırıldı</string>
@@ -553,4 +553,17 @@
     <string name="you_can_add_more_time_play">VPN kullanmaya devam etmek için hesap görünümünden daha fazla süre ekleyebilirsiniz.</string>
     <string name="your_device">Cihazınız</string>
     <string name="your_device_with_location">Cihazınız (%1$s)</string>
+    <string name="problem_report_github_description">%1$s desteği herkese açık GitHub sorunlarını kullanır. Bağlantıyı açmak, gözden geçirilen metni tarayıcınız ve GitHub ile paylaşır. Hesap numaranızı asla eklemeyin.</string>
+    <string name="problem_report_message_hint">Mesaj</string>
+    <string name="open_github_issue">GitHub sorunu aç</string>
+    <string name="problem_report_public_logs_notice">Günlükler veya hesap verileri otomatik olarak eklenmez. Paylaşmayı seçmeden önce günlükleri gözden geçirin.</string>
+    <string name="report_problem_message_is_empty">Lütfen bir mesaj girin</string>
+    <string name="problem_report_review">Sorunu gözden geçir</string>
+    <string name="problem_report_review_title">Sorun incelemesi</string>
+    <string name="problem_report_copy">Sorun metnini kopyala</string>
+    <string name="problem_report_copy_fallback">Metnin tamamını kopyalayın, GitHub\'ı açın ve yeni bir soruna yapıştırın.</string>
+    <string name="browser_unavailable">Kullanılabilir tarayıcı yok. Bu bağlantıyı kopyalayıp bir tarayıcıda açın.</string>
+    <string name="unable_to_reach_api_github_message">Sorun devam ederse yardım almak için GitHub\'ı açın. Rapor veya cihaz ayrıntıları eklenmez.</string>
+    <string name="report_on_github">GitHub\'da bildir</string>
+    <string name="android_16_upgrade_warning_support_message">Cihazınızı yeniden başlatıp tekrar bağlanmayı deneyin. İşe yaramazsa sorunu %s adresinde bildirin.</string>
 </resources>

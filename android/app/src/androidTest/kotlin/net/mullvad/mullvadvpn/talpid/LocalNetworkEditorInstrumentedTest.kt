@@ -1,5 +1,9 @@
 package net.mullvad.mullvadvpn.talpid
 
+import android.app.Activity
+import android.app.Instrumentation
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.graphics.Rect
 import android.os.Bundle
@@ -8,9 +12,14 @@ import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.ComposeUiTest
 import androidx.compose.ui.test.ExperimentalTestApi
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasScrollToIndexAction
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.hasTestTag
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performScrollToIndex
+import androidx.compose.ui.test.performTextReplacement
 import androidx.compose.ui.test.v2.AndroidComposeUiTestEnvironment
 import androidx.compose.ui.test.v2.runEmptyComposeUiTest
 import androidx.test.platform.app.InstrumentationRegistry
@@ -19,6 +28,7 @@ import androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry
 import androidx.test.runner.lifecycle.Stage
 import java.util.ArrayDeque
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.assertEquals
@@ -33,7 +43,10 @@ import net.mullvad.mullvadvpn.app.MullvadApplication
 import net.mullvad.mullvadvpn.feature.lansharing.impl.R
 import net.mullvad.mullvadvpn.lib.model.LocalNetworkAccess
 import net.mullvad.mullvadvpn.lib.model.SsidIdentity
+import net.mullvad.mullvadvpn.lib.repository.ProblemReportRepository
 import net.mullvad.mullvadvpn.lib.repository.SettingsRepository
+import net.mullvad.mullvadvpn.lib.ui.resource.R as CommonR
+import net.mullvad.mullvadvpn.lib.usecase.SupportIssueUseCase
 import org.junit.jupiter.api.Test
 import org.koin.android.ext.android.getKoin
 
@@ -310,6 +323,187 @@ class LocalNetworkEditorInstrumentedTest {
 
     internal fun requireRenderedText(expected: String) {
         awaitNode(true) { it.text?.toString() == expected }
+    }
+
+    /** B7 only: real shipped UI and intercepted Android intents, never a public request. */
+    internal fun verifySupportAndGuide() {
+        val koin = (target.applicationContext as MullvadApplication).getKoin()
+        val repository = koin.get<ProblemReportRepository>()
+        val support = koin.get<SupportIssueUseCase>()
+        val original = repository.problemReport.value.description
+        val clipboard = target.getSystemService(ClipboardManager::class.java)
+        var savedClip: ClipData? = null
+        instrumentation.runOnMainSync { savedClip = clipboard.primaryClip?.let { ClipData(it) } }
+        val outgoing = LinkedBlockingQueue<Intent>()
+        val monitor =
+            object : Instrumentation.ActivityMonitor() {
+                override fun onStartActivity(intent: Intent): Instrumentation.ActivityResult {
+                    // Block every external start, including an unexpected email/share regression.
+                    outgoing.add(Intent(intent))
+                    return Instrumentation.ActivityResult(Activity.RESULT_CANCELED, null)
+                }
+            }
+        instrumentation.addMonitor(monitor)
+        fun messageField() = compose.onNode(hasSetTextAction(), useUnmergedTree = true)
+        fun replaceMessage(text: String) {
+            messageField().performScrollTo().performTextReplacement(text)
+            compose.waitForIdle()
+            assertEquals(
+                text,
+                messageField().fetchSemanticsNode().config[SemanticsProperties.EditableText].text,
+            )
+        }
+        fun copiedText(): String? {
+            var text: String? = null
+            instrumentation.runOnMainSync {
+                text = clipboard.primaryClip?.getItemAt(0)?.text?.toString()
+            }
+            return text
+        }
+        try {
+            // Local screen -> VPN settings -> Settings. No settings are changed.
+            back()
+            back()
+            click(copy(CommonR.string.report_a_problem))
+            requireRenderedText(
+                copy(
+                    CommonR.string.problem_report_github_description,
+                    copy(CommonR.string.app_name),
+                )
+            )
+            compose.onNode(hasText(copy(CommonR.string.open_github_issue))).assertDoesNotExist()
+            replaceMessage(" \n\t ")
+            click(copy(CommonR.string.problem_report_review))
+            requireRenderedText(copy(CommonR.string.report_problem_message_is_empty))
+            for (message in
+                listOf(
+                    "  B7 🦔 & 中文 1234 5678 9012 3456\nUnsent original  ",
+                    "B7 中文🦔& ".repeat(500),
+                )) {
+                replaceMessage(message)
+                compose
+                    .onNode(hasText(copy(CommonR.string.report_problem_message_is_empty)))
+                    .assertDoesNotExist()
+                compose.onNode(hasText(copy(CommonR.string.open_github_issue))).assertDoesNotExist()
+                click(copy(CommonR.string.problem_report_review))
+                val expected = support(message, copy(CommonR.string.report_a_problem))
+                assertTrue(expected.body.startsWith(message + "\n\n"))
+                assertEquals(
+                    expected.body,
+                    compose
+                        .onNode(hasText(expected.body), useUnmergedTree = true)
+                        .fetchSemanticsNode()
+                        .config[SemanticsProperties.Text]
+                        .single()
+                        .text,
+                )
+                if (expected.prefilledUrl == null) {
+                    requireRenderedText(copy(CommonR.string.problem_report_copy_fallback))
+                    requireRenderedText(expected.issuePageUrl)
+                }
+                val clipboardChanged = CountDownLatch(1)
+                val listener = ClipboardManager.OnPrimaryClipChangedListener {
+                    clipboardChanged.countDown()
+                }
+                instrumentation.runOnMainSync { clipboard.addPrimaryClipChangedListener(listener) }
+                try {
+                    click(copy(CommonR.string.problem_report_copy))
+                    assertTrue(
+                        clipboardChanged.await(10, TimeUnit.SECONDS),
+                        "Actual clipboard change did not arrive",
+                    )
+                    assertEquals(
+                        expected.body,
+                        copiedText(),
+                        "Actual clipboard equals the complete review",
+                    )
+                } finally {
+                    instrumentation.runOnMainSync {
+                        clipboard.removePrimaryClipChangedListener(listener)
+                    }
+                }
+                click(copy(CommonR.string.open_github_issue))
+                val intent =
+                    checkNotNull(outgoing.poll(10, TimeUnit.SECONDS)) {
+                        "Reviewed action did not reach Android"
+                    }
+                assertEquals(Intent.ACTION_VIEW, intent.action)
+                assertEquals(expected.url, intent.dataString)
+                check(intent.extras == null && intent.clipData == null && intent.type == null) {
+                    "Unexpected support attachment; private data withheld"
+                }
+                assertTrue(
+                    outgoing.isEmpty(),
+                    "One deliberate action emits exactly one browser intent",
+                )
+                assertEquals(
+                    message,
+                    repository.problemReport.value.description,
+                    "Browser launch is not issue submission",
+                )
+                // Leave and recreate the screen; the repository still owns the full original.
+                click(copy(CommonR.string.back), scroll = false)
+                click(copy(CommonR.string.report_a_problem))
+                assertEquals(
+                    message,
+                    messageField()
+                        .fetchSemanticsNode()
+                        .config[SemanticsProperties.EditableText]
+                        .text,
+                )
+                compose.onNode(hasText(copy(CommonR.string.open_github_issue))).assertDoesNotExist()
+            }
+            click(copy(CommonR.string.back), scroll = false)
+            click(copy(CommonR.string.settings_vpn))
+            click(copy(CommonR.string.auto_connect_and_lockdown_mode))
+            compose.onNode(hasScrollToIndexAction()).performScrollToIndex(2)
+            val warning =
+                copy(CommonR.string.auto_connect_carousel_third_slide_bottom_text)
+                    .substringAfter("<b>")
+                    .substringBefore("</b>")
+            compose
+                .onNode(hasText(warning, substring = true), useUnmergedTree = true)
+                .assertIsDisplayed()
+            back()
+            click(copy(CommonR.string.local_network_sharing))
+            instrumentation.sendStatus(
+                0,
+                Bundle().apply {
+                    putString(
+                        "krtek_support_review",
+                        "PASS: complete short/oversized review, clipboard and blocked ACTION_VIEW, retained draft, localized lockdown guide",
+                    )
+                },
+            )
+        } finally {
+            instrumentation.removeMonitor(monitor)
+            instrumentation.runOnMainSync {
+                repository.setDescription(original)
+                savedClip?.let(clipboard::setPrimaryClip) ?: clipboard.clearPrimaryClip()
+                val restored = clipboard.primaryClip
+                check(restored?.itemCount == savedClip?.itemCount) {
+                    "Clipboard restoration failed"
+                }
+                savedClip?.let { saved ->
+                    val actual = checkNotNull(restored)
+                    for (index in 0 until saved.itemCount) {
+                        val expectedItem = saved.getItemAt(index)
+                        val actualItem = actual.getItemAt(index)
+                        check(
+                            expectedItem.text?.toString() == actualItem.text?.toString() &&
+                                expectedItem.htmlText == actualItem.htmlText &&
+                                expectedItem.uri == actualItem.uri &&
+                                expectedItem.intent?.toUri(0) == actualItem.intent?.toUri(0)
+                        ) {
+                            "Clipboard contents changed; private data withheld"
+                        }
+                    }
+                }
+            }
+            check(repository.problemReport.value.description == original) {
+                "Support draft restoration failed; private text withheld"
+            }
+        }
     }
 
     internal fun requireConnectedDraft(ssid: SsidIdentity) {

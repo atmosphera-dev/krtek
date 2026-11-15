@@ -63,7 +63,7 @@
     <string name="auto_connect_carousel_first_slide_top_text">Die Einstellungen für die automatische Verbindung und den Sperrmodus finden Sie in den Android-Systemeinstellungen. Folgen Sie dieser Anleitung, um eine oder beide Einstellungen zu aktivieren.</string>
     <string name="auto_connect_carousel_second_slide_bottom_text">2. Um die automatische Verbindung zu aktivieren, klicken Sie auf den Kippschalter neben „Always-on VPN“.</string>
     <string name="auto_connect_carousel_second_slide_top_text">Die automatische Verbindung wird in den Android-Systemeinstellungen als „Always-on VPN“ bezeichnet und sorgt dafür, dass Sie ständig mit dem VPN-Tunnel verbunden sind und sich nach einem Neustart automatisch verbinden.</string>
-    <string name="auto_connect_carousel_third_slide_bottom_text">3. Um den Sperrmodus zu aktivieren, klicken Sie auf den Kippschalter neben „Verbindungen ohne VPN blockieren“.<br /><br /><b>Warnung: Diese Einstellung blockiert geteilte Apps und die Funktion der lokalen Netzwerkfreigabe.</b></string>
+    <string name="auto_connect_carousel_third_slide_bottom_text">3. Um den Sperrmodus zu aktivieren, klicken Sie auf den Kippschalter neben „Verbindungen ohne VPN blockieren“.<br /><br /><b>Warnung: Diese Einstellung blockiert ausgeschlossene Apps und die bisherige lokale Netzwerkumgehung bei aktiver VPN-Verbindung. Lokale Regeln für eingeschlossene Apps sind unabhängig davon.</b></string>
     <string name="auto_connect_carousel_third_slide_top_text">Der Sperrmodus heißt in den Android-Systemeinstellungen „Verbindungen ohne VPN blockieren“. Dieser trägt dazu bei, Lecks zu minimieren, hat jedoch einige bekannte Einschränkungen. Mehr dazu finden Sie</string>
     <string name="auto_connect_carousel_third_slide_top_text_website_link">hier</string>
     <string name="automatic">Automatisch</string>
@@ -297,7 +297,7 @@
     <string name="local_network_sharing_info2"><b>Dies kann Ihre Anonymität beeinträchtigen.</b> Aktivieren Sie diese Option nicht in öffentlichen oder nicht vertrauenswürdigen Netzwerken, da Ihr Gerät sonst für andere sichtbar werden könnte.</string>
     <string name="local_network_sharing_info3">Die App ermöglicht lokalen Multicast- und Broadcast-Netzwerk-Traffic sowie Traffic zu und von privaten IP-Bereichen, um den VPN-Tunnel zu umgehen.</string>
     <string name="local_network_sharing_info4"><b>Private IP-Bereiche</b></string>
-    <string name="local_network_sharing_info_block_connections_warning"><b>Achtung:</b> Die Freigabe über das lokale Netzwerk ist nicht mit der Funktion „Verbindungen ohne VPN blockieren“ kompatibel.</string>
+    <string name="local_network_sharing_info_block_connections_warning"><b>Achtung:</b> Die bisherige lokale Netzwerkumgehung bei aktiver VPN-Verbindung ist nicht mit „Verbindungen ohne VPN blockieren“ kompatibel. Lokale Regeln sind unabhängig davon.</string>
     <string name="location_added">%1$s (hinzugefügt)</string>
     <string name="location_was_added_to_list">%1$s wurde zu „%2$s“ hinzugefügt</string>
     <string name="location_was_removed_from_list">%1$s wurde von „%2$s“ entfernt</string>
@@ -553,4 +553,17 @@
     <string name="you_can_add_more_time_play">Sie können über die Kontoansicht Zeit hinzufügen, um das VPN weiterhin zu verwenden.</string>
     <string name="your_device">Ihr Gerät</string>
     <string name="your_device_with_location">Ihr Gerät (%1$s)</string>
+    <string name="problem_report_github_description">Der Support für %1$s nutzt öffentliche GitHub-Issues. Beim Öffnen des Links wird der überprüfte Text an Ihren Browser und GitHub weitergegeben. Geben Sie niemals Ihre Kontonummer an.</string>
+    <string name="problem_report_message_hint">Nachricht</string>
+    <string name="open_github_issue">GitHub-Issue öffnen</string>
+    <string name="problem_report_public_logs_notice">Protokolle oder Kontodaten werden nicht automatisch angehängt. Prüfen Sie die Protokolle, bevor Sie sie bewusst teilen.</string>
+    <string name="report_problem_message_is_empty">Geben Sie bitte eine Nachricht ein</string>
+    <string name="problem_report_review">Issue überprüfen</string>
+    <string name="problem_report_review_title">Issue-Überprüfung</string>
+    <string name="problem_report_copy">Issue-Text kopieren</string>
+    <string name="problem_report_copy_fallback">Kopieren Sie den vollständigen Text, öffnen Sie GitHub und fügen Sie ihn in ein neues Issue ein.</string>
+    <string name="browser_unavailable">Kein Browser verfügbar. Kopieren Sie diesen Link und öffnen Sie ihn in einem Browser.</string>
+    <string name="unable_to_reach_api_github_message">Wenn das Problem weiterhin besteht, öffnen Sie GitHub, um Hilfe zu erhalten. Es werden kein Bericht und keine Gerätedetails angehängt.</string>
+    <string name="report_on_github">Auf GitHub melden</string>
+    <string name="android_16_upgrade_warning_support_message">Starten Sie Ihr Gerät neu und versuchen Sie erneut, eine Verbindung herzustellen. Falls dies nicht hilft, melden Sie das Problem unter %s.</string>
 </resources>

@@ -136,9 +136,11 @@ class LocalNetworkDeliveryInstrumentedTest {
     private fun withConsumer(
         expectation: ForwardingAvailability?,
         testTimeout: Duration = 1.minutes,
+        after: (LocalNetworkEditorInstrumentedTest) -> Unit = {},
         block: (Consumer, SettingsRepository, ConnectionProxy) -> Unit,
     ) {
         LocalNetworkEditorInstrumentedTest().withLocalAccessScreen(testTimeout = testTimeout) {
+            editor ->
             val koin = (target.applicationContext as MullvadApplication).getKoin()
             val repository = koin.get<SettingsRepository>()
             val connection = koin.get<ConnectionProxy>()
@@ -209,6 +211,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                     awaitState(repository, connection, forwarding, null)
                     block(consumer, repository, connection)
                 }
+                after(editor)
             } finally {
                 before.forEach { (key, _) ->
                     val (name, permission) = key
@@ -293,7 +296,10 @@ class LocalNetworkDeliveryInstrumentedTest {
     // extend this same method before the final clean-pair B7 campaign.
     @Test
     fun rulesOffMatchesUpstream() =
-        withConsumer(null, testTimeout = 8.minutes) { consumer, repository, connection ->
+        withConsumer(null, testTimeout = 8.minutes, after = { it.verifySupportAndGuide() }) {
+            consumer,
+            repository,
+            connection ->
             withPolicy(repository, LocalNetworkAccess()) {
                 withOrderedTunnelEvents { events ->
                     var failure: Throwable? = null

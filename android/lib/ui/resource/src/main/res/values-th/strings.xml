@@ -63,7 +63,7 @@
     <string name="auto_connect_carousel_first_slide_top_text">การตั้งค่าการเชื่อมต่ออัตโนมัติและโหมดล็อกดาวน์ อยู่ในการตั้งค่าระบบ Android โปรดทำตามคำแนะนำนี้ เพื่อเปิดใช้งานโหมดใดโหมดหนึ่ง หรือทั้งสองโหมด</string>
     <string name="auto_connect_carousel_second_slide_bottom_text">2. ในการเปิดใช้การเชื่อมต่ออัตโนมัติ ให้คลิกปุ่มเปิด/ปิดที่อยู่ถัดจาก \"VPN เปิดอยู่เสมอ\"</string>
     <string name="auto_connect_carousel_second_slide_top_text">การเชื่อมต่ออัตโนมัติเรียกว่า Always-on VPN ในการตั้งค่าระบบ Android ซึ่งจะช่วยให้คุณมั่นใจได้ว่า คุณเชื่อมต่อกับช่องทาง VPN อย่างต่อเนื่อง และมีการเชื่อมต่ออัตโนมัติหลังจากรีสตาร์ต</string>
-    <string name="auto_connect_carousel_third_slide_bottom_text">3. ในการเปิดโหมดล็อกดาวน์ ให้คลิกปุ่มเปิด/ปิดที่อยู่ถัดจาก \"ปิดกั้นการเชื่อมต่อที่ไม่ใช้ VPN\"<br /><br /><b>คำเตือน: การตั้งค่านี้จะบล็อกแอปที่มีการแยก และคุณลักษณะการแชร์เครือข่ายท้องถิ่น</b></string>
+    <string name="auto_connect_carousel_third_slide_bottom_text">3. ในการเปิดโหมดล็อกดาวน์ ให้คลิกปุ่มเปิด/ปิดที่อยู่ถัดจาก \"ปิดกั้นการเชื่อมต่อที่ไม่ใช้ VPN\"<br /><br /><b>คำเตือน: การตั้งค่านี้จะบล็อกแอปที่ยกเว้นและการข้าม VPN สำหรับเครือข่ายท้องถิ่นแบบเดิมขณะเชื่อมต่อ กฎท้องถิ่นสำหรับแอปที่รวมอยู่ทำงานแยกกัน</b></string>
     <string name="auto_connect_carousel_third_slide_top_text">โหมดล็อกดาวน์ถูกเรียกว่า \"ปิดกั้นการเชื่อมต่อที่ไม่ใช้ VPN\" ในการตั้งค่าระบบ Android ซึ่งจะช่วยลดการรั่วไหล แต่ก็มีข้อจำกัดบางประการ ซึ่งคุณสามารถอ่านข้อมูลเพิ่มเติมเกี่ยวกับเรื่องดังกล่าวได้</string>
     <string name="auto_connect_carousel_third_slide_top_text_website_link">ที่นี่</string>
     <string name="automatic">อัตโนมัติ</string>
@@ -297,7 +297,7 @@
     <string name="local_network_sharing_info2"><b>รายการนี้อาจส่งผลกระทบต่อการไม่ระบุตัวตนของคุณ</b> หลีกเลี่ยงการเปิดใช้งานรายการบนเครือข่ายสาธารณะหรือไม่น่าเชื่อถือ เนื่องจากอุปกรณ์ของคุณอาจปรากฏให้ผู้อื่นเห็นได้</string>
     <string name="local_network_sharing_info3">แอปอนุญาตให้การรับส่งข้อมูลทางเครือข่ายมัลติคาสต์และช่วงการเผยแพร่ในท้องถิ่น รวมถึงการรับส่งข้อมูลเข้าและออกจากช่วง IP ส่วนตัว สามารถบายพาสอุโมงค์ VPN ได้</string>
     <string name="local_network_sharing_info4"><b>ช่วง IP ส่วนตัว</b></string>
-    <string name="local_network_sharing_info_block_connections_warning"><b>ข้อควรระวัง:</b> การแชร์เครือข่ายท้องถิ่นไม่รองรับการใช้งานร่วมกับ \"ปิดกั้นการเชื่อมต่อที่ไม่ใช้ VPN\"</string>
+    <string name="local_network_sharing_info_block_connections_warning"><b>ข้อควรระวัง:</b> การข้าม VPN สำหรับเครือข่ายท้องถิ่นแบบเดิมขณะเชื่อมต่อใช้ร่วมกับ \"ปิดกั้นการเชื่อมต่อที่ไม่ใช้ VPN\" ไม่ได้ กฎท้องถิ่นทำงานแยกกัน</string>
     <string name="location_added">%1$s (เพิ่มแล้ว)</string>
     <string name="location_was_added_to_list">เพิ่ม %1$s ลงใน \"%2$s\" แล้ว</string>
     <string name="location_was_removed_from_list">%1$s ถูกลบออกจาก \"%2$s” แล้ว</string>
@@ -553,4 +553,17 @@
     <string name="you_can_add_more_time_play">คุณสามารถเพิ่มเวลาผ่านทางหน้าบัญชีเพื่อใช้งาน VPN ต่อได้</string>
     <string name="your_device">อุปกรณ์ของคุณ</string>
     <string name="your_device_with_location">อุปกรณ์ของคุณ (%1$s)</string>
+    <string name="problem_report_github_description">การสนับสนุน %1$s ใช้ประเด็นปัญหาสาธารณะบน GitHub การเปิดลิงก์จะแชร์ข้อความที่ตรวจทานแล้วกับเบราว์เซอร์และ GitHub ห้ามใส่หมายเลขบัญชีของคุณ</string>
+    <string name="problem_report_message_hint">ข้อความ</string>
+    <string name="open_github_issue">เปิดประเด็นบน GitHub</string>
+    <string name="problem_report_public_logs_notice">ไม่มีการแนบบันทึกหรือข้อมูลบัญชีโดยอัตโนมัติ ตรวจทานบันทึกก่อนเลือกแชร์</string>
+    <string name="report_problem_message_is_empty">โปรดป้อนข้อความ</string>
+    <string name="problem_report_review">ตรวจทานประเด็น</string>
+    <string name="problem_report_review_title">การตรวจทานประเด็น</string>
+    <string name="problem_report_copy">คัดลอกข้อความ</string>
+    <string name="problem_report_copy_fallback">คัดลอกข้อความทั้งหมด เปิด GitHub แล้ววางลงในประเด็นใหม่</string>
+    <string name="browser_unavailable">ไม่มีเบราว์เซอร์ที่ใช้งานได้ คัดลอกลิงก์นี้แล้วเปิดในเบราว์เซอร์</string>
+    <string name="unable_to_reach_api_github_message">หากปัญหายังคงอยู่ ให้เปิด GitHub เพื่อขอความช่วยเหลือ ไม่มีการแนบรายงานหรือรายละเอียดอุปกรณ์</string>
+    <string name="report_on_github">รายงานบน GitHub</string>
+    <string name="android_16_upgrade_warning_support_message">รีสตาร์ทอุปกรณ์แล้วลองเชื่อมต่ออีกครั้ง หากยังไม่ได้ผล ให้รายงานปัญหาที่ %s</string>
 </resources>

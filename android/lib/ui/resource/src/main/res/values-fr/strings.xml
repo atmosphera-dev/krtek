@@ -63,7 +63,7 @@
     <string name="auto_connect_carousel_first_slide_top_text">Les paramètres de la connexion automatique et du mode Verrouillage se trouvent dans les paramètres du système Android, suivez ce guide pour activer l\'un, l\'autre ou les deux.</string>
     <string name="auto_connect_carousel_second_slide_bottom_text">2. Pour activer la connexion automatique, cliquez sur l\'interrupteur situé à côté de « Toujours exiger un VPN ».</string>
     <string name="auto_connect_carousel_second_slide_top_text">La connexion automatique est appelée VPN toujours actif dans les paramètres du système Android et elle s\'assure que vous êtes constamment connecté au tunnel VPN et se connecte automatiquement après le redémarrage.</string>
-    <string name="auto_connect_carousel_third_slide_bottom_text">3. Pour activer le mode Verrouillage, cliquez sur l\'interrupteur situé à côté de « Bloquer les connexions sans VPN ».<br /><br /><b>Avertissement : ce paramètre bloque les applications fractionnées et la fonctionnalité de partage du réseau local.</b></string>
+    <string name="auto_connect_carousel_third_slide_bottom_text">3. Pour activer le mode Verrouillage, cliquez sur l\'interrupteur situé à côté de « Bloquer les connexions sans VPN ».<br /><br /><b>Avertissement : ce paramètre bloque les applications exclues et le contournement historique du VPN pour le réseau local pendant la connexion. Les règles locales des applications incluses sont indépendantes.</b></string>
     <string name="auto_connect_carousel_third_slide_top_text">Le mode Verrouillage est appelé « Bloquer les connexions sans VPN » dans les paramètres système d\'Android. Il permet de minimiser les fuites, mais présente des limites connues sur lesquelles vous pouvez en savoir plus</string>
     <string name="auto_connect_carousel_third_slide_top_text_website_link">ici</string>
     <string name="automatic">Automatique</string>
@@ -297,7 +297,7 @@
     <string name="local_network_sharing_info2"><b>Ceci peut impacter votre anonymat.</b> Évitez d\'activer cette option sur des réseaux publics ou non fiables, car votre appareil pourrait devenir visible pour d\'autres utilisateurs.</string>
     <string name="local_network_sharing_info3">L\'application permet au trafic réseau local de multidiffusion et de diffusion, ainsi qu\'au trafic à destination et en provenance de plages d\'adresses IP privées, de contourner le tunnel VPN.</string>
     <string name="local_network_sharing_info4"><b>Plages d\'IP privées</b></string>
-    <string name="local_network_sharing_info_block_connections_warning"><b>Attention :</b> le partage sur réseau local n\'est pas compatible avec « Bloquer les connexions sans VPN ».</string>
+    <string name="local_network_sharing_info_block_connections_warning"><b>Attention :</b> le contournement historique du VPN pour le réseau local pendant la connexion n\'est pas compatible avec « Bloquer les connexions sans VPN ». Les règles locales sont indépendantes.</string>
     <string name="location_added">%1$s (ajouté)</string>
     <string name="location_was_added_to_list">%1$s a été ajouté à « %2$s »</string>
     <string name="location_was_removed_from_list">%1$s a été retiré de « %2$s »</string>
@@ -553,4 +553,17 @@
     <string name="you_can_add_more_time_play">Vous pouvez ajouter plus de temps via la vue du compte pour continuer d\'utiliser le VPN.</string>
     <string name="your_device">Votre appareil</string>
     <string name="your_device_with_location">Votre appareil (%1$s)</string>
+    <string name="problem_report_github_description">L\'assistance de %1$s utilise des tickets publics sur GitHub. Ouvrir le lien partage le texte vérifié avec votre navigateur et GitHub. N\'incluez jamais votre numéro de compte.</string>
+    <string name="problem_report_message_hint">Message</string>
+    <string name="open_github_issue">Ouvrir un ticket GitHub</string>
+    <string name="problem_report_public_logs_notice">Aucun journal ni aucune donnée de compte ne sont joints automatiquement. Vérifiez les journaux avant de choisir de les partager.</string>
+    <string name="report_problem_message_is_empty">Veuillez saisir un message</string>
+    <string name="problem_report_review">Vérifier le ticket</string>
+    <string name="problem_report_review_title">Vérification du ticket</string>
+    <string name="problem_report_copy">Copier le texte</string>
+    <string name="problem_report_copy_fallback">Copiez le texte complet, ouvrez GitHub, puis collez-le dans un nouveau ticket.</string>
+    <string name="browser_unavailable">Aucun navigateur disponible. Copiez ce lien et ouvrez-le dans un navigateur.</string>
+    <string name="unable_to_reach_api_github_message">Si le problème persiste, ouvrez GitHub pour obtenir de l\'aide. Aucun rapport ni détail sur l\'appareil ne sont joints.</string>
+    <string name="report_on_github">Signaler sur GitHub</string>
+    <string name="android_16_upgrade_warning_support_message">Redémarrez votre appareil et réessayez de vous connecter. Si cela ne fonctionne pas, signalez le problème sur %s.</string>
 </resources>

@@ -69,16 +69,21 @@
     <string name="auto_connect_carousel_third_slide_top_text">The Lockdown mode is called \"Block connections without VPN\" in the Android system settings. It helps minimize leaks, however it has some known limitations which you can read more about</string>
     <string name="auto_connect_carousel_third_slide_top_text_website_link">here</string>
     <string name="auto_connect_carousel_third_slide_bottom_text">
-        <![CDATA[3. To enable Lockdown mode, click on the toggle next to \"Block connections without VPN\".<br /><br /><b>Warning: This setting blocks split apps and the Local Network Sharing feature.</b>]]>
+        <![CDATA[3. To enable Lockdown mode, click on the toggle next to \"Block connections without VPN\".<br /><br /><b>Warning: This setting blocks excluded apps and the legacy local-network bypass while connected. Local rules for included apps are independent.</b>]]>
     </string>
     <string name="mtu">MTU</string>
     <string name="mtu_x">Value: %s</string>
     <string name="wireguard_mtu_footer">Set WireGuard MTU value. Valid range: %1$d - %2$d.</string>
     <string name="hint_default">Default</string>
-    <string name="problem_report_github_description">Krtek is an independent client. Problems are tracked as public GitHub issues.</string>
-    <string name="problem_report_message_hint">Message (optional)</string>
+    <string name="problem_report_github_description">%1$s support uses public GitHub issues. Opening the link shares the reviewed text with your browser and GitHub. Never include your account number.</string>
+    <string name="problem_report_message_hint">Message</string>
     <string name="open_github_issue">Open GitHub issue</string>
-    <string name="problem_report_public_logs_notice">Logs are anonymised, but GitHub issues are public. Review the logs before sharing them, and never post your account number.</string>
+    <string name="problem_report_public_logs_notice">No logs or account data are attached automatically. Review logs before you choose to share them.</string>
+    <string name="report_problem_message_is_empty">Please enter a message</string>
+    <string name="problem_report_review">Review issue</string>
+    <string name="problem_report_review_title">Issue review</string>
+    <string name="problem_report_copy">Copy issue text</string>
+    <string name="problem_report_copy_fallback">Copy the complete text, open GitHub, then paste it into a new issue.</string>
     <string name="view_logs">View app logs</string>
     <string name="back">Back</string>
     <string name="back_with_icon"> %1$s Back</string>
@@ -345,7 +350,7 @@
     <string name="app_info">App info</string>
     <string name="changelog_title">What’s new</string>
     <string name="version">Version</string>
-    <string name="local_network_sharing_info_block_connections_warning"><b>Attention:</b> Local network sharing is not compatible with “Block connections without VPN”.</string>
+    <string name="local_network_sharing_info_block_connections_warning"><b>Attention:</b> The legacy local-network bypass while connected is not compatible with \"Block connections without VPN\". Local rules are independent.</string>
     <string name="encrypted_dns_proxy_info_message_part1">With the “Encrypted DNS proxy” method, the app will communicate with our Mullvad API through a proxy address. It does this by retrieving an address from a DNS over HTTPS (DoH) server and then using that to reach our API servers.</string>
     <string name="encrypted_dns_proxy_info_message_part2">If you are not connected to our VPN, then the Encrypted DNS proxy will use your own non-VPN IP when connecting. The DoH servers are hosted by one of the following providers: Quad9 or Cloudflare.</string>
     <string name="connection_details_out">Out</string>
@@ -439,7 +444,7 @@
     <string name="unable_to_reach_api_dialog_message_list_first">Restart your device</string>
     <string name="unable_to_reach_api_dialog_message_list_second">Connect to a different network</string>
     <string name="unable_to_reach_api_dialog_message_list_third">Enable all access methods in the app</string>
-    <string name="unable_to_reach_api_github_message">If these steps don’t work, report the problem as a public GitHub issue using the button below. No logs are attached automatically.</string>
+    <string name="unable_to_reach_api_github_message">If the problem continues, open GitHub for help. No report or device details are attached.</string>
     <string name="enable_all_methods">Enable all &amp; retry</string>
     <string name="report_on_github">Report on GitHub</string>
     <string name="browser_unavailable">No browser is available. Copy this link and open it in a browser.</string>

@@ -63,7 +63,7 @@
     <string name="auto_connect_carousel_first_slide_top_text">အော်တို ချိတ်ဆက်မှုနှင့် လော့ခ်ဒေါင်းစနစ် ဆက်တင်များကို Android စနစ် ဆက်တင်များတွင် ရှာတွေ့နိုင်ပြီး တစ်ခု သို့မဟုတ် နှစ်ခုလုံးကို ဖွင့်ရန် ဤလမ်းညွှန်ချက်ကို လိုက်နာပါ။</string>
     <string name="auto_connect_carousel_second_slide_bottom_text">2. အော်တို ချိတ်ဆက်မှုကို ဖွင့်ရန် \"အမြဲဖွင့် VPN\" ဘေးရှိ ဖွင့်/ပိတ် ခလုတ်ကို နှိပ်ပါ။</string>
     <string name="auto_connect_carousel_second_slide_top_text">Android စနစ် ဆက်တင်တွင် အော်တိုချိတ်ဆက်မှုကို အမြဲဖွင့် VPN ဟုခေါ်ပြီး VPN Tunnel ကို အမြဲချိတ်ဆက်ထားကြောင်း သေချာစေပြီး အစမှ ပြန်ဖွင့်ပြီးနောက် အော်တို ချိတ်ဆက်ပါသည်။</string>
-    <string name="auto_connect_carousel_third_slide_bottom_text">3. လော့ခ်ဒေါင်းစနစ်ကို ဖွင့်ရန် \"VPN မသုံးဘဲ ချိတ်ဆက်မှုများကို ပိတ်ဆို့ရန်\"ဘေးရှိ ဖွင့်/ပိတ်ခလုတ်ကို နှိပ်ပါ။.<br /><br /><b>သတိပေးချက်- ဤဆက်တင်သည် Split အက်ပ်များနှင့် လိုကယ် ကွန်ရက် ဝေမျှမှု လုပ်ဆောင်ချက်ကို တားမြစ်ပါသည်။</b></string>
+    <string name="auto_connect_carousel_third_slide_bottom_text">3. လော့ခ်ဒေါင်းစနစ်ကို ဖွင့်ရန် \"VPN မသုံးဘဲ ချိတ်ဆက်မှုများကို ပိတ်ဆို့ရန်\"ဘေးရှိ ဖွင့်/ပိတ်ခလုတ်ကို နှိပ်ပါ။.<br /><br /><b>သတိပေးချက်- ဤဆက်တင်သည် ဖယ်ထုတ်ထားသော အက်ပ်များနှင့် VPN ချိတ်ဆက်ထားစဉ် ယခင် လိုကယ်ကွန်ရက် ကျော်ဖြတ်မှုကို ပိတ်ဆို့သည်။ ပါဝင်သော အက်ပ်များအတွက် လိုကယ်စည်းမျဉ်းများသည် သီးခြားဖြစ်သည်။</b></string>
     <string name="auto_connect_carousel_third_slide_top_text">လော့ခ်ဒေါင်းစနစ်ကို Android စနစ်ဆက်တင်များတွင် \"VPN မသုံးဘဲ ချိတ်ဆက်မှုများကို ပိတ်ဆို့ရန်\"ဟု ခေါ်ဆိုပါသည်။ ၎င်းသည် ပေါက်ကြားမှုများကို လျှော့ချနိုင်အောင် ကူညီပေးနိုင်သော်လည်း အများသိ အကန့်အသတ်များရှိပြီး ၎င်းတို့အကြောင်းကို ဖော်ပြပါတွင် ဖတ်ရှုနိုင်သည်</string>
     <string name="auto_connect_carousel_third_slide_top_text_website_link">ဤနေရာတွင် ပိုမိုဖတ်ရှုနိုင်ပါသည်</string>
     <string name="automatic">အလိုအလျောက်</string>
@@ -297,7 +297,7 @@
     <string name="local_network_sharing_info2"><b>ယင်းက သင့်အမည်ဝှက်ခြင်းအပေါ် သက်ရောက်မှုရှိနိုင်သည်။</b> သင့်စက်ကို အခြားသူများ မြင်နိုင်မည်ဖြစ်သောကြောင့် အများသုံးကွန်ရက် သို့မဟုတ် မယုံကြည်ရသောကွန်ရက်များတွင် ၎င်းကို မဖွင့်ပါနှင့်။</string>
     <string name="local_network_sharing_info3">အက်ပ်သည် VPN လမ်းကြောင်းအတွင်းမှ မဖြတ်သန်းဘဲ စက်တွင်း အုပ်စုလိုက်ထုတ်လွှင့်မှုနှင့် ထုတ်လွှင့်မှု ကွန်ရက် ဒေတာစီးဆင်းမှုအပြင် သီးသန့် IP အပိုင်းအခြားများအကြား ဒေတာအပြန်အလှန်စီးဆင်းမှုကို ခွင့်ပြုသည်။</string>
     <string name="local_network_sharing_info4"><b>သီးသန့် IP အပိုင်းအခြားများ</b></string>
-    <string name="local_network_sharing_info_block_connections_warning"><b>သတိပြုရန်-</b> “VPN မသုံးသော ချိတ်ဆက်မှုများကို ပိတ်ပင်ရန်” ကို ဖွင့်လျက် စက်တွင်းကွန်ရက်မျှဝေခြင်းကို သုံး၍မရပါ။</string>
+    <string name="local_network_sharing_info_block_connections_warning"><b>သတိပြုရန်-</b> VPN ချိတ်ဆက်ထားစဉ် ယခင် လိုကယ်ကွန်ရက် ကျော်ဖြတ်မှုကို “VPN မသုံးသော ချိတ်ဆက်မှုများကို ပိတ်ပင်ရန်” နှင့် တွဲသုံး၍မရပါ။ လိုကယ်စည်းမျဉ်းများသည် သီးခြားဖြစ်သည်။</string>
     <string name="location_added">%1$s (ထည့်ပြီး)</string>
     <string name="location_was_added_to_list">%1$s ကို \"%2$s\" တွင် ထည့်ထားပါသည်</string>
     <string name="location_was_removed_from_list">%1$s ကို \"%2$s\" မှ ဖယ်ရှားထားပါသည်</string>
@@ -553,4 +553,17 @@
     <string name="you_can_add_more_time_play">VPN ကို ဆက်လက်အသုံးပြုရန် အကောင့် ပြသမှုမှတစ်ဆင့် အချိန်ထပ်တိုးနိုင်ပါသည်။</string>
     <string name="your_device">သင့်စက်</string>
     <string name="your_device_with_location">သင့်စက် (%1$s)</string>
+    <string name="problem_report_github_description">%1$s အကူအညီအတွက် အများမြင်နိုင်သော GitHub ပြဿနာတင်ပြချက်များကို သုံးသည်။ လင့်ခ်ကိုဖွင့်လျှင် စစ်ဆေးထားသောစာသားကို သင့်ဘရောက်ဇာနှင့် GitHub သို့ မျှဝေမည်။ သင့်အကောင့်နံပါတ်ကို လုံးဝမထည့်ပါနှင့်။</string>
+    <string name="problem_report_message_hint">မက်ဆေ့ချ်</string>
+    <string name="open_github_issue">GitHub ပြဿနာဖွင့်ရန်</string>
+    <string name="problem_report_public_logs_notice">မှတ်တမ်းများ သို့မဟုတ် အကောင့်ဒေတာကို အလိုအလျောက် မပူးတွဲပါ။ မျှဝေရန် မရွေးချယ်မီ မှတ်တမ်းများကို စစ်ဆေးပါ။</string>
+    <string name="report_problem_message_is_empty">မက်ဆေ့ချ် တစ်ခု ထည့်ပေးပါ</string>
+    <string name="problem_report_review">တင်ပြချက် စစ်ဆေးရန်</string>
+    <string name="problem_report_review_title">တင်ပြချက် စစ်ဆေးခြင်း</string>
+    <string name="problem_report_copy">စာသားကူးယူရန်</string>
+    <string name="problem_report_copy_fallback">စာသားအပြည့်အစုံကို ကူးယူပါ၊ GitHub ကိုဖွင့်ပြီး တင်ပြချက်အသစ်ထဲသို့ ကူးထည့်ပါ။</string>
+    <string name="browser_unavailable">အသုံးပြုနိုင်သော ဘရောက်ဇာမရှိပါ။ ဤလင့်ခ်ကို ကူးယူပြီး ဘရောက်ဇာတွင် ဖွင့်ပါ။</string>
+    <string name="unable_to_reach_api_github_message">ပြဿနာဆက်ရှိပါက အကူအညီရရန် GitHub ကိုဖွင့်ပါ။ အစီရင်ခံစာ သို့မဟုတ် စက်အချက်အလက်များ မပူးတွဲပါ။</string>
+    <string name="report_on_github">GitHub တွင်တင်ပြရန်</string>
+    <string name="android_16_upgrade_warning_support_message">သင့်စက်ကို ပြန်စတင်ပြီး ထပ်မံချိတ်ဆက်ကြည့်ပါ။ အဆင်မပြေပါက ပြဿနာကို %s တွင် တင်ပြပါ။</string>
 </resources>

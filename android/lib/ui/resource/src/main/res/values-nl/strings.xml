@@ -63,7 +63,7 @@
     <string name="auto_connect_carousel_first_slide_top_text">De instellingen Automatisch verbinden en Lockdownmodus zijn te vinden in de Android-systeeminstellingen, volg deze gids om een of beide in te schakelen.</string>
     <string name="auto_connect_carousel_second_slide_bottom_text">2. Klik om Automatisch verbinden in te schakelen op de schakelaar naast \"Altijd-aan VPN\".</string>
     <string name="auto_connect_carousel_second_slide_top_text">Automatisch verbinden heet Altijd-aan VPN in de Android-systeeminstellingen en zorgt ervoor dat u altijd verbonden bent met de VPN-tunnel en automatisch verbinding maakt na een herstart.</string>
-    <string name="auto_connect_carousel_third_slide_bottom_text">3. Klik om de Lockdownmodus in te schakelen op de schakelaar naast \"Verbindingen zonder VPN blokkeren\".<br /><br /><b>Waarschuwing: deze instelling blokkeert gesplitste apps en de functie Delen via lokaal netwerk.</b></string>
+    <string name="auto_connect_carousel_third_slide_bottom_text">3. Klik om de Lockdownmodus in te schakelen op de schakelaar naast \"Verbindingen zonder VPN blokkeren\".<br /><br /><b>Waarschuwing: deze instelling blokkeert uitgesloten apps en de bestaande lokale netwerkomleiding tijdens de VPN-verbinding. Lokale regels voor opgenomen apps staan hier los van.</b></string>
     <string name="auto_connect_carousel_third_slide_top_text">De Lockdownmodus heet \"Verbindingen zonder VPN blokkeren\" in de Android-systeeminstellingen. Deze helpt om lekken te minimaliseren, maar heeft enkele bekende beperkingen. Meer daarover leest u</string>
     <string name="auto_connect_carousel_third_slide_top_text_website_link">hier</string>
     <string name="automatic">Automatisch</string>
@@ -297,7 +297,7 @@
     <string name="local_network_sharing_info2"><b>Dit kan gevolgen hebben voor je anonimiteit.</b> Schakel deze functie niet in op openbare of onbetrouwbare netwerken, want je apparaat kan dan zichtbaar worden voor anderen.</string>
     <string name="local_network_sharing_info3">De app staat toe dat lokaal multicast- en broadcastnetwerkverkeer, evenals verkeer van en naar privé-IP-reeksen, de VPN-tunnel omzeilt.</string>
     <string name="local_network_sharing_info4"><b>Privé-IP-reeksen</b></string>
-    <string name="local_network_sharing_info_block_connections_warning"><b>Let op:</b> delen via lokaal netwerk is niet compatibel met \"Verbindingen zonder VPN blokkeren\".</string>
+    <string name="local_network_sharing_info_block_connections_warning"><b>Let op:</b> de bestaande lokale netwerkomleiding tijdens de VPN-verbinding is niet compatibel met \"Verbindingen zonder VPN blokkeren\". Lokale regels staan hier los van.</string>
     <string name="location_added">%1$s (toegevoegd)</string>
     <string name="location_was_added_to_list">%1$s is toegevoegd aan \"%2$s\"</string>
     <string name="location_was_removed_from_list">%1$s is verwijderd uit \"%2$s\"</string>
@@ -553,4 +553,17 @@
     <string name="you_can_add_more_time_play">U kunt meer tijd toevoegen via de accountweergave om de VPN te blijven gebruiken.</string>
     <string name="your_device">Uw apparaat</string>
     <string name="your_device_with_location">Uw apparaat (%1$s)</string>
+    <string name="problem_report_github_description">Ondersteuning voor %1$s verloopt via openbare GitHub-issues. Als u de link opent, wordt de gecontroleerde tekst gedeeld met uw browser en GitHub. Vermeld nooit uw accountnummer.</string>
+    <string name="problem_report_message_hint">Bericht</string>
+    <string name="open_github_issue">GitHub-issue openen</string>
+    <string name="problem_report_public_logs_notice">Er worden niet automatisch logboeken of accountgegevens bijgevoegd. Controleer de logboeken voordat u besluit ze te delen.</string>
+    <string name="report_problem_message_is_empty">Voer een bericht in</string>
+    <string name="problem_report_review">Issue controleren</string>
+    <string name="problem_report_review_title">Issue controleren</string>
+    <string name="problem_report_copy">Issuetekst kopiëren</string>
+    <string name="problem_report_copy_fallback">Kopieer de volledige tekst, open GitHub en plak de tekst in een nieuw issue.</string>
+    <string name="browser_unavailable">Er is geen browser beschikbaar. Kopieer deze link en open de link in een browser.</string>
+    <string name="unable_to_reach_api_github_message">Als het probleem aanhoudt, opent u GitHub voor hulp. Er worden geen rapport of apparaatgegevens bijgevoegd.</string>
+    <string name="report_on_github">Melden op GitHub</string>
+    <string name="android_16_upgrade_warning_support_message">Start uw apparaat opnieuw op en probeer opnieuw verbinding te maken. Als dit niet werkt, meldt u het probleem op %s.</string>
 </resources>

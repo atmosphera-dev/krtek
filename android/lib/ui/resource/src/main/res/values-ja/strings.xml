@@ -63,7 +63,7 @@
     <string name="auto_connect_carousel_first_slide_top_text">自動接続とロックダウンモードの設定はAndroidシステム設定にあります。どちらか、または両方をこのガイドに従って有効にしてください。</string>
     <string name="auto_connect_carousel_second_slide_bottom_text">2. 自動接続を有効にするには、[Always-on VPN] の横のトグルボタンをクリックします。</string>
     <string name="auto_connect_carousel_second_slide_top_text">自動接続はAndroidシステム設定で「Always-on VPN」と呼ばれており、確実に一貫してVPNトンネルに接続し、再起動の後に自動接続を行う機能です。</string>
-    <string name="auto_connect_carousel_third_slide_bottom_text">3. ロックダウンモードを有効にするには、[VPN 以外の接続のブロック] の横にあるトグルボタンをクリックします。<br /><br /><b>警告: この設定では、分割アプリとローカルネットワーク共有の機能がブロックされます。</b></string>
+    <string name="auto_connect_carousel_third_slide_bottom_text">3. ロックダウンモードを有効にするには、[VPN 以外の接続のブロック] の横にあるトグルボタンをクリックします。<br /><br /><b>警告: この設定では、除外アプリと、接続中に VPN を迂回する従来のローカルネットワーク共有がブロックされます。対象アプリのローカルルールは独立しています。</b></string>
     <string name="auto_connect_carousel_third_slide_top_text">このロックダウンモードは、Androidのシステム設定では [VPN以外の接続のブロック] と呼ばれています。情報漏洩の可能性を低減することが可能ですが、既知の制限がいくつかあります。制限については、</string>
     <string name="auto_connect_carousel_third_slide_top_text_website_link">こちらをご覧ください。</string>
     <string name="automatic">自動</string>
@@ -297,7 +297,7 @@
     <string name="local_network_sharing_info2"><b>匿名性が損なわれる可能性があります。</b> 公共のネットワークや信頼できないネットワークでは有効にしないでください。デバイスが他のユーザーから見える状態になる可能性があります。</string>
     <string name="local_network_sharing_info3">このアプリでは、ローカルのマルチキャストおよびブロードキャスト通信、ならびにプライベートIPアドレス範囲との通信をVPNトンネルを経由せずに許可します。</string>
     <string name="local_network_sharing_info4"><b>プライベートIPアドレス範囲</b></string>
-    <string name="local_network_sharing_info_block_connections_warning"><b>注意: </b>ローカルネットワーク共有と「VPNなしの接続をブロック」は併用できません。</string>
+    <string name="local_network_sharing_info_block_connections_warning"><b>注意: </b>接続中に VPN を迂回する従来のローカルネットワーク共有と「VPNなしの接続をブロック」は併用できません。ローカルルールは独立しています。</string>
     <string name="location_added">%1$s (追加済み)</string>
     <string name="location_was_added_to_list">%1$sが「%2$s」に追加されました</string>
     <string name="location_was_removed_from_list">%1$sが「%2$s」から削除されました</string>
@@ -553,4 +553,17 @@
     <string name="you_can_add_more_time_play">アカウント画面から時間を追加することで、VPNを引き続き使用できます。</string>
     <string name="your_device">お使いのデバイス</string>
     <string name="your_device_with_location">お使いのデバイス (%1$s)</string>
+    <string name="problem_report_github_description">%1$s のサポートには GitHub の公開 Issue を使用します。リンクを開くと、確認済みのテキストがブラウザーと GitHub に共有されます。アカウント番号は絶対に含めないでください。</string>
+    <string name="problem_report_message_hint">メッセージ</string>
+    <string name="open_github_issue">GitHub Issue を開く</string>
+    <string name="problem_report_public_logs_notice">ログやアカウント情報は自動的には添付されません。共有を選択する前にログを確認してください。</string>
+    <string name="report_problem_message_is_empty">メッセージを入力してください</string>
+    <string name="problem_report_review">Issue を確認</string>
+    <string name="problem_report_review_title">Issue の確認</string>
+    <string name="problem_report_copy">Issue の本文をコピー</string>
+    <string name="problem_report_copy_fallback">全文をコピーし、GitHub を開いて新しい Issue に貼り付けてください。</string>
+    <string name="browser_unavailable">利用できるブラウザーがありません。このリンクをコピーしてブラウザーで開いてください。</string>
+    <string name="unable_to_reach_api_github_message">問題が解決しない場合は、GitHub でサポートを受けてください。レポートやデバイス情報は添付されません。</string>
+    <string name="report_on_github">GitHub で報告</string>
+    <string name="android_16_upgrade_warning_support_message">デバイスを再起動して接続を再試行してください。解決しない場合は、%s で問題を報告してください。</string>
 </resources>

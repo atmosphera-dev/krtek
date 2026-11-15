@@ -63,7 +63,7 @@
     <string name="auto_connect_carousel_first_slide_top_text">Indstillingerne for automatisk forbindelse og Lockdown-tilstand kan findes i Android- systemindstillingerne. Følg denne vejledning for at aktivere en eller begge.</string>
     <string name="auto_connect_carousel_second_slide_bottom_text">2. For at aktivere automatisk forbindelse skal du klikke på knappen ved siden af \"Altid-til VPN\".</string>
     <string name="auto_connect_carousel_second_slide_top_text">Auto-tilslutning kaldes Altid-til VPN i Android-systemindstillingerne, og det sørger for, at du konstant er forbundet til VPN-tunnelen og automatisk forbinder efter genstart.</string>
-    <string name="auto_connect_carousel_third_slide_bottom_text">3. For at aktivere Lockdown-tilstand skal du klikke på knappen ved siden af \"Bloker forbindelser uden VPN\".<br /><br /><b>Advarsel: Denne indstilling blokerer delte apps og funktionen Lokal netværksdeling.</b></string>
+    <string name="auto_connect_carousel_third_slide_bottom_text">3. For at aktivere Lockdown-tilstand skal du klikke på knappen ved siden af \"Bloker forbindelser uden VPN\".<br /><br /><b>Advarsel: Denne indstilling blokerer udelukkede apps og den gamle lokale netværksomgåelse, mens VPN er tilsluttet. Lokale regler for inkluderede apps er uafhængige.</b></string>
     <string name="auto_connect_carousel_third_slide_top_text">Lockdown-tilstanden kaldes \"Bloker forbindelser uden VPN\" i Android-systemindstillingerne. Det hjælper med at minimere lækager, men det har nogle kendte begrænsninger, som du kan læse mere om</string>
     <string name="auto_connect_carousel_third_slide_top_text_website_link">her</string>
     <string name="automatic">Automatisk</string>
@@ -297,7 +297,7 @@
     <string name="local_network_sharing_info2"><b>Dette kan påvirke din anonymitet.</b> Undgå at aktivere dette på offentlige eller upålidelige netværk, da din enhed kan blive synlig for andre.</string>
     <string name="local_network_sharing_info3">Appen tillader lokal multicast- og broadcast-netværkstrafik samt trafik til og fra private IP-intervaller for at omgå VPN-tunnelen.</string>
     <string name="local_network_sharing_info4"><b>Private IP-intervaller</b></string>
-    <string name="local_network_sharing_info_block_connections_warning"><b>Bemærk:</b> Lokal netværksdeling er ikke kompatibel med \"Bloker forbindelser uden VPN\".</string>
+    <string name="local_network_sharing_info_block_connections_warning"><b>Bemærk:</b> Den gamle lokale netværksomgåelse under VPN-forbindelse er ikke kompatibel med \"Bloker forbindelser uden VPN\". Lokale regler er uafhængige.</string>
     <string name="location_added">%1$s (tilføjet)</string>
     <string name="location_was_added_to_list">%1$s blev tilføjet til \"%2$s\"</string>
     <string name="location_was_removed_from_list">%1$s blev fjernet fra \"%2$s\"</string>
@@ -553,4 +553,17 @@
     <string name="you_can_add_more_time_play">Du kan tilføje mere tid via kontovisning for at fortsætte med at bruge VPN\'en.</string>
     <string name="your_device">Din enhed</string>
     <string name="your_device_with_location">Din enhed (%1$s)</string>
+    <string name="problem_report_github_description">Support til %1$s foregår via offentlige GitHub-issues. Når du åbner linket, deles den gennemsete tekst med din browser og GitHub. Medtag aldrig dit kontonummer.</string>
+    <string name="problem_report_message_hint">Besked</string>
+    <string name="open_github_issue">Åbn GitHub-issue</string>
+    <string name="problem_report_public_logs_notice">Ingen logfiler eller kontodata vedhæftes automatisk. Gennemse logfilerne, før du vælger at dele dem.</string>
+    <string name="report_problem_message_is_empty">Indtast en besked</string>
+    <string name="problem_report_review">Gennemse issue</string>
+    <string name="problem_report_review_title">Gennemgang af issue</string>
+    <string name="problem_report_copy">Kopiér issue-tekst</string>
+    <string name="problem_report_copy_fallback">Kopiér hele teksten, åbn GitHub, og indsæt den i en ny issue.</string>
+    <string name="browser_unavailable">Ingen browser tilgængelig. Kopiér dette link, og åbn det i en browser.</string>
+    <string name="unable_to_reach_api_github_message">Åbn GitHub for at få hjælp, hvis problemet fortsætter. Ingen rapport eller enhedsoplysninger vedhæftes.</string>
+    <string name="report_on_github">Rapportér på GitHub</string>
+    <string name="android_16_upgrade_warning_support_message">Genstart din enhed, og prøv at oprette forbindelse igen. Hvis det ikke virker, skal du rapportere problemet på %s.</string>
 </resources>

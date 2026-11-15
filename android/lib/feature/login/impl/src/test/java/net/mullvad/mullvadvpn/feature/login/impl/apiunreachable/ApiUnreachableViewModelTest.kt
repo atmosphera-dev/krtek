@@ -41,9 +41,7 @@ class ApiUnreachableViewModelTest {
             viewModel.uiSideEffect.test {
                 viewModel.openSupportIssue()
                 assertEquals(
-                    ApiUnreachableSideEffect.OpenIssue(
-                        supportIssueUseCase(title = "API unreachable")
-                    ),
+                    ApiUnreachableSideEffect.OpenIssue(issuesUrl),
                     awaitItem(),
                 )
             }
@@ -58,7 +56,7 @@ class ApiUnreachableViewModelTest {
         try {
             viewModel.uiState.test {
                 awaitItem()
-                val url = supportIssueUseCase(title = "API unreachable")
+                val url = issuesUrl
                 viewModel.onBrowserUnavailable(url)
                 assertEquals(url, awaitItem().fallbackUrl)
                 viewModel.openSupportIssue()

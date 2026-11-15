@@ -62,7 +62,7 @@
     <string name="auto_connect_carousel_first_slide_top_text">تنظیمات اتصال خودکار و حالت قفل در تنظیمات سیستمی اندروید قرار دارند. برای فعال‌کردن یکی یا هر دو، این راهنما را دنبال کنید.</string>
     <string name="auto_connect_carousel_second_slide_bottom_text">2. برای فعال کردن «اتصال خودکار»، روی دکمهٔ تغییر وضعیت کنار «VPN همیشه‌فعال» کلیک کنید.</string>
     <string name="auto_connect_carousel_second_slide_top_text">در تنظیمات سیستم اندروید، «اتصال خودکار» با نام «VPN همیشه‌فعال» شناخته می‌شود و باعث می‌شود دستگاه شما همیشه به تونل VPN وصل بماند و پس از راه‌اندازی مجدد نیز به‌طور خودکار دوباره متصل شود.</string>
-    <string name="auto_connect_carousel_third_slide_bottom_text">3. برای فعال کردن حالت قفل، روی کلید کنار «مسدود کردن اتصال‌ها بدون VPN» کلیک کنید.<br /><br /><b>هشدار: این تنظیم اپلیکیشن‌های تفکیک‌شده و قابلیت اشتراک‌گذاری شبکهٔ محلی را مسدود می‌کند.</b></string>
+    <string name="auto_connect_carousel_third_slide_bottom_text">3. برای فعال کردن حالت قفل، روی کلید کنار «مسدود کردن اتصال‌ها بدون VPN» کلیک کنید.<br /><br /><b>هشدار: این تنظیم برنامه‌های مستثنا و روش قدیمی دور زدن VPN برای شبکهٔ محلی هنگام اتصال را مسدود می‌کند. قوانین محلی برای برنامه‌های مشمول مستقل هستند.</b></string>
     <string name="auto_connect_carousel_third_slide_top_text">حالت قفل در تنظیمات سیستمی اندروید با نام «مسدود کردن اتصال‌ها بدون VPN» نمایش داده می‌شود. این حالت به کاهش نشت ارتباطات کمک می‌کند، اما محدودیت‌های شناخته‌شده‌ای دارد که می‌توانید بیشتر دربارهٔ آن بخوانید</string>
     <string name="auto_connect_carousel_third_slide_top_text_website_link">اینجا</string>
     <string name="automatic">خودکار</string>
@@ -287,7 +287,7 @@
     <string name="local_network_sharing_info2"><b>این کار می‌تواند ناشناس‌ماندن شما را تحت تأثیر قرار دهد.</b> از فعال کردن این قابلیت در شبکه‌های عمومی یا غیرقابل‌اعتماد خودداری کنید، زیرا ممکن است دستگاه شما برای دیگران قابل مشاهده شود.</string>
     <string name="local_network_sharing_info3">این برنامه به ترافیک شبکهٔ محلیِ چندپخشی (multicast) و پخشی (broadcast)، و همچنین ترافیک ورودی و خروجیِ محدوده‌های IP خصوصی، اجازه می‌دهد تونل VPN را دور بزنند.</string>
     <string name="local_network_sharing_info4"><b>محدوده‌های IP خصوصی</b></string>
-    <string name="local_network_sharing_info_block_connections_warning"><b>توجه:</b> اشتراک‌گذاری در شبکهٔ محلی با گزینهٔ «مسدود کردن اتصال‌ها بدون VPN» سازگار نیست.</string>
+    <string name="local_network_sharing_info_block_connections_warning"><b>توجه:</b> روش قدیمی دور زدن VPN برای شبکهٔ محلی هنگام اتصال با گزینهٔ «مسدود کردن اتصال‌ها بدون VPN» سازگار نیست. قوانین محلی مستقل هستند.</string>
     <string name="location_added">%1$s (اضافه شد)</string>
     <string name="location_was_added_to_list">%1$s به «%2$s» اضافه شد</string>
     <string name="location_was_removed_from_list">%1$s از «%2$s» حذف شد</string>
@@ -526,4 +526,17 @@
     <string name="you_can_add_more_time_play">می‌توانید از طریق نمای حساب زمان بیشتری را برای ادامه استفاده از VPN اضافه کنید.</string>
     <string name="your_device">دستگاه شما</string>
     <string name="your_device_with_location">دستگاه شما (%1$s)</string>
+    <string name="problem_report_github_description">پشتیبانی %1$s از گزارش‌های عمومی GitHub استفاده می‌کند. با باز کردن پیوند، متن بررسی‌شده با مرورگر شما و GitHub به اشتراک گذاشته می‌شود. هرگز شمارهٔ حساب خود را وارد نکنید.</string>
+    <string name="problem_report_message_hint">پیام</string>
+    <string name="open_github_issue">باز کردن گزارش GitHub</string>
+    <string name="problem_report_public_logs_notice">هیچ گزارش رخداد یا دادهٔ حسابی خودکار پیوست نمی‌شود. پیش از انتخاب اشتراک‌گذاری، گزارش‌های رخداد را بررسی کنید.</string>
+    <string name="report_problem_message_is_empty">لطفاً یک پیغام را وارد کنید</string>
+    <string name="problem_report_review">بررسی گزارش</string>
+    <string name="problem_report_review_title">بازبینی گزارش</string>
+    <string name="problem_report_copy">کپی متن گزارش</string>
+    <string name="problem_report_copy_fallback">متن کامل را کپی کنید، GitHub را باز کنید و آن را در گزارشی جدید جای‌گذاری کنید.</string>
+    <string name="browser_unavailable">مرورگری در دسترس نیست. این پیوند را کپی و در مرورگری باز کنید.</string>
+    <string name="unable_to_reach_api_github_message">اگر مشکل ادامه داشت، برای دریافت کمک GitHub را باز کنید. هیچ گزارش یا جزئیات دستگاهی پیوست نمی‌شود.</string>
+    <string name="report_on_github">گزارش در GitHub</string>
+    <string name="android_16_upgrade_warning_support_message">دستگاه خود را دوباره راه‌اندازی کنید و اتصال را دوباره امتحان کنید. اگر مشکل حل نشد، آن را در %s گزارش دهید.</string>
 </resources>

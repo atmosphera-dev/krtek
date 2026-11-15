@@ -78,7 +78,8 @@ class ApiUnreachableViewModel(
         viewModelScope.launch {
             fallbackUrl.emit(null)
             _uiSideEffect.send(
-                ApiUnreachableSideEffect.OpenIssue(supportIssueUseCase(title = "API unreachable"))
+                // Help links export no hidden text or device details.
+                ApiUnreachableSideEffect.OpenIssue(supportIssueUseCase.issuesUrl)
             )
         }
     }

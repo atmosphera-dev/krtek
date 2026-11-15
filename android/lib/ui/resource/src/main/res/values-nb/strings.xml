@@ -63,7 +63,7 @@
     <string name="auto_connect_carousel_first_slide_top_text">Du finner innstillingene for automatisk tilkobling og låsemodus i Androids systeminnstillinger. Følg denne veiledningen for å aktivere én eller begge.</string>
     <string name="auto_connect_carousel_second_slide_bottom_text">2. For å aktivere «Automatisk tilkobling» klikker du på bryteren ved siden av «VPN alltid på».</string>
     <string name="auto_connect_carousel_second_slide_top_text">Automatisk tilkobling heter «Alltid-på-VPN» i Androids systeminnstillinger og sørger for at du alltid er tilkoblet VPN-tunnelen og automatisk tilkobling etter omstart.</string>
-    <string name="auto_connect_carousel_third_slide_bottom_text">3. Klikk på bryteren ved siden av «Blokker tilkoblinger uten VPN» for å aktivere låsemodusen.<br /><br /><b>Advarsel: Denne innstillingen blokkerer delte apper og funksjonen «Deling over lokalt nettverk».</b></string>
+    <string name="auto_connect_carousel_third_slide_bottom_text">3. Klikk på bryteren ved siden av «Blokker tilkoblinger uten VPN» for å aktivere låsemodusen.<br /><br /><b>Advarsel: Denne innstillingen blokkerer utelatte apper og den gamle lokale nettverksomgåelsen under VPN-tilkobling. Lokale regler for inkluderte apper er uavhengige.</b></string>
     <string name="auto_connect_carousel_third_slide_top_text">Låsemodusen kalles «Blokker tilkoblinger uten VPN» i systeminnstillingene for Android. Den bidrar til å minimere lekkasjer, men den har noen kjente begrensninger som du kan lese mer om</string>
     <string name="auto_connect_carousel_third_slide_top_text_website_link">her</string>
     <string name="automatic">Automatisk</string>
@@ -297,7 +297,7 @@
     <string name="local_network_sharing_info2"><b>Dette kan påvirke anonymiteten din.</b> Unngå å aktivere denne funksjonen på offentlige eller upålitelige nettverk. Det kan gjøre enheten din synlig for andre.</string>
     <string name="local_network_sharing_info3">Appen lar lokal multicast- og broadcast-nettverkstrafikk, samt trafikk til og fra private IP-adressområder, for å omgå VPN-tunnelen.</string>
     <string name="local_network_sharing_info4"><b>Private IP-intervall</b></string>
-    <string name="local_network_sharing_info_block_connections_warning"><b>Merk:</b> Deling i lokalt nettverk er ikke kompatibelt med «Blokker tilkoblinger uten VPN».</string>
+    <string name="local_network_sharing_info_block_connections_warning"><b>Merk:</b> Den gamle lokale nettverksomgåelsen under VPN-tilkobling er ikke kompatibel med «Blokker tilkoblinger uten VPN». Lokale regler er uavhengige.</string>
     <string name="location_added">%1$s (lagt til)</string>
     <string name="location_was_added_to_list">%1$s ble lagt til «%2$s»</string>
     <string name="location_was_removed_from_list">%1$s ble fjernet fra «%2$s»</string>
@@ -553,4 +553,17 @@
     <string name="you_can_add_more_time_play">Du kan legge til mer tid via kontooversikten for å fortsette å bruke VPN.</string>
     <string name="your_device">Din enhet</string>
     <string name="your_device_with_location">Din enhet (%1$s)</string>
+    <string name="problem_report_github_description">Brukerstøtte for %1$s bruker offentlige GitHub-saker. Når du åpner lenken, deles den gjennomgåtte teksten med nettleseren og GitHub. Ta aldri med kontonummeret ditt.</string>
+    <string name="problem_report_message_hint">Melding</string>
+    <string name="open_github_issue">Åpne GitHub-sak</string>
+    <string name="problem_report_public_logs_notice">Ingen logger eller kontodata legges ved automatisk. Se gjennom loggene før du velger å dele dem.</string>
+    <string name="report_problem_message_is_empty">Skriv inn en melding</string>
+    <string name="problem_report_review">Se gjennom saken</string>
+    <string name="problem_report_review_title">Gjennomgang av saken</string>
+    <string name="problem_report_copy">Kopier saksteksten</string>
+    <string name="problem_report_copy_fallback">Kopier hele teksten, åpne GitHub og lim den inn i en ny sak.</string>
+    <string name="browser_unavailable">Ingen nettleser er tilgjengelig. Kopier denne lenken og åpne den i en nettleser.</string>
+    <string name="unable_to_reach_api_github_message">Hvis problemet fortsetter, åpner du GitHub for å få hjelp. Ingen rapport eller enhetsdetaljer legges ved.</string>
+    <string name="report_on_github">Rapporter på GitHub</string>
+    <string name="android_16_upgrade_warning_support_message">Start enheten på nytt og prøv å koble til igjen. Hvis det ikke fungerer, rapporterer du problemet på %s.</string>
 </resources>
