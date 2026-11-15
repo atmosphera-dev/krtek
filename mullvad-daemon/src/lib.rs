@@ -689,6 +689,40 @@ impl<E> DaemonEventSender<E> {
     }
 }
 
+/// A failed shutdown still owns the daemon, runtime consumers and exact release
+/// records. The caller must retain this value and explicitly retry it.
+pub struct ShutdownFailure {
+    daemon: Box<Daemon>,
+    error: std::io::Error,
+}
+
+impl std::fmt::Debug for ShutdownFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShutdownFailure")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Display for ShutdownFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Daemon shutdown retains cleanup ownership: {}",
+            self.error
+        )
+    }
+}
+impl std::error::Error for ShutdownFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+impl ShutdownFailure {
+    pub async fn retry(self) -> Result<(), Self> {
+        self.daemon.finish_shutdown().await
+    }
+}
+
 pub struct Daemon {
     local_network: local_network::LocalNetworkRuntime,
     local_connect: local_network::ConnectContinuation,
@@ -1156,16 +1190,42 @@ impl Daemon {
 
     /// Consume the `Daemon` and run the main event loop. Blocks until an error happens or a
     /// shutdown event is received.
-    pub async fn run(mut self) -> Result<(), Error> {
+    pub async fn run(mut self) -> Result<(), ShutdownFailure> {
         self.local_connect = self
             .local_network
             .initialize_transport(local_network::TunnelPhase::from(&self.tunnel_state));
         self.handle_initial_target_state();
         self.update_local_network_status().await;
         self.handle_events().await;
+        self.finish_shutdown().await
+    }
+
+    async fn finish_shutdown(mut self) -> Result<(), ShutdownFailure> {
         self.local_network.begin_shutdown();
-        self.disconnect_tunnel_and_wait().await;
-        self.finish_local_shutdown().await;
+        if self.local_network.broker().snapshot().mode
+            == talpid_tunnel::packet_attachment::AttachmentMode::ManagedRequired
+        {
+            // Wake pending configuration before joining queued TSM work. No
+            // actor may depend on the daemon's stopped event loop for progress.
+            if let Err(error) = self
+                .local_network
+                .shutdown_with_transport(self.tunnel_state_machine_handle.shutdown_and_join())
+                .await
+            {
+                return Err(ShutdownFailure {
+                    daemon: Box::new(self),
+                    error,
+                });
+            }
+        } else {
+            self.disconnect_tunnel_and_wait().await;
+            if let Err(error) = self.local_network.shutdown().await {
+                return Err(ShutdownFailure {
+                    daemon: Box::new(self),
+                    error,
+                });
+            }
+        }
         self.finalize().await;
         Ok(())
     }
@@ -1210,27 +1270,6 @@ impl Daemon {
                 .disconnected_and_joined(&self.tunnel_state)
             {
                 break;
-            }
-        }
-    }
-
-    async fn finish_local_shutdown(&mut self) {
-        // Failed fallible release is still an owned resource. Keep the daemon
-        // and recovery handle alive; a later external event may retry it. Internal
-        // terminal notifications never create an automatic release retry loop.
-        while let Err(error) = self.local_network.shutdown().await {
-            log::error!("Local frontend shutdown retains a release obligation: {error}");
-            let event = {
-                let (feed, _, _) = self.local_network.notifications();
-                tokio::select! {
-                    event = self.rx.next() => {
-                        match event { Some(event) => Some(event), None => std::future::pending().await }
-                    }
-                    _ = feed => None,
-                }
-            };
-            if let Some(event) = event {
-                self.handle_event(event).await;
             }
         }
     }

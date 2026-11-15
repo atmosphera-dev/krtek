@@ -103,6 +103,8 @@ async fn managed_route_timeout_preserves_upstream_recoverable_start_cause() {
         expected: Mutex<Option<CaptureExpectation>>,
         generation: AtomicI64,
         bound: tokio::sync::Notify,
+        waiting: tokio::sync::Notify,
+        post_bind: Mutex<Option<Arc<(Mutex<bool>, std::sync::Condvar)>>>,
         peers: Mutex<Vec<std::os::unix::net::UnixDatagram>>,
     }
     impl Routes {
@@ -182,8 +184,19 @@ async fn managed_route_timeout_preserves_upstream_recoverable_start_cause() {
         fn bind(&self, generation: i64, _: &str) -> io::Result<bool> {
             self.generation.store(generation, SeqCst);
             self.publish(false);
+            let hold = self.post_bind.lock().unwrap().take();
             self.bound.notify_one();
+            if let Some(hold) = hold {
+                let mut released = hold.0.lock().unwrap();
+                while !*released {
+                    released = hold.1.wait(released).unwrap();
+                }
+            }
             Ok(true)
+        }
+        fn readiness_pending(&self, generation: i64) {
+            assert_eq!(self.generation.load(SeqCst), generation);
+            self.waiting.notify_one();
         }
         fn closed(&self, _: i64) -> io::Result<()> {
             Ok(())
@@ -194,6 +207,8 @@ async fn managed_route_timeout_preserves_upstream_recoverable_start_cause() {
         expected: Mutex::new(None),
         generation: 0.into(),
         bound: tokio::sync::Notify::new(),
+        waiting: tokio::sync::Notify::new(),
+        post_bind: Mutex::new(None),
         peers: Mutex::new(vec![]),
     });
     let (broker, root, control) = broker();
@@ -204,7 +219,9 @@ async fn managed_route_timeout_preserves_upstream_recoverable_start_cause() {
         "lost-before-receipt",
         "lost-after-receipt",
     ] {
-        let began = tokio::time::Instant::now();
+        let hold = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let release = ReleaseSetup(hold.clone());
+        *platform.post_bind.lock().unwrap() = Some(hold);
         let target = tun_config(&config);
         let capture_config = tun_provider::transport::router_config(&target, vec![]);
         let request = broker
@@ -244,12 +261,34 @@ async fn managed_route_timeout_preserves_upstream_recoverable_start_cause() {
             _ = platform.bound.notified() => {},
             result = owner.ready() => panic!("frontend terminated before bind: {result:?}"),
         }
-        // Poll both owners before moving the clock: platform acquisition has no
-        // separate 15/30s deadline, only the new-fd route wait's upstream 2s.
-        tokio::task::yield_now().await;
-        assert!(futures::FutureExt::now_or_never(pending.create(&config)).is_none());
+        // Acquisition is deliberately still held after bind. This scheduling
+        // delay must not consume any part of the actual route-readiness window.
+        let (resume, held) = tokio::sync::oneshot::channel();
+        if case == "lost-after-receipt" {
+            pending.after_receipt = Some(held);
+        } else {
+            drop(held);
+        }
+        let mut create = Box::pin(pending.create(&config));
+        assert!(futures::FutureExt::now_or_never(create.as_mut()).is_none());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(futures::FutureExt::now_or_never(create.as_mut()).is_none());
+        assert!(futures::FutureExt::now_or_never(owner.ready()).is_none());
+        assert!(
+            futures::FutureExt::now_or_never(platform.waiting.notified()).is_none(),
+            "readiness timeout reported before acquisition joined"
+        );
+        drop(release);
+        tokio::select! {
+            biased;
+            _ = platform.waiting.notified() => {},
+            result = owner.ready() => panic!("frontend terminated before pending readiness poll: {result:?}"),
+        }
+        // The signal comes only after the actual timeout's first pending poll.
+        let began = tokio::time::Instant::now();
         tokio::time::advance(Duration::from_millis(1999)).await;
-        assert!(futures::FutureExt::now_or_never(pending.create(&config)).is_none());
+        assert!(futures::FutureExt::now_or_never(create.as_mut()).is_none());
+        assert!(futures::FutureExt::now_or_never(owner.ready()).is_none());
         if case != "timeout" {
             platform.publish(true);
             owner.ready().await.unwrap();
@@ -262,9 +301,6 @@ async fn managed_route_timeout_preserves_upstream_recoverable_start_cause() {
                     );
                 };
                 let result = if case == "lost-after-receipt" {
-                    let (release, held) = tokio::sync::oneshot::channel();
-                    pending.after_receipt = Some(held);
-                    let mut create = Box::pin(pending.create(&config));
                     // Owner.ready already published the exact current receipt.
                     // This poll consumes it and parks at the existing seam,
                     // before broker.acquire and all control/device allocation.
@@ -273,11 +309,11 @@ async fn managed_route_timeout_preserves_upstream_recoverable_start_cause() {
                     assert!(broker.snapshot().attachment.is_none());
                     assert_eq!(control.used(), 0);
                     revoke();
-                    release.send(()).unwrap();
+                    resume.send(()).unwrap();
                     create.await
                 } else {
                     revoke();
-                    pending.create(&config).await
+                    create.await
                 };
                 let error = match result {
                     Err(error) => error,
@@ -298,13 +334,13 @@ async fn managed_route_timeout_preserves_upstream_recoverable_start_cause() {
                 assert!(!broker.snapshot().ordinary_ready);
                 assert_eq!(control.used(), 0);
             } else {
-                let pair = pending.create(&config).await.unwrap();
+                let pair = create.await.unwrap();
                 pair.owner.stop().await;
                 drop(pair);
             }
         } else {
             tokio::time::advance(Duration::from_millis(1)).await;
-            let error = match pending.create(&config).await {
+            let error = match create.await {
                 Err(error) => error,
                 Ok(_) => panic!("missing routes acquired a device"),
             };
@@ -1438,6 +1474,7 @@ async fn up_enqueue_is_checked_against_retirement_after_activation() {
 struct FirstBindEnobufs {
     broker: AttachmentBroker,
     attempts: Mutex<Vec<(u64, u64)>>,
+    always: bool,
 }
 #[cfg(unix)]
 impl SocketBypass for FirstBindEnobufs {
@@ -1452,7 +1489,7 @@ impl SocketBypass for FirstBindEnobufs {
             snapshot.capture_generation.unwrap(),
             snapshot.attachment.unwrap(),
         ));
-        if attempts.len() == 1 {
+        if self.always || attempts.len() == 1 {
             Err(io::Error::from_raw_os_error(
                 nix::errno::Errno::ENOBUFS as i32,
             ))
@@ -1502,6 +1539,7 @@ async fn actual_enobufs_bind_retries_with_fresh_request_capture_attempt_and_cont
     let bypass = Arc::new(FirstBindEnobufs {
         broker: broker.clone(),
         attempts: Mutex::new(Vec::new()),
+        always: false,
     });
     let mut client = tokio::time::timeout(
         Duration::from_secs(5),
@@ -1534,7 +1572,7 @@ async fn actual_enobufs_bind_retries_with_fresh_request_capture_attempt_and_cont
     stop.send(()).unwrap();
     let (capture, requests) = actor.await.unwrap();
     assert!(
-        requests.len() >= 2,
+        requests.len() == 2,
         "retry did not request fresh target configuration"
     );
     let bytes = ipv4(17, b"fresh-enobufs-attempt-nonce");
@@ -1588,9 +1626,9 @@ async fn cancelled_setup_owner_and_cancelled_shutdown_keep_joined_cleanup() {
         .await
         .is_err()
     );
-    let capture = acknowledge(&broker, &config);
-    // An unclaimed completed tunnel is dropped by its supervised setup owner,
-    // which revokes and joins both GotaTun and control work before refund.
+    // Caller-drop now cancels the pending operation; no late platform receipt
+    // or held-stage completion is needed to finish this exact setup owner.
+    assert!(broker.pending_request().is_none());
     assert!(broker.snapshot().attachment.is_none());
     assert!(!broker.snapshot().ordinary_ready);
     assert_eq!(control.used(), 0);
@@ -1603,26 +1641,16 @@ async fn cancelled_setup_owner_and_cancelled_shutdown_keep_joined_cleanup() {
         assert_eq!(control.used(), 0);
     };
     tokio::pin!(joined_cleanup);
-    // The initial empty snapshot cannot satisfy this exact worker's receipt.
-    std::future::poll_fn(|cx| {
-        assert!(std::future::Future::poll(joined_cleanup.as_mut(), cx).is_pending());
-        std::task::Poll::Ready(())
-    })
-    .await;
-    resume.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(2), &mut joined_cleanup)
         .await
         .unwrap();
     assert!(!broker.snapshot().ordinary_ready);
     assert!(
-        capture.capability().unwrap().current(),
-        "cancelled setup retired capture"
+        resume.send(()).is_err(),
+        "cancelled setup retained a network wait"
     );
-    assert!(capture.try_send(&ipv4(17, b"cancelled-ordinary")).is_err());
     let source = PendingManaged::request(broker.clone(), tun_config(&config)).unwrap();
-    capture
-        .acknowledge_request(&broker.pending_request().unwrap())
-        .unwrap();
+    let _capture = acknowledge(&broker, &config);
     let mut client = GotaTun::new(
         PlaintextSource::Managed(source),
         Arc::new(NoopBypass),
@@ -1757,6 +1785,552 @@ async fn managed_monitor_disconnect_waits_for_cancelled_owner_and_actual_joined_
         "Stop preceded actual control/device joins"
     );
     assert!(!broker.snapshot().ordinary_ready);
+}
+
+#[derive(Default)]
+struct SetupBypass {
+    hits: std::sync::atomic::AtomicUsize,
+    entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    hold: Option<Arc<(Mutex<bool>, std::sync::Condvar)>>,
+}
+impl SocketBypass for SetupBypass {
+    fn bypass_socket(
+        &self,
+        _: socket2::SockRef<'_>,
+        _: &talpid_net::bypass::BypassToken,
+    ) -> io::Result<()> {
+        self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(entered) = self.entered.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
+        if let Some(hold) = &self.hold {
+            let mut released = hold.0.lock().unwrap();
+            while !*released {
+                released = hold.1.wait(released).unwrap();
+            }
+        }
+        Ok(())
+    }
+    fn revoke_bypass(
+        &self,
+        _: socket2::SockRef<'_>,
+        _: &talpid_net::bypass::BypassToken,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+}
+struct ReleaseSetup(Arc<(Mutex<bool>, std::sync::Condvar)>);
+impl Drop for ReleaseSetup {
+    fn drop(&mut self) {
+        *self.0.0.lock().unwrap() = true;
+        self.0.1.notify_all();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn managed_setup_cancellation_joins_each_owned_stage() {
+    use futures::FutureExt;
+    // A completed Device::stop may leave its final Drop task owning plaintext
+    // halves. Their own destruction, not task scheduling, gates acknowledgement.
+    {
+        let (broker, _root, control) = broker();
+        let config = config();
+        let mut source = PendingManaged::request(broker.clone(), tun_config(&config)).unwrap();
+        let request = broker.pending_request().unwrap();
+        let _capture = acknowledge(&broker, &config);
+        let ManagedPair {
+            send,
+            receive,
+            owner,
+        } = source.create(&config).await.unwrap();
+        owner.guard.lock().await.as_mut().unwrap().stop().await;
+        let mut stopped = Box::pin(owner.stop_after_device());
+        assert!(stopped.as_mut().now_or_never().is_none());
+        assert!(!request.release_ready());
+        assert_eq!(control.used(), CONTROL_STORAGE);
+        drop(send);
+        assert!(stopped.as_mut().now_or_never().is_none());
+        assert!(!request.release_ready());
+        drop(receive);
+        stopped.await;
+        assert!(request.release_ready());
+        drop(owner);
+        assert_eq!(control.used(), 0);
+    }
+    // A current-thread worker cannot run between caller-drop and the next
+    // pending-request inspection. Hold the fallback receipt at that boundary.
+    tokio::task::spawn_blocking(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (broker, _root, control) = broker();
+                let config = config();
+                let mut source =
+                    PendingManaged::request(broker.clone(), tun_config(&config)).unwrap();
+                let exact_cleanup = source.cleanup();
+                let first = broker.pending_request().unwrap().id();
+                let (finished, completion) = tokio::sync::oneshot::channel();
+                source.cleanup_complete = Some(finished);
+                let capture = acknowledge(&broker, &config);
+                let bypass = Arc::new(FirstBindEnobufs {
+                    broker: broker.clone(),
+                    attempts: Mutex::new(Vec::new()),
+                    always: false,
+                });
+                let mut caller = Box::pin(GotaTun::new(
+                    PlaintextSource::Managed(source),
+                    bypass.clone(),
+                    None,
+                    &config,
+                    None,
+                    String::new(),
+                ));
+                assert!(caller.as_mut().now_or_never().is_none());
+                let mut changes = broker.changes();
+                let second = tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let _ = changes.borrow_and_update();
+                        if let Some(request) = broker.pending_request() {
+                            assert!(request.id() > first);
+                            break request;
+                        }
+                        changes.changed().await.unwrap();
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    control.used(),
+                    0,
+                    "fallback published before old cleanup/refund"
+                );
+                assert_eq!(bypass.attempts.lock().unwrap().len(), 1);
+                drop(caller);
+                assert!(
+                    broker.pending_request().is_none(),
+                    "caller-drop left the second receipt admissible before worker scheduling"
+                );
+                // This is the next platform-admission pass. A stale pending request
+                // would authorize configuration; none may escape caller-drop.
+                let mut platform_admissions = 0;
+                if let Some(request) = broker.pending_request() {
+                    platform_admissions += 1;
+                    capture.acknowledge_request(&request).unwrap();
+                }
+                assert_eq!(platform_admissions, 0);
+                let successor = broker
+                    .request_target_capture(tun_config(&config), tun_config(&config))
+                    .unwrap();
+                let successor_id = broker.pending_request().unwrap().id();
+                exact_cleanup.cancel();
+                assert_eq!(
+                    broker.pending_request().unwrap().id(),
+                    successor_id,
+                    "old setup cancelled unrelated successor"
+                );
+                tokio::time::timeout(Duration::from_secs(2), completion)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(second.release_ready());
+                assert_eq!(
+                    bypass.attempts.lock().unwrap().len(),
+                    1,
+                    "cancel admitted another device"
+                );
+                assert_eq!(control.used(), 0);
+                assert_eq!(broker.pending_request().unwrap().id(), successor_id);
+                assert!(capture.capability().unwrap().current());
+                drop(successor);
+            });
+    })
+    .await
+    .unwrap();
+    // Pending receipt, consumed receipt and an already-running private stack.
+    for stage in ["receipt", "acquisition", "control", "device"] {
+        let (broker, _root, control) = broker();
+        let config = config();
+        let mut source = PendingManaged::request(broker.clone(), tun_config(&config)).unwrap();
+        let request = broker.pending_request().unwrap();
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        source.cleanup_complete = Some(finished);
+        let (entered, reached) = tokio::sync::oneshot::channel();
+        let (resume, held) = tokio::sync::oneshot::channel();
+        let hold = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let release = ReleaseSetup(hold.clone());
+        let bypass = Arc::new(SetupBypass {
+            entered: Mutex::new(if stage == "device" {
+                Some(entered)
+            } else {
+                None
+            }),
+            hold: (stage == "device").then_some(hold),
+            ..Default::default()
+        });
+        // Entered is used by exactly one real boundary, never by a timer.
+        let (stage_entered, stage_reached) = tokio::sync::oneshot::channel();
+        if stage == "acquisition" {
+            source.after_receipt = Some(held);
+            source.after_receipt_entered = Some(stage_entered);
+        } else if stage == "control" {
+            source.after_stack = Some((stage_entered, held));
+        } else {
+            drop((stage_entered, held));
+        }
+        let capture = (stage != "receipt").then(|| acknowledge(&broker, &config));
+        let mut setup = Box::pin(GotaTun::new(
+            PlaintextSource::Managed(source),
+            bypass.clone(),
+            None,
+            &config,
+            None,
+            String::new(),
+        ));
+        assert!(setup.as_mut().now_or_never().is_none());
+        match stage {
+            "acquisition" | "control" => {
+                tokio::time::timeout(Duration::from_secs(2), stage_reached)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+            "device" => tokio::time::timeout(Duration::from_secs(2), reached)
+                .await
+                .unwrap()
+                .unwrap(),
+            _ => {}
+        }
+        drop(setup);
+        assert!(broker.pending_request().is_none());
+        assert!(
+            broker.snapshot().attachment.is_none(),
+            "{stage}: cancellation did not revoke immediately"
+        );
+        assert!(!broker.snapshot().ordinary_ready);
+        let mut completion = Box::pin(completion);
+        if stage == "device" {
+            assert_eq!(
+                control.used(),
+                CONTROL_STORAGE,
+                "refunded started device work"
+            );
+            assert!(
+                completion.as_mut().now_or_never().is_none(),
+                "Stop preceded device join"
+            );
+        }
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(2), completion)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(request.release_ready());
+        assert_eq!(control.used(), 0, "{stage}: control leaked after join");
+        if stage != "device" {
+            assert_eq!(
+                bypass.hits.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "cancel started a device"
+            );
+        }
+        if let Some(capture) = capture {
+            assert!(capture.capability().unwrap().current());
+        }
+        assert!(resume.send(()).is_err());
+    }
+    // Observe a real temporary device's handshake before cancelling PQ/DAITA.
+    for (pq, daita) in [(true, false), (false, true), (true, true)] {
+        let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut config = config();
+        config.quantum_resistant = pq;
+        config.daita = daita;
+        config.entry_peer.endpoint = relay.local_addr().unwrap();
+        let bypass: Arc<dyn SocketBypass> = Arc::new(NoopBypass);
+        let (cancel, receiver) = CancelToken::new();
+        let negotiation = crate::ephemeral::negotiate_ephemeral_peers_cancellable(
+            &config, 3, None, &bypass, receiver,
+        );
+        tokio::pin!(negotiation);
+        let mut bytes = [0u8; 2048];
+        tokio::select! {
+            result = &mut negotiation => panic!("negotiation ended before handshake: {}", result.is_ok()),
+            result = tokio::time::timeout(Duration::from_secs(2), relay.recv_from(&mut bytes)) => { assert!(result.unwrap().unwrap().0 > 0); },
+        }
+        cancel.close();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), negotiation)
+                .await
+                .unwrap(),
+            Err(crate::CloseMsg::Stop)
+        ));
+    }
+    // Both real bind attempts fail: the fallback is exactly once, with a fresh
+    // request/attempt after the old private guard has joined and refunded.
+    #[cfg(unix)]
+    {
+        let (broker, _root, control) = broker();
+        let config = config();
+        let source = PendingManaged::request(broker.clone(), tun_config(&config)).unwrap();
+        let first = broker.pending_request().unwrap().id();
+        let capture = acknowledge(&broker, &config);
+        let actor_broker = broker.clone();
+        let actor_control = control.clone();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let actor = tokio::spawn(async move {
+            let mut requests = vec![first];
+            let mut changes = actor_broker.changes();
+            tokio::pin!(stopped);
+            loop {
+                let _ = changes.borrow_and_update();
+                if let Some(request) = actor_broker.pending_request() {
+                    assert_eq!(actor_control.used(), 0, "retry retained old control stack");
+                    assert!(request.id() > *requests.last().unwrap());
+                    requests.push(request.id());
+                    capture.acknowledge_request(&request).unwrap();
+                }
+                tokio::select! {
+                    _ = &mut stopped => return requests,
+                    result = changes.changed() => result.unwrap(),
+                }
+            }
+        });
+        let bypass = Arc::new(FirstBindEnobufs {
+            broker: broker.clone(),
+            attempts: Mutex::new(Vec::new()),
+            always: true,
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            GotaTun::new(
+                PlaintextSource::Managed(source),
+                bypass.clone(),
+                None,
+                &config,
+                None,
+                String::new(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        stop.send(()).unwrap();
+        let requests = actor.await.unwrap();
+        assert_eq!(requests.len(), 2, "more than one ENOBUFS retry");
+        let attempts = bypass.attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_ne!(attempts[0].1, attempts[1].1);
+        assert_eq!(control.used(), 0);
+    }
+    // Obfuscator commitment is cancellable after the real peer-stat check.
+    let (broker, _root, control) = broker();
+    let mut config = config();
+    let (remote, _observed) = remote(&mut config, false).await;
+    let source = PendingManaged::request(broker.clone(), tun_config(&config)).unwrap();
+    let _capture = acknowledge(&broker, &config);
+    let mut client = GotaTun::new(
+        PlaintextSource::Managed(source),
+        Arc::new(NoopBypass),
+        None,
+        &config,
+        None,
+        String::new(),
+    )
+    .await
+    .unwrap();
+    let owner = client.managed().unwrap();
+    let (cancel, receiver) = CancelToken::new();
+    let mut check = Check::new_with_smoltcp(owner.pinger().unwrap(), 0, receiver);
+    let (entered, reached) = tokio::sync::oneshot::channel();
+    {
+        let setup = establish_and_observe(&mut check, &client, &owner, async {
+            entered.send(()).unwrap();
+            std::future::pending().await
+        });
+        tokio::pin!(setup);
+        tokio::select! {
+            result = &mut setup => panic!("commitment not held: {result:?}"),
+            _ = reached => {},
+        }
+        cancel.close();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), setup)
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+    assert!(!broker.snapshot().ordinary_ready);
+    client.shutdown().await;
+    drop((client, owner, check));
+    assert_eq!(control.used(), 0);
+    remote.stop().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn native_setup_and_private_pinger_preserve_upstream_configuration_domain() {
+    use crate::connectivity::Pinger;
+    use futures::FutureExt;
+    use std::os::fd::{AsRawFd, IntoRawFd};
+    // A real Native constructor runs before its caller's first suspension, not
+    // in an unowned worker. A borrowed Unix fd stands in for the native IP fd.
+    let name = std::fs::read_dir("/sys/class/net")
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .find(|name| {
+            std::fs::read_to_string(format!("/sys/class/net/{name}/mtu"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u16>().ok())
+                .is_some()
+        })
+        .unwrap();
+    let (fd, peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+    let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+    let inode = std::fs::read_link(&path).unwrap();
+    let mut tun = tun::Configuration::default();
+    tun.raw_fd(fd.into_raw_fd()).tun_name(name);
+    let device = GotaTunDevice::from_tun_device(
+        tun::AsyncDevice::new(tun::Device::new(&tun).unwrap()).unwrap(),
+    )
+    .unwrap();
+    let (retired, destroyed) = tokio::sync::oneshot::channel::<()>();
+    let device = NativeDevice {
+        device,
+        _retired: Some(Arc::new(retired)),
+    };
+    let bypass = Arc::new(SetupBypass::default());
+    let config = config();
+    let mut setup = Box::pin(GotaTun::new(
+        PlaintextSource::Native(device),
+        bypass.clone(),
+        None,
+        &config,
+        None,
+        String::new(),
+    ));
+    let result = setup.as_mut().now_or_never();
+    assert!(
+        bypass.hits.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "Native constructor detached from caller"
+    );
+    let mut destroyed = Box::pin(destroyed);
+    assert!(
+        destroyed.as_mut().now_or_never().is_none(),
+        "live Native half signalled retirement"
+    );
+    drop((result, setup));
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), destroyed)
+            .await
+            .unwrap()
+            .is_err()
+    );
+    assert_ne!(std::fs::read_link(&path).ok(), Some(inode));
+    drop(peer);
+    for (v4, v6, mtu) in [(true, false, 1220), (true, true, 1280), (false, true, 1280)] {
+        let (broker, _root, control) = broker();
+        let mut config = self::config();
+        config
+            .tunnel
+            .addresses
+            .retain(|ip| if ip.is_ipv4() { v4 } else { v6 });
+        config.mtu = mtu;
+        let (remote, mut observed) = remote(&mut config, false).await;
+        let source = PendingManaged::request(broker.clone(), tun_config(&config)).unwrap();
+        let capture = acknowledge(&broker, &config);
+        let mut client = GotaTun::new(
+            PlaintextSource::Managed(source),
+            Arc::new(NoopBypass),
+            None,
+            &config,
+            None,
+            String::new(),
+        )
+        .await
+        .expect("upstream-valid family/MTU rejected by private pinger");
+        let owner = client.managed().unwrap();
+        let mut pinger = owner.pinger().unwrap();
+        if v4 {
+            pinger.send_icmp().await.unwrap();
+        } else {
+            let error = pinger.send_icmp().await.unwrap_err();
+            use std::error::Error as _;
+            assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<io::Error>()
+                    .unwrap()
+                    .kind(),
+                io::ErrorKind::AddrNotAvailable
+            );
+            assert_eq!(
+                control.used(),
+                0,
+                "unavailable private source allocated a fake IPv4 stack"
+            );
+        }
+        // Constructor-domain proof: open this installed carrier explicitly to
+        // drive ordinary bytes; B4 separately owns pre-Up admission timing.
+        owner.activate().unwrap();
+        let mut bytes = if v6 {
+            let mut bytes = vec![0; 48 + 8];
+            bytes[0] = 0x60;
+            bytes[4..6].copy_from_slice(&16u16.to_be_bytes());
+            bytes[6] = 17;
+            bytes[7] = 64;
+            bytes[8..24].copy_from_slice(&config.tunnel_ipv6().unwrap().octets());
+            bytes[24..40].copy_from_slice(&"2001:db8::42".parse::<Ipv6Addr>().unwrap().octets());
+            bytes[40..42].copy_from_slice(&43000u16.to_be_bytes());
+            bytes[42..44].copy_from_slice(&53u16.to_be_bytes());
+            bytes[44..46].copy_from_slice(&16u16.to_be_bytes());
+            bytes[48..].copy_from_slice(b"v6-nonce");
+            fix_wire(&mut bytes, 40, 17);
+            bytes
+        } else {
+            ipv4(17, b"v4-nonce")
+        };
+        capture.try_send(&bytes).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), observed.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            bytes
+        );
+        let mut reply = tokio::time::timeout(Duration::from_secs(2), capture.reply())
+            .await
+            .unwrap()
+            .unwrap();
+        bytes = application_reply(&bytes);
+        assert!(matches!(
+            reply.write(|actual| {
+                assert_eq!(actual, bytes);
+                Ok(actual.len())
+            }),
+            RelayWriteOutcome::Written
+        ));
+        let (_cancel, receiver) = CancelToken::new();
+        let mut check = Check::new_with_smoltcp(pinger, 0, receiver);
+        assert!(
+            check.establish_connectivity(&client).await.unwrap(),
+            "ordinary authenticated stats must suffice without a private reply"
+        );
+        assert!(
+            client
+                .get_tunnel_stats()
+                .await
+                .unwrap()
+                .values()
+                .any(|s| s.rx_bytes > 0 && s.tx_bytes > 0)
+        );
+        client.shutdown().await;
+        drop((client, owner, check, reply));
+        assert_eq!(control.used(), 0);
+        remote.stop().await;
+    }
 }
 
 // Independent endpoint/device from the archived TCP fixture. This is ordinary

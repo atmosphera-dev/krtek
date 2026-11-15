@@ -169,6 +169,7 @@ pub async fn spawn(
     );
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let weak_command_tx = Arc::downgrade(&command_tx);
 
@@ -181,6 +182,7 @@ pub async fn spawn(
         log_dir,
         resource_dir,
         commands_rx: command_rx,
+        shutdown_requested: shutdown_requested.clone(),
         route_manager,
         #[cfg(target_os = "windows")]
         volume_update_rx,
@@ -204,7 +206,9 @@ pub async fn spawn(
 
     Ok(TunnelStateMachineHandle {
         command_tx,
-        shutdown_rx,
+        shutdown_rx: Some(shutdown_rx),
+        shutdown_requested,
+        shutdown_result: None,
         #[cfg(windows)]
         split_tunnel,
     })
@@ -340,6 +344,7 @@ impl PartialEq for LockdownMode {
 /// to. Every time it successfully advances the state machine a `TunnelStateTransition` is emitted
 /// by the stream.
 struct TunnelStateMachine {
+    shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
     current_state: Option<Box<dyn TunnelState>>,
     commands: TunnelCommandReceiver,
     shared_values: SharedTunnelStateValues,
@@ -347,6 +352,7 @@ struct TunnelStateMachine {
 
 /// Tunnel state machine initialization arguments arguments
 struct TunnelStateMachineInitArgs<G: TunnelParametersGenerator> {
+    shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
     settings: InitialTunnelState,
     command_tx: std::sync::Weak<mpsc::UnboundedSender<TunnelCommand>>,
     offline_state_tx: mpsc::UnboundedSender<Connectivity>,
@@ -493,6 +499,7 @@ impl TunnelStateMachine {
                 DisconnectedState::enter(&mut shared_values, args.settings.reset_firewall);
 
             Ok(TunnelStateMachine {
+                shutdown_requested: args.shutdown_requested,
                 current_state: Some(initial_state),
                 commands: args.commands_rx.fuse(),
                 shared_values,
@@ -508,6 +515,13 @@ impl TunnelStateMachine {
         let runtime = self.shared_values.runtime.clone();
 
         while let Some(state) = self.current_state.take() {
+            if self
+                .shutdown_requested
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                self.commands.get_mut().close();
+                while self.commands.get_mut().try_recv().is_ok() {}
+            }
             match state.handle_event(&runtime, &mut self.commands, &mut self.shared_values) {
                 NewState((state, transition)) => {
                     self.current_state = Some(state);
@@ -517,7 +531,11 @@ impl TunnelStateMachine {
                         .map_err(|_| Error::SendStateChange)
                     {
                         log::error!("{}", error);
-                        break;
+                        // A closed observer is not completion of owned teardown.
+                        // Close the command stream and let each state join its
+                        // monitor before this task acknowledges shutdown.
+                        self.shutdown_requested
+                            .store(true, std::sync::atomic::Ordering::Release);
                     }
                 }
                 SameState(state) => {
@@ -813,18 +831,41 @@ trait TunnelState: Send {
 /// Handle used to control the tunnel state machine.
 pub struct TunnelStateMachineHandle {
     command_tx: Arc<mpsc::UnboundedSender<TunnelCommand>>,
-    shutdown_rx: oneshot::Receiver<()>,
+    shutdown_rx: Option<oneshot::Receiver<()>>,
+    shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_result: Option<bool>,
     #[cfg(windows)]
     split_tunnel: split_tunnel::SplitTunnelHandle,
 }
 
 impl TunnelStateMachineHandle {
+    /// Managed shutdown joins the actual owner, independently of public events.
+    /// Cancelling this wait retains the same completion receiver for a retry.
+    pub async fn shutdown_and_join(&mut self) -> io::Result<()> {
+        self.shutdown_requested
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.command_tx.close_channel();
+        if let Some(receiver) = self.shutdown_rx.as_mut() {
+            self.shutdown_result = Some(receiver.await.is_ok());
+            self.shutdown_rx = None;
+        }
+        match self.shutdown_result {
+            Some(true) => Ok(()),
+            _ => Err(io::Error::other(
+                "Tunnel state machine lost its shutdown acknowledgement",
+            )),
+        }
+    }
     /// Waits for the tunnel state machine to shut down.
     /// This may fail after a timeout of `TUNNEL_STATE_MACHINE_SHUTDOWN_TIMEOUT`.
     pub async fn try_join(self) {
         drop(self.command_tx);
 
-        match tokio::time::timeout(TUNNEL_STATE_MACHINE_SHUTDOWN_TIMEOUT, self.shutdown_rx).await {
+        let Some(shutdown_rx) = self.shutdown_rx else {
+            return;
+        };
+
+        match tokio::time::timeout(TUNNEL_STATE_MACHINE_SHUTDOWN_TIMEOUT, shutdown_rx).await {
             Ok(_) => log::info!("Tunnel state machine shut down"),
             Err(_) => log::error!("Tunnel state machine did not shut down gracefully"),
         }

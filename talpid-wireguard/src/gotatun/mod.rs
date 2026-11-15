@@ -49,18 +49,51 @@ type TunRx = SourceFilter<PlaintextReceive>;
 type SinglehopDevice = Device<(TransportFactory, PlaintextSend, TunRx)>;
 type ExitDevice = Device<(UdpChannelFactory, PlaintextSend, TunRx)>;
 
+#[cfg(not(test))]
+type NativeDevice = GotaTunDevice;
+
+#[cfg(test)]
+#[derive(Clone)]
+struct NativeDevice {
+    device: GotaTunDevice,
+    // Last field: all owned native handles drop before this completion closes.
+    _retired: Option<Arc<tokio::sync::oneshot::Sender<()>>>,
+}
+#[cfg(test)]
+impl From<GotaTunDevice> for NativeDevice {
+    fn from(device: GotaTunDevice) -> Self {
+        Self {
+            device,
+            _retired: None,
+        }
+    }
+}
+#[cfg(test)]
+impl std::ops::Deref for NativeDevice {
+    type Target = GotaTunDevice;
+    fn deref(&self) -> &Self::Target {
+        &self.device
+    }
+}
+#[cfg(test)]
+impl std::ops::DerefMut for NativeDevice {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.device
+    }
+}
+
 enum PlaintextSource {
-    Native(GotaTunDevice),
+    Native(NativeDevice),
     #[cfg(any(target_os = "android", test))]
     Managed(managed_control::PendingManaged),
 }
 enum PlaintextSend {
-    Native(GotaTunDevice),
+    Native(NativeDevice),
     #[cfg(any(target_os = "android", test))]
     Managed(managed_control::ManagedSend),
 }
 enum PlaintextReceive {
-    Native(GotaTunDevice),
+    Native(NativeDevice),
     #[cfg(any(target_os = "android", test))]
     Managed(managed_control::ManagedReceive),
 }
@@ -138,16 +171,37 @@ impl GotaTun {
         daita: Option<&DaitaSettings>,
         interface_name: String,
     ) -> Result<Self, TunnelError> {
+        if matches!(source, PlaintextSource::Native(_)) {
+            // Upstream Native setup belongs to its caller, including cancellation.
+            return Self::new_inner(source, bypass, obfuscation, config, daita, interface_name)
+                .await;
+        }
+        #[cfg(any(target_os = "android", test))]
+        let mut cancel_on_drop = match &source {
+            PlaintextSource::Managed(pending) => Some(SetupCancellation {
+                cancellation: pending.cancellation.clone(),
+                cleanup: pending.cleanup(),
+                armed: true,
+            }),
+            PlaintextSource::Native(_) => None,
+        };
         let config = config.clone();
         let daita = daita.map(|settings| DaitaSettings {
             client_machines: settings.client_machines.clone(),
             max_decoy_frac: settings.max_decoy_frac,
             max_delay_frac: settings.max_delay_frac,
         });
-        // A cancelled caller detaches this one setup owner, never an in-flight
-        // device/guard join. An unclaimed successful result has joined Drop cleanup.
-        tokio::spawn(async move {
-            Self::new_inner(
+        // Only Managed has an owned worker: caller-drop revokes its exact request,
+        // while the worker cancels waits and joins work that has already started.
+        let result = tokio::spawn(async move {
+            #[cfg(test)]
+            let mut source = source;
+            #[cfg(test)]
+            let completion = match &mut source {
+                PlaintextSource::Managed(pending) => pending.cleanup_complete.take(),
+                PlaintextSource::Native(_) => None,
+            };
+            let result = Self::new_inner(
                 source,
                 bypass,
                 obfuscation,
@@ -155,10 +209,31 @@ impl GotaTun {
                 daita.as_ref(),
                 interface_name,
             )
-            .await
+            .await;
+            #[cfg(test)]
+            let result = match result {
+                Ok(mut tunnel) => {
+                    tunnel.cleanup_complete = completion;
+                    Ok(tunnel)
+                }
+                Err(error) => {
+                    if let Some(completion) = completion {
+                        let _ = completion.send(());
+                    }
+                    Err(error)
+                }
+            };
+            result
         })
         .await
-        .map_err(|error| TunnelError::FatalStartWireguardError(Box::new(error)))?
+        .map_err(|error| TunnelError::FatalStartWireguardError(Box::new(error)))?;
+        #[cfg(any(target_os = "android", test))]
+        {
+            if let Some(guard) = cancel_on_drop.as_mut() {
+                guard.armed = false;
+            }
+        }
+        result
     }
 
     #[cfg_attr(not(any(target_os = "android", test)), expect(unused_mut))]
@@ -174,7 +249,31 @@ impl GotaTun {
             obfuscation.with_client_public_key(config.tunnel.private_key.public_key())
         });
         let mut optimize = true;
+        #[cfg(any(target_os = "android", test))]
+        let cancellation = match &source {
+            PlaintextSource::Managed(pending) => {
+                Some((pending.cancellation.clone(), pending.cancelled.clone()))
+            }
+            PlaintextSource::Native(_) => None,
+        };
+        let is_cancelled = || {
+            #[cfg(any(target_os = "android", test))]
+            {
+                cancellation
+                    .as_ref()
+                    .is_some_and(|(token, _)| token.is_closed())
+            }
+            #[cfg(not(any(target_os = "android", test)))]
+            {
+                false
+            }
+        };
         loop {
+            if is_cancelled() {
+                return Err(TunnelError::FatalStartWireguardError(Box::new(
+                    std::io::Error::from(std::io::ErrorKind::Interrupted),
+                )));
+            }
             let (send, receive, managed): (_, _, Option<ManagedOwner>) = match &mut source {
                 PlaintextSource::Native(device) => (
                     PlaintextSend::Native(device.clone()),
@@ -202,15 +301,30 @@ impl GotaTun {
             let setup = create_devices(
                 config,
                 daita,
-                send,
-                receive,
+                (send, receive),
                 bypass.clone(),
                 obfuscation.clone(),
                 optimize,
-            )
-            .await;
+                is_cancelled,
+            );
+            tokio::pin!(setup);
+            #[cfg(any(target_os = "android", test))]
+            let setup = if let Some((_, receiver)) = &cancellation {
+                let mut receiver = receiver.clone();
+                tokio::select! { biased;
+                    _ = receiver.cancelled() => {
+                        if let Some(owner) = &managed { owner.revoke(); }
+                        setup.await
+                    }
+                    result = &mut setup => result,
+                }
+            } else {
+                setup.await
+            };
+            #[cfg(not(any(target_os = "android", test)))]
+            let setup = setup.await;
             match setup {
-                Ok(devices) => {
+                Ok(Some(devices)) => {
                     #[cfg(any(target_os = "android", test))]
                     if let Some(owner) = &managed {
                         owner.installed();
@@ -228,10 +342,19 @@ impl GotaTun {
                         managed,
                     });
                 }
+                Ok(None) => {
+                    #[cfg(any(target_os = "android", test))]
+                    if let Some(owner) = managed {
+                        owner.stop_after_device().await;
+                    }
+                    return Err(TunnelError::FatalStartWireguardError(Box::new(
+                        std::io::Error::from(std::io::ErrorKind::Interrupted),
+                    )));
+                }
                 Err(error) => {
                     #[cfg(any(target_os = "android", test))]
                     if let Some(owner) = managed {
-                        owner.stop().await;
+                        owner.stop_after_device().await;
                     }
                     #[cfg(unix)]
                     if optimize
@@ -267,7 +390,7 @@ impl GotaTun {
             devices.stop().await;
             #[cfg(any(target_os = "android", test))]
             if let Some(owner) = managed {
-                owner.stop().await;
+                owner.stop_after_device().await;
             }
             #[cfg(test)]
             if let Some(completed) = cleanup_complete {
@@ -277,6 +400,16 @@ impl GotaTun {
     }
 
     async fn shutdown(&mut self) {
+        #[cfg(any(target_os = "android", test))]
+        let managed = self.managed.is_some() || self.cleanup.is_some();
+        #[cfg(not(any(target_os = "android", test)))]
+        let managed = false;
+        if !managed {
+            if let Some(devices) = self.devices.take() {
+                devices.stop().await;
+            }
+            return;
+        }
         self.begin_cleanup();
         if let Some(cleanup) = &mut self.cleanup {
             let _ = cleanup.await;
@@ -292,7 +425,26 @@ type ManagedOwner = ();
 
 impl Drop for GotaTun {
     fn drop(&mut self) {
-        self.begin_cleanup();
+        #[cfg(any(target_os = "android", test))]
+        if self.managed.is_some() {
+            self.begin_cleanup();
+        }
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+struct SetupCancellation {
+    cancellation: crate::connectivity::CancelToken,
+    cleanup: Arc<managed_control::SetupRequests>,
+    armed: bool,
+}
+#[cfg(any(target_os = "android", test))]
+impl Drop for SetupCancellation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cleanup.cancel();
+            self.cancellation.close();
+        }
     }
 }
 
@@ -339,6 +491,7 @@ impl Multihop {
         // TODO: Express relationship between `config` and `exit_peer` at the type level.
         exit_peer: &PeerConfig,
         daita: Option<&DaitaSettings>,
+        is_cancelled: impl Fn() -> bool,
     ) -> Result<(), gotatun::device::Error> {
         let private_key = StaticSecret::from(config.tunnel.private_key.to_bytes());
         let exit_peer = to_gotatun_peer(exit_peer, None);
@@ -349,6 +502,9 @@ impl Multihop {
         );
 
         configure_entry_device(&self.entry_device, config, daita).await?;
+        if is_cancelled() {
+            return Ok(());
+        }
         configure_exit_device(&self.exit_device, private_key, exit_peer).await?;
 
         Ok(())
@@ -388,6 +544,25 @@ enum OpenedSource {
 }
 
 impl OpenedTun {
+    #[cfg(target_os = "android")]
+    pub(super) fn set_cancellation(
+        &mut self,
+        token: crate::connectivity::CancelToken,
+        receiver: crate::connectivity::CancelReceiver,
+    ) {
+        if let OpenedSource::Managed(pending) = &mut self.source {
+            pending.cancellation = token;
+            pending.cancelled = receiver;
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    pub(super) fn cancel_setup(&self) {
+        if let OpenedSource::Managed(pending) = &self.source {
+            pending.cleanup().cancel();
+            pending.cancellation.close();
+        }
+    }
     /// Whether the tunnel device was created, rather than reused. Android applies the routes of a
     /// new tunnel device asynchronously.
     #[cfg(target_os = "android")]
@@ -499,10 +674,13 @@ pub async fn start_gotatun(
 
     log::trace!("passing tunnel dev to gotatun");
     let source = match tun.source {
-        OpenedSource::Native(device) => PlaintextSource::Native(
-            GotaTunDevice::from_tun_device(device)
-                .map_err(|e| TunnelError::RecoverableStartWireguardError(Box::new(e)))?,
-        ),
+        OpenedSource::Native(device) => {
+            let device = GotaTunDevice::from_tun_device(device)
+                .map_err(|e| TunnelError::RecoverableStartWireguardError(Box::new(e)))?;
+            #[cfg(test)]
+            let device = NativeDevice::from(device);
+            PlaintextSource::Native(device)
+        }
         #[cfg(target_os = "android")]
         OpenedSource::Managed(pending) => PlaintextSource::Managed(pending),
     };
@@ -642,12 +820,20 @@ impl Tunnel for GotaTun {
 async fn create_devices(
     config: &Config, // TODO: do not include config to reduce confusion
     daita: Option<&DaitaSettings>,
-    send: PlaintextSend,
-    receive: PlaintextReceive,
+    plaintext: (PlaintextSend, PlaintextReceive),
     bypass: Arc<dyn SocketBypass>,
     obfuscation: Option<RunningObfuscation>,
     optimize_buffer_size: bool,
-) -> Result<Devices, gotatun::device::Error> {
+    is_cancelled: impl Fn() -> bool,
+) -> Result<Option<Devices>, gotatun::device::Error> {
+    let (send, receive) = plaintext;
+    #[cfg(any(target_os = "android", test))]
+    let managed_cleanup = matches!(send, PlaintextSend::Managed(_));
+    #[cfg(not(any(target_os = "android", test)))]
+    let managed_cleanup = false;
+    if is_cancelled() {
+        return Ok(None);
+    }
     let factory = transport_factory(
         optimize_buffer_size,
         obfuscation,
@@ -686,6 +872,10 @@ async fn create_devices(
             .with_ip_pair(send, tun_rx)
             .build()
             .await?;
+        if is_cancelled() {
+            exit_device.stop().await;
+            return Ok(None);
+        }
 
         // Hacky way of dumping entry<->exit traffic to a unix socket which wireshark can read.
         // See docs on wrap_in_pcap_sniffer for an explanation.
@@ -700,7 +890,9 @@ async fn create_devices(
         {
             Ok(device) => device,
             Err(error) => {
-                exit_device.stop().await;
+                if managed_cleanup {
+                    exit_device.stop().await;
+                }
                 return Err(error);
             }
         };
@@ -708,8 +900,17 @@ async fn create_devices(
             entry_device,
             exit_device,
         };
-        if let Err(error) = devices.configure(config, exit_peer, daita).await {
+        if is_cancelled() {
             devices.stop().await;
+            return Ok(None);
+        }
+        if let Err(error) = devices
+            .configure(config, exit_peer, daita, &is_cancelled)
+            .await
+        {
+            if managed_cleanup {
+                devices.stop().await;
+            }
             return Err(error);
         }
         Devices::Multihop(devices)
@@ -723,14 +924,24 @@ async fn create_devices(
             .build()
             .await?;
         let mut device = Singlehop { device };
-        if let Err(error) = device.configure(config, daita).await {
+        if is_cancelled() {
             device.stop().await;
+            return Ok(None);
+        }
+        if let Err(error) = device.configure(config, daita).await {
+            if managed_cleanup {
+                device.stop().await;
+            }
             return Err(error);
         }
         Devices::Singlehop(device)
     };
 
-    Ok(devices)
+    if is_cancelled() {
+        devices.stop().await;
+        return Ok(None);
+    }
+    Ok(Some(devices))
 }
 
 #[cfg(target_os = "windows")]

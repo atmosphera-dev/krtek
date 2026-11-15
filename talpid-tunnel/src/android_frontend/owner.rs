@@ -342,11 +342,20 @@ async fn run<A: LocalAuthority>(actor: Actor<A>) -> io::Result<()> {
                 } else if buffers.is_err() {
                     Err(io::Error::other("Capture read storage unavailable"))
                 } else {
-                    let wait = epoch.observation.wait_ready(
+                    let readiness = epoch.observation.wait_ready(
                         &epoch.config,
                         retained.as_ref().map(|old| &old.change),
                         &mut stop,
                     );
+                    tokio::pin!(readiness);
+                    let mut first_pending = true;
+                    let wait = std::future::poll_fn(|cx| {
+                        let result = std::future::Future::poll(readiness.as_mut(), cx);
+                        if result.is_pending() && std::mem::take(&mut first_pending) {
+                            platform.readiness_pending(epoch.observation.generation);
+                        }
+                        result
+                    });
                     tokio::pin!(wait);
                     let mut updates_open = true;
                     loop {

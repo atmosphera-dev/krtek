@@ -76,10 +76,14 @@ macro_rules! ok_or_throw {
 struct DaemonContext {
     runtime: tokio::runtime::Runtime,
     daemon_command_tx: DaemonCommandSender,
-    running_daemon: tokio::task::JoinHandle<()>,
+    running_daemon: Option<DaemonTask>,
+    shutdown_failure: Option<mullvad_daemon::ShutdownFailure>,
+    task_failure: Option<String>,
     local_network_registration: Option<local_network::LocalNetworkRegistration>,
     capture_network_registration: Option<capture_network::CaptureNetworkRegistration>,
 }
+
+type DaemonTask = tokio::task::JoinHandle<Result<(), mullvad_daemon::ShutdownFailure>>;
 
 /// Spawn Mullvad daemon. There can only be a single instance, which must be shut down using
 /// `MullvadDaemon.shutdown`. On success, nothing is returned. On error, an exception is thrown.
@@ -95,9 +99,13 @@ pub extern "system" fn Java_net_mullvad_mullvadvpn_app_service_MullvadDaemon_ini
     extra_metadata: JObject<'_>,
 ) {
     let mut ctx = DAEMON_CONTEXT.lock().unwrap();
-    assert!(ctx.is_none(), "multiple calls to MullvadDaemon.initialize");
-
     let env = JnixEnv::from(env);
+    if ctx.is_some() {
+        ok_or_throw!(
+            &env,
+            Err::<(), _>("Mullvad daemon still owns its runtime or pending cleanup")
+        );
+    }
     let files_dir = pathbuf_from_java(&env, files_directory);
 
     // In some cases, this function may be called multiple times for the same daemon process.
@@ -152,12 +160,44 @@ pub extern "system" fn Java_net_mullvad_mullvadvpn_app_service_MullvadDaemon_ini
 /// Shut down Mullvad daemon that was initialized using `MullvadDaemon.initialize`.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_net_mullvad_mullvadvpn_app_service_MullvadDaemon_shutdown(
-    _: JNIEnv<'_>,
+    env: JNIEnv<'_>,
     _class: JClass<'_>,
 ) {
-    if let Some(context) = DAEMON_CONTEXT.lock().unwrap().take() {
-        _ = context.daemon_command_tx.shutdown();
-        _ = context.runtime.block_on(context.running_daemon);
+    let env = JnixEnv::from(env);
+    let mut stored = DAEMON_CONTEXT.lock().unwrap();
+    if let Some(context) = stored.as_mut() {
+        let result = if let Some(task) = context.running_daemon.as_mut() {
+            _ = context.daemon_command_tx.shutdown();
+            let result = context.runtime.block_on(task);
+            context.running_daemon = None;
+            match result {
+                Ok(result) => result,
+                Err(error) => {
+                    context.task_failure = Some(error.to_string());
+                    ok_or_throw!(&env, Err::<(), _>(error));
+                    unreachable!()
+                }
+            }
+        } else if let Some(failure) = context.shutdown_failure.take() {
+            context.runtime.block_on(failure.retry())
+        } else {
+            ok_or_throw!(
+                &env,
+                Err::<(), _>(
+                    context
+                        .task_failure
+                        .as_deref()
+                        .unwrap_or("Daemon shutdown lost its owner")
+                )
+            );
+            unreachable!()
+        };
+        if let Err(failure) = result {
+            let message = failure.to_string();
+            context.shutdown_failure = Some(failure);
+            ok_or_throw!(&env, Err::<(), _>(message));
+        }
+        stored.take();
 
         // Dropping the tokio runtime will block if there are any tasks in flight.
         // That is, until all async tasks yield *and* all blocking threads have stopped.
@@ -225,7 +265,9 @@ fn spawn_daemon(
     Ok(DaemonContext {
         runtime,
         daemon_command_tx,
-        running_daemon,
+        running_daemon: Some(running_daemon),
+        shutdown_failure: None,
+        task_failure: None,
         local_network_registration: None,
         capture_network_registration: None,
     })
@@ -234,7 +276,7 @@ fn spawn_daemon(
 async fn spawn_daemon_inner(
     daemon_config: DaemonConfig,
     daemon_command_channel: DaemonCommandChannel,
-) -> Result<tokio::task::JoinHandle<()>, Error> {
+) -> Result<DaemonTask, Error> {
     cleanup_old_rpc_socket(&daemon_config.rpc_socket_path).await;
 
     let daemon = Daemon::start(daemon_config, daemon_command_channel)
@@ -242,13 +284,15 @@ async fn spawn_daemon_inner(
         .map_err(Error::InitializeDaemon)?;
 
     let running_daemon = tokio::spawn(async move {
-        match daemon.run().await {
+        let result = daemon.run().await;
+        match &result {
             Ok(()) => log::info!("Mullvad daemon has stopped"),
             Err(error) => log::error!(
                 "{}",
                 error.display_chain_with_msg("Mullvad daemon exited with an error")
             ),
         }
+        result
     });
 
     Ok(running_daemon)

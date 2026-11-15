@@ -488,9 +488,27 @@ impl WireguardMonitor {
         let (cancel_token, cancel_receiver) = connectivity::CancelToken::new();
         // Nothing reads from the tunnel device until GotaTun is started, so traffic is held back in
         // it until ephemeral peers have been negotiated.
-        let tun = gotatun::open_tun(&config, args.tun_provider.clone())?;
+        // Native constructs its pinger before opening the TUN, as upstream.
+        let native_check = if matches!(
+            args.tun_provider.lock().unwrap().transport(),
+            talpid_tunnel::tun_provider::transport::TransportMode::Native
+        ) {
+            Some(
+                connectivity::Check::new(
+                    config.ipv4_gateway,
+                    args.retry_attempt,
+                    cancel_receiver.clone(),
+                )
+                .map_err(Error::ConnectivityMonitorError)?,
+            )
+        } else {
+            None
+        };
+        let mut tun = gotatun::open_tun(&config, args.tun_provider.clone())?;
         let is_new_tun = tun.is_new();
         let managed_setup = tun.is_managed();
+        tun.set_cancellation(cancel_token.clone(), cancel_receiver.clone());
+        let mut setup_cancelled = cancel_receiver.clone();
         let connection_cancel = cancel_token.clone();
         let route_manager = args.route_manager;
         let tun_provider = Arc::clone(&args.tun_provider);
@@ -507,13 +525,29 @@ impl WireguardMonitor {
 
         let tunnel_fut = async move {
             let daita = if config.negotiates_ephemeral_peers() {
-                let peers = ephemeral::negotiate_ephemeral_peers(
-                    &config,
-                    args.retry_attempt,
-                    obfuscation.as_ref(),
-                    &bypass,
-                )
-                .await?;
+                let peers = if managed_setup {
+                    let negotiation = ephemeral::negotiate_ephemeral_peers_cancellable(
+                        &config,
+                        args.retry_attempt,
+                        obfuscation.as_ref(),
+                        &bypass,
+                        setup_cancelled.clone(),
+                    );
+                    // Revoke immediately, then join any started device work.
+                    tokio::pin!(negotiation);
+                    tokio::select! { biased;
+                        _ = setup_cancelled.cancelled() => { tun.cancel_setup(); negotiation.await },
+                        result = &mut negotiation => result,
+                    }
+                } else {
+                    ephemeral::negotiate_ephemeral_peers(
+                        &config,
+                        args.retry_attempt,
+                        obfuscation.as_ref(),
+                        &bypass,
+                    )
+                    .await
+                }?;
                 config.set_ephemeral_keys(peers.private_key, peers.ingress_psk, peers.exit_psk);
                 peers.daita
             } else {
@@ -550,13 +584,7 @@ impl WireguardMonitor {
                     args.retry_attempt,
                     cancel_receiver,
                 ),
-                None => connectivity::Check::new(
-                    config.ipv4_gateway,
-                    args.retry_attempt,
-                    cancel_receiver,
-                )
-                .map_err(Error::ConnectivityMonitorError)
-                .map_err(CloseMsg::SetupError)?,
+                None => native_check.expect("Native pinger constructed before open_tun"),
             };
 
             // Negotiating ephemeral peers does not depend on the routes, but the connectivity

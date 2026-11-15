@@ -110,8 +110,14 @@ class MullvadVpnService : MullvadVpnServiceLifecycle() {
         Logger.i("MullvadVpnService: onDestroy")
         managementService.stop()
         Logger.i("Shutdown MullvadDaemon")
-        MullvadDaemon.shutdown()
-        Logger.i("Shutdown complete")
+        try {
+            MullvadDaemon.shutdown()
+            Logger.i("Shutdown complete")
+        } catch (error: Exception) {
+            // JNI retains the runtime and exact release owner for an explicit
+            // shutdown retry. An uncaught lifecycle exception would kill it.
+            Logger.e("Daemon shutdown incomplete; cleanup ownership retained", error)
+        }
     }
 
     private fun Context.prepareFiles() {

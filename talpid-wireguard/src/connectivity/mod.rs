@@ -6,6 +6,8 @@ mod mock;
 mod monitor;
 mod pinger;
 
+#[cfg(any(target_os = "android", test))]
+pub(crate) use check::CancelReceiver;
 pub use check::{CancelToken, Check, establish_timeout};
 pub use error::Error;
 pub use monitor::Monitor;

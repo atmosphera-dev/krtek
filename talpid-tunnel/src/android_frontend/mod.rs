@@ -58,6 +58,9 @@ pub trait FrontendPlatform: Send + Sync + 'static {
         interface_name(fd)
     }
     fn bind(&self, generation: i64, interface: &str) -> io::Result<bool>;
+    /// Observe the first pending readiness poll after acquisition has joined.
+    /// This grants no capture authority and must not block the owner.
+    fn readiness_pending(&self, _generation: i64) {}
     /// Release platform ownership after descriptor closure. Must be idempotent:
     /// an error may mean the call never arrived, or that its acknowledgement failed.
     fn closed(&self, generation: i64) -> io::Result<()>;

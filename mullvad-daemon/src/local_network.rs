@@ -555,9 +555,6 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
         self.delivery.authority.revoke();
         // Preserve provider selection through joined TSM close, including Native.
         self.broker.pause_transport();
-        if self.phase == Some(TunnelPhase::Disconnected) {
-            self.delivery.transport_joined();
-        }
     }
 
     #[cfg(test)]
@@ -578,6 +575,23 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
         self.target_config = None;
         self.blocking_config = None;
         Ok(())
+    }
+
+    pub fn transport_shutdown_joined(&self) {
+        // The TSM's own completion joined queued commands and monitor cleanup.
+        // This acknowledges resource ownership, not a public Disconnected state.
+        self.delivery.transport_joined();
+    }
+
+    pub async fn shutdown_with_transport(
+        &mut self,
+        joined: impl std::future::Future<Output = std::io::Result<()>>,
+    ) -> std::io::Result<()> {
+        self.begin_shutdown();
+        self.broker.close();
+        joined.await?;
+        self.transport_shutdown_joined();
+        self.shutdown().await
     }
 }
 

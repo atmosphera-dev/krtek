@@ -1,7 +1,10 @@
 //! Per-attempt application target and a separate prepaid connectivity pinger.
 //! Address translation is after capture selection and before SourceFilter;
 //! authenticated private replies are demultiplexed before inverse translation.
-use crate::{config::Config, connectivity::SmoltcpPinger};
+use crate::{
+    config::Config,
+    connectivity::{CancelReceiver, CancelToken, SmoltcpPinger},
+};
 use gotatun::{
     packet::{Ip, Packet, PacketBufPool},
     tun::{IpRecv, IpSend, MtuWatcher},
@@ -47,26 +50,70 @@ pub(super) fn unavailable() -> io::Error {
 }
 
 /// Configuration request ownership exists before any async platform wait.
+pub(super) struct SetupRequests {
+    current: Mutex<SetupRequest>,
+}
+
+struct SetupRequest {
+    cancelled: bool,
+    cleanup: talpid_tunnel::packet_attachment::TransportCleanup,
+}
+
+impl SetupRequests {
+    pub(super) fn cancel(&self) {
+        let mut current = self.current.lock().expect("setup request");
+        current.cancelled = true;
+        current.cleanup.cancel();
+    }
+}
+
 pub(super) struct PendingManaged {
     broker: AttachmentBroker,
     config: TunConfig,
     capture_config: TunConfig,
     request: Option<ConfigurationRequest>,
+    setup: Arc<SetupRequests>,
+    pub(super) cancellation: CancelToken,
+    pub(super) cancelled: CancelReceiver,
     #[cfg(test)]
     pub(super) after_receipt: Option<tokio::sync::oneshot::Receiver<()>>,
+    #[cfg(test)]
+    pub(super) after_receipt_entered: Option<tokio::sync::oneshot::Sender<()>>,
+    #[cfg(test)]
+    pub(super) after_stack: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
     #[cfg(test)]
     pub(super) cleanup_complete: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl PendingManaged {
+    pub(super) fn cleanup(&self) -> Arc<SetupRequests> {
+        self.setup.clone()
+    }
     pub(super) fn new(source: talpid_tunnel::tun_provider::transport::ManagedTun) -> Self {
+        let (cancellation, cancelled) = CancelToken::new();
+        let setup = Arc::new(SetupRequests {
+            current: Mutex::new(SetupRequest {
+                cancelled: false,
+                cleanup: source.request.cleanup(),
+            }),
+        });
         Self {
             broker: source.broker,
             config: source.config,
             capture_config: source.capture_config,
             request: Some(source.request),
+            setup,
+            cancellation,
+            cancelled,
             #[cfg(test)]
             after_receipt: None,
+            #[cfg(test)]
+            after_receipt_entered: None,
+            #[cfg(test)]
+            after_stack: None,
             #[cfg(test)]
             cleanup_complete: None,
         }
@@ -94,30 +141,46 @@ impl PendingManaged {
     }
 
     async fn create_inner(&mut self, config: &Config) -> io::Result<ManagedPair> {
+        if self.cancellation.is_closed() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
         if self.request.is_none() {
-            self.request = Some(
-                self.broker
-                    .request_target_capture(self.config.clone(), self.capture_config.clone())
-                    .map_err(io::Error::other)?,
-            );
+            // Publication of a fresh request and caller-drop cancellation share
+            // this lock. Drop can never retain only the previous retry identity.
+            let mut current = self.setup.current.lock().expect("setup request");
+            if current.cancelled || self.cancellation.is_closed() {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let request = self
+                .broker
+                .request_target_capture(self.config.clone(), self.capture_config.clone())
+                .map_err(io::Error::other)?;
+            current.cleanup = request.cleanup();
+            self.request = Some(request);
         }
         // Platform acquisition is owned/joined, not an independent admission
         // deadline. The fd owner's new-route wait has upstream's2s boundary.
-        let receipt = self
-            .request
-            .as_mut()
-            .expect("request owner")
-            .configured()
-            .await
-            .map_err(io::Error::other)?;
+        let receipt = tokio::select! { biased;
+            _ = self.cancelled.cancelled() => {
+                self.request.as_ref().expect("request owner").cancel();
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            receipt = self.request.as_mut().expect("request owner").configured() => receipt.map_err(io::Error::other)?,
+        };
         #[cfg(test)]
         if let Some(resume) = self.after_receipt.take() {
-            resume.await.map_err(|_| unavailable())?;
+            if let Some(entered) = self.after_receipt_entered.take() {
+                let _ = entered.send(());
+            }
+            tokio::select! { biased;
+                _ = self.cancelled.cancelled() => { self.request.as_ref().expect("request owner").cancel(); return Err(io::ErrorKind::Interrupted.into()); },
+                result = resume => result.map_err(|_| unavailable())?,
+            }
         }
         let pair = self.broker.acquire(&receipt).map_err(io::Error::other)?;
-        let source = config.tunnel_ipv4().ok_or_else(unavailable)?;
+        let source = config.tunnel_ipv4();
         let identity = pair.control.capability();
-        if identity.sources().ipv4 != Some(source)
+        if identity.sources().ipv4 != source
             || identity.sources().ipv6 != config.tunnel_ipv6()
             || identity.mtu() != config.mtu
         {
@@ -137,40 +200,77 @@ impl PendingManaged {
             self.broker.application_buffers(),
         )
         .map_err(|_| unavailable())?;
-        let storage = self
-            .broker
-            .control_buffers()
-            .try_reserve(CONTROL_STORAGE)
-            .map_err(|_| io::ErrorKind::OutOfMemory)?;
-        let (network, receive, send, mut guard) = smoltcp_network_retained(
-            SmoltcpNetworkConfig {
-                ipv4_addr: source,
-                ipv6_addr: None,
-                mtu: CONTROL_MTU.min(config.mtu),
-            },
-            storage.clone(),
-        );
         let id = rand::random();
-        let socket = match network.icmp_socket(id).await {
-            Ok(socket) => socket,
-            Err(error) => {
-                guard.stop().await;
-                return Err(error);
+        let private = if let Some(source) = source {
+            let storage = self
+                .broker
+                .control_buffers()
+                .try_reserve(CONTROL_STORAGE)
+                .map_err(|_| io::ErrorKind::OutOfMemory)?;
+            let (network, receive, send, mut guard) = smoltcp_network_retained(
+                SmoltcpNetworkConfig {
+                    ipv4_addr: source,
+                    ipv6_addr: None,
+                    mtu: CONTROL_MTU.min(config.mtu),
+                },
+                storage.clone(),
+            );
+            #[cfg(test)]
+            if let Some((entered, resume)) = self.after_stack.take() {
+                let _ = entered.send(());
+                tokio::select! { biased;
+                    _ = self.cancelled.cancelled() => {
+                        self.request.as_ref().expect("request owner").cancel();
+                        guard.stop().await;
+                        return Err(io::ErrorKind::Interrupted.into());
+                    },
+                    _ = resume => {},
+                }
             }
+            let socket = tokio::select! { biased;
+                _ = self.cancelled.cancelled() => {
+                    self.request.as_ref().expect("request owner").cancel();
+                    Err(io::ErrorKind::Interrupted.into())
+                },
+                socket = network.icmp_socket(id) => socket,
+            };
+            let socket = match socket {
+                Ok(socket) => socket,
+                Err(error) => {
+                    guard.stop().await;
+                    return Err(error);
+                }
+            };
+            // The handle with TCP methods does not escape this construction.
+            drop(network);
+            Some((receive, send, guard, socket, storage))
+        } else {
+            None
         };
-        // The handle with TCP methods does not escape this construction.
-        drop(network);
+        let (receive, send, guard, socket, storage) = match private {
+            Some((receive, send, guard, socket, storage)) => (
+                Some(receive),
+                Some(send),
+                Some(guard),
+                Some(socket),
+                Some(storage),
+            ),
+            None => (None, None, None, None, None),
+        };
         let TransportPair {
             control,
             receive: ordinary_receive,
             send: ordinary_send,
         } = pair;
+        let (send_dropped, send_joined) = tokio::sync::oneshot::channel();
+        let (receive_dropped, receive_joined) = tokio::sync::oneshot::channel();
         let owner = Arc::new(ManagedControl {
             control,
             receipt,
             request: self.request.take().expect("request owner"),
             guard: tokio::sync::Mutex::new(guard),
-            socket: Mutex::new(Some(socket)),
+            device_halves: tokio::sync::Mutex::new([Some(send_joined), Some(receive_joined)]),
+            socket: Mutex::new(socket),
             source,
             gateway: config.ipv4_gateway,
             id,
@@ -189,12 +289,14 @@ impl PendingManaged {
             send: ManagedSend {
                 send,
                 owner: owner.clone(),
+                _dropped: send_dropped,
             },
             receive: ManagedReceive {
                 receive,
                 ordinary_receive,
                 owner: owner.clone(),
                 turn: 0,
+                _dropped: receive_dropped,
             },
             owner,
         })
@@ -216,9 +318,10 @@ pub(crate) struct ManagedControl {
     control: AttemptControl,
     receipt: CaptureReceipt,
     request: ConfigurationRequest,
-    guard: tokio::sync::Mutex<SmoltcpNetworkGuard>,
+    guard: tokio::sync::Mutex<Option<SmoltcpNetworkGuard>>,
+    device_halves: tokio::sync::Mutex<[Option<tokio::sync::oneshot::Receiver<()>>; 2]>,
     socket: Mutex<Option<SmoltcpIcmpSocket>>,
-    source: Ipv4Addr,
+    source: Option<Ipv4Addr>,
     gateway: Ipv4Addr,
     id: u16,
     secret: [u8; 32],
@@ -226,7 +329,7 @@ pub(crate) struct ManagedControl {
     application: Arc<dyn RelayBufferAllocator>,
     ordinary_send: TransportSend,
     path: Mutex<TargetPacketPath>,
-    _storage: Arc<dyn RelayBufferReservation>,
+    _storage: Option<Arc<dyn RelayBufferReservation>>,
     installed: AtomicBool,
 }
 
@@ -245,12 +348,10 @@ impl ManagedControl {
             .unwrap_or_default()
     }
     pub(crate) fn pinger(&self) -> io::Result<SmoltcpPinger> {
-        let socket = self
-            .socket
-            .lock()
-            .expect("private pinger")
-            .take()
-            .ok_or_else(unavailable)?;
+        let socket = self.socket.lock().expect("private pinger").take();
+        if self.source.is_some() && socket.is_none() {
+            return Err(unavailable());
+        }
         Ok(SmoltcpPinger::new(
             socket,
             self.gateway,
@@ -284,15 +385,32 @@ impl ManagedControl {
     }
     pub(super) async fn stop(&self) {
         self.revoke();
-        self.guard.lock().await.stop().await;
+        if let Some(guard) = self.guard.lock().await.as_mut() {
+            guard.stop().await;
+        }
         // Every production caller has already joined create_devices failure or
         // devices.stop(). The control guard is the final transport task owner.
         self.request.transport_joined();
     }
 
+    pub(super) async fn stop_after_device(&self) {
+        self.revoke();
+        // Device::stop joins I/O, but Device::drop spawns a final cleanup task
+        // that still owns its plaintext halves. Join their actual destruction
+        // before acknowledging transport cleanup or refunding private storage.
+        for receiver in self.device_halves.lock().await.iter_mut() {
+            if let Some(joined) = receiver.as_mut() {
+                let _ = joined.await;
+                *receiver = None;
+            }
+        }
+        self.stop().await;
+    }
+
     // This deliberately recognizes only a plain IPv4 private echo. Fragments,
     // errors/quotations, options and all IPv6 chains remain raw application IP.
     fn echo(&self, bytes: &[u8], outbound: bool) -> Option<u64> {
+        let assigned = self.source?;
         if bytes.len() != 70
             || bytes[0] != 0x45
             || bytes[9] != 1
@@ -304,9 +422,9 @@ impl ManagedControl {
             return None;
         }
         let (source, destination) = if outbound {
-            (self.source, self.gateway)
+            (assigned, self.gateway)
         } else {
-            (self.gateway, self.source)
+            (self.gateway, assigned)
         };
         if bytes[12..16] != source.octets()
             || bytes[16..20] != destination.octets()
@@ -367,10 +485,12 @@ enum Reply {
 mod tcp_fixture;
 
 pub(super) struct ManagedReceive {
-    receive: SmoltcpIpRecv,
+    receive: Option<SmoltcpIpRecv>,
     ordinary_receive: TransportReceive,
     owner: Arc<ManagedControl>,
     turn: u8,
+    // Fields drop in order: completion follows the owned handles and owner Arc.
+    _dropped: tokio::sync::oneshot::Sender<()>,
 }
 
 impl ManagedControl {
@@ -397,6 +517,15 @@ impl ManagedControl {
 }
 
 impl ManagedReceive {
+    async fn private(
+        receive: &mut Option<SmoltcpIpRecv>,
+        pool: &mut PacketBufPool,
+    ) -> io::Result<Option<Packet<Ip>>> {
+        match receive {
+            Some(receive) => Ok(receive.recv(pool).await?.next()),
+            None => std::future::pending().await,
+        }
+    }
     async fn ordinary_parts(
         receive: &mut TransportReceive,
         owner: &ManagedControl,
@@ -437,14 +566,14 @@ impl IpRecv for ManagedReceive {
             let packet = if turn == 0 {
                 tokio::select! { biased;
                     _ = owner.cancelled() => return Err(unavailable()),
-                    packet = self.receive.recv(pool) => Selected::Private(packet?.next()),
+                    packet = Self::private(&mut self.receive, pool) => Selected::Private(packet?),
                     packet = Self::ordinary_parts(&mut self.ordinary_receive, &owner) => Selected::Application(packet?),
                 }
             } else {
                 tokio::select! { biased;
                     _ = owner.cancelled() => return Err(unavailable()),
                     packet = Self::ordinary_parts(&mut self.ordinary_receive, &owner) => Selected::Application(packet?),
-                    packet = self.receive.recv(pool) => Selected::Private(packet?.next()),
+                    packet = Self::private(&mut self.receive, pool) => Selected::Private(packet?),
                 }
             };
             let packet = match packet {
@@ -480,8 +609,9 @@ impl IpRecv for ManagedReceive {
 }
 
 pub(super) struct ManagedSend {
-    send: SmoltcpIpSend,
+    send: Option<SmoltcpIpSend>,
     owner: Arc<ManagedControl>,
+    _dropped: tokio::sync::oneshot::Sender<()>,
 }
 impl IpSend for ManagedSend {
     async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
@@ -495,7 +625,7 @@ impl IpSend for ManagedSend {
                 let packet = bytes.try_into_ip().map_err(|_| unavailable())?;
                 tokio::select! { biased;
                     _ = self.owner.cancelled() => Err(unavailable()),
-                    result = self.send.send(packet) => result,
+                    result = self.send.as_mut().expect("private reply has assigned source").send(packet) => result,
                 }
             }
             Reply::Discard => Ok(()),

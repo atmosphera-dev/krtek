@@ -121,6 +121,9 @@ pub struct NegotiatedPeers {
 /// Errors from [`negotiate_ephemeral_peers`].
 #[derive(thiserror::Error, Debug)]
 pub enum NegotiationError {
+    /// The owner cancelled setup; all started devices have been joined.
+    #[error("Ephemeral peer negotiation cancelled")]
+    Cancelled,
     /// A config service did not respond in time.
     #[error("Timed out while negotiating ephemeral peer")]
     Timeout,
@@ -148,6 +151,84 @@ pub async fn negotiate_ephemeral_peers<F: UdpTransportFactory>(
     negotiate: Negotiables,
     ingress_transport: impl Fn(&PublicKey) -> F,
 ) -> Result<NegotiatedPeers, NegotiationError> {
+    negotiate_inner(
+        config,
+        negotiate,
+        ingress_transport,
+        &mut Cancellation {
+            future: Box::pin(std::future::pending()),
+            closed: false,
+            joined: false,
+        },
+    )
+    .await
+}
+
+/// Managed setup cancels network waits, but joins device construction and Stop.
+/// The original entry point retains upstream Native cancellation/Drop behavior.
+pub async fn negotiate_ephemeral_peers_cancellable<F: UdpTransportFactory>(
+    config: &NegotiationConfig,
+    negotiate: Negotiables,
+    ingress_transport: impl Fn(&PublicKey) -> F,
+    cancelled: impl std::future::Future<Output = ()> + Send,
+) -> Result<NegotiatedPeers, NegotiationError> {
+    negotiate_inner(
+        config,
+        negotiate,
+        ingress_transport,
+        &mut Cancellation {
+            future: Box::pin(cancelled),
+            closed: false,
+            joined: true,
+        },
+    )
+    .await
+}
+
+struct Cancellation<'a> {
+    future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>,
+    closed: bool,
+    joined: bool,
+}
+impl Cancellation<'_> {
+    async fn wait<T>(
+        &mut self,
+        work: impl std::future::Future<Output = T>,
+    ) -> Result<T, NegotiationError> {
+        if self.closed {
+            return Err(NegotiationError::Cancelled);
+        }
+        tokio::select! { biased;
+            _ = &mut self.future => { self.closed = true; Err(NegotiationError::Cancelled) },
+            result = work => Ok(result),
+        }
+    }
+    async fn build<T>(
+        &mut self,
+        work: impl std::future::Future<Output = Result<T, gotatun::device::Error>>,
+    ) -> Result<T, NegotiationError> {
+        let started = std::sync::atomic::AtomicBool::new(false);
+        let admitted = async {
+            started.store(true, std::sync::atomic::Ordering::Relaxed);
+            work.await
+        };
+        tokio::pin!(admitted);
+        match self.wait(&mut admitted).await {
+            Ok(result) => result.map_err(NegotiationError::Device),
+            Err(_) if started.load(std::sync::atomic::Ordering::Relaxed) => {
+                admitted.await.map_err(NegotiationError::Device)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+async fn negotiate_inner<F: UdpTransportFactory>(
+    config: &NegotiationConfig,
+    negotiate: Negotiables,
+    ingress_transport: impl Fn(&PublicKey) -> F,
+    cancellation: &mut Cancellation<'_>,
+) -> Result<NegotiatedPeers, NegotiationError> {
     let ephemeral_key = PrivateKey::new_from_random();
 
     log::debug!(
@@ -156,8 +237,14 @@ pub async fn negotiate_ephemeral_peers<F: UdpTransportFactory>(
         negotiate.post_quantum,
         negotiate.daita
     );
-    let ingress_peer =
-        negotiate_with_ingress(config, negotiate, &ingress_transport, &ephemeral_key).await?;
+    let ingress_peer = negotiate_with_ingress(
+        config,
+        negotiate,
+        &ingress_transport,
+        &ephemeral_key,
+        cancellation,
+    )
+    .await?;
     log::debug!(
         "Negotiated ephemeral peer with the ingress relay (psk={}, daita={})",
         ingress_peer.psk.is_some(),
@@ -181,6 +268,7 @@ pub async fn negotiate_ephemeral_peers<F: UdpTransportFactory>(
                 ingress_peer.psk.as_ref(),
                 exit,
                 exit_private_key.as_ref().unwrap_or(&ephemeral_key),
+                cancellation,
             )
             .await?;
             log::debug!(
@@ -207,24 +295,41 @@ async fn negotiate_with_ingress<F: UdpTransportFactory>(
     negotiate: Negotiables,
     ingress_transport: impl Fn(&PublicKey) -> F,
     ephemeral_key: &PrivateKey,
+    cancellation: &mut Cancellation<'_>,
 ) -> Result<EphemeralPeer, NegotiationError> {
-    let (net, net_recv, net_send, _net_guard) = userspace_net(config);
+    // Do not start a stack or a second relay after cancellation.
+    cancellation.wait(std::future::ready(())).await?;
+    let (net, net_recv, net_send, mut net_guard) = userspace_net(config);
 
     let peer = ingress_peer(config, config.relays.ingress()).with_allowed_ip(config.allowed_ip());
-    let device = DeviceBuilder::new()
-        .with_udp(ingress_transport(&config.private_key.public_key()))
-        .with_ip_pair(net_send, net_recv)
-        .with_private_key(static_secret(&config.private_key))
-        .with_peer(peer)
-        .build()
-        .await
-        .map_err(NegotiationError::Device)?;
+    let built = cancellation
+        .build(
+            DeviceBuilder::new()
+                .with_udp(ingress_transport(&config.private_key.public_key()))
+                .with_ip_pair(net_send, net_recv)
+                .with_private_key(static_secret(&config.private_key))
+                .with_peer(peer)
+                .build(),
+        )
+        .await;
+    let device = match built {
+        Ok(device) => device,
+        Err(error) => {
+            if cancellation.joined {
+                net_guard.stop().await;
+            }
+            return Err(error);
+        }
+    };
 
-    let result = tokio::select! {
+    let result = cancellation.wait(async { tokio::select! {
         result = request_ephemeral_peer_through(net, config, ephemeral_key, negotiate) => result,
         error = fail_without_handshake(&device, config.handshake_timeout) => Err(error),
-    };
+    }}).await.and_then(|result| result);
     device.stop().await;
+    if cancellation.joined {
+        net_guard.stop().await;
+    }
     result
 }
 
@@ -243,8 +348,10 @@ async fn negotiate_through_entry<F: UdpTransportFactory>(
     entry_psk: Option<&PresharedKey>,
     exit: &Relay,
     exit_key: &PrivateKey,
+    cancellation: &mut Cancellation<'_>,
 ) -> Result<EphemeralPeer, NegotiationError> {
-    let (net, net_recv, net_send, _net_guard) = userspace_net(config);
+    cancellation.wait(std::future::ready(())).await?;
+    let (net, net_recv, net_send, mut net_guard) = userspace_net(config);
     let (entry_ip_send, entry_ip_recv, exit_udp) = new_udp_tun_channel(
         MULTIHOP_CHANNEL_CAPACITY,
         config.tunnel_ipv4,
@@ -257,32 +364,54 @@ async fn negotiate_through_entry<F: UdpTransportFactory>(
     let exit_peer = Peer::new(exit.pubkey())
         .with_endpoint(exit.endpoint)
         .with_allowed_ip(config.allowed_ip());
-    let exit_device = DeviceBuilder::new()
-        .with_udp(exit_udp)
-        .with_ip_pair(net_send, net_recv)
-        .with_private_key(static_secret(&config.private_key))
-        .with_peer(exit_peer)
-        .build()
-        .await
-        .map_err(NegotiationError::Device)?;
+    let built = cancellation
+        .build(
+            DeviceBuilder::new()
+                .with_udp(exit_udp)
+                .with_ip_pair(net_send, net_recv)
+                .with_private_key(static_secret(&config.private_key))
+                .with_peer(exit_peer)
+                .build(),
+        )
+        .await;
+    let exit_device = match built {
+        Ok(device) => device,
+        Err(error) => {
+            if cancellation.joined {
+                net_guard.stop().await;
+            }
+            return Err(error);
+        }
+    };
+    if cancellation.closed {
+        exit_device.stop().await;
+        net_guard.stop().await;
+        return Err(NegotiationError::Cancelled);
+    }
 
     let mut entry_peer =
         ingress_peer(config, entry).with_allowed_ip(IpNetwork::from(exit.endpoint.ip()));
     if let Some(psk) = entry_psk {
         entry_peer = entry_peer.with_preshared_key(*psk.as_bytes());
     }
-    let entry_device = match DeviceBuilder::new()
-        .with_udp(ingress_transport(&entry_key.public_key()))
-        .with_ip_pair(entry_ip_send, entry_ip_recv)
-        .with_private_key(static_secret(entry_key))
-        .with_peer(entry_peer)
-        .build()
+    let entry_device = match cancellation
+        .build(
+            DeviceBuilder::new()
+                .with_udp(ingress_transport(&entry_key.public_key()))
+                .with_ip_pair(entry_ip_send, entry_ip_recv)
+                .with_private_key(static_secret(entry_key))
+                .with_peer(entry_peer)
+                .build(),
+        )
         .await
     {
         Ok(device) => device,
         Err(error) => {
             exit_device.stop().await;
-            return Err(NegotiationError::Device(error));
+            if cancellation.joined {
+                net_guard.stop().await;
+            }
+            return Err(error);
         }
     };
 
@@ -293,12 +422,15 @@ async fn negotiate_through_entry<F: UdpTransportFactory>(
     };
     // The exit device reaches the exit relay through the entry relay, so it cannot complete a
     // handshake unless both relays are reachable.
-    let result = tokio::select! {
+    let result = cancellation.wait(async { tokio::select! {
         result = request_ephemeral_peer_through(net, config, exit_key, negotiate) => result,
         error = fail_without_handshake(&exit_device, config.handshake_timeout) => Err(error),
-    };
+    }}).await.and_then(|result| result);
     entry_device.stop().await;
     exit_device.stop().await;
+    if cancellation.joined {
+        net_guard.stop().await;
+    }
     result
 }
 

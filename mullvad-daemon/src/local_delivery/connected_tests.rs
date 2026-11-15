@@ -980,6 +980,97 @@ fn release_fixture() -> (
     (delivery, platform, broker)
 }
 
+#[tokio::test]
+async fn shutdown_failure_is_observable_without_external_events() {
+    use futures::{FutureExt, StreamExt};
+    for queued_connect in [false, true] {
+        let mut h = Handover::new(policy());
+        h.connect_endpoint().await;
+        let broker = h.runtime.broker();
+        let platform = h.platform.clone();
+        let generation = platform.generation.load(SeqCst);
+        let request = h.request.take().unwrap();
+        let transport = h.transport.take().unwrap();
+        if queued_connect {
+            h.continuation.connect();
+            assert_eq!(
+                h.runtime
+                    .continue_connect(&mut h.continuation)
+                    .map(|_| "Connect"),
+                Some("Connect")
+            );
+        }
+        // The daemon's input is closed; the physical feed is never republished.
+        let (input, mut events) = futures::channel::mpsc::unbounded::<crate::InternalDaemonEvent>();
+        drop(input);
+        assert!(events.next().await.is_none());
+        platform.fail_release.store(true, SeqCst);
+        let before = platform.releases.load(SeqCst);
+        let (complete, joined) = oneshot::channel();
+        {
+            let shutdown = h.runtime.shutdown_with_transport(async move {
+                joined.await.map_err(io::Error::other)?;
+                drop(transport);
+                request.transport_joined();
+                Ok(())
+            });
+            tokio::pin!(shutdown);
+            assert!(shutdown.as_mut().now_or_never().is_none());
+            assert!(broker.snapshot().closed);
+            assert!(!broker.snapshot().ordinary_ready);
+            assert_eq!(platform.releases.load(SeqCst), before);
+            assert!(
+                !platform.descriptor_closed(generation),
+                "closed before actual transport join"
+            );
+            complete.send(()).unwrap();
+            assert!(
+                bounded(shutdown).await.is_err(),
+                "release failure was hidden by an event wait"
+            );
+        }
+        assert!(
+            h.runtime.has_owner(),
+            "failed shutdown discarded recovery owner"
+        );
+        assert!(platform.descriptor_closed(generation));
+        assert_eq!(platform.releases.load(SeqCst), before + 1);
+        assert!(
+            !platform
+                .completed_releases
+                .lock()
+                .unwrap()
+                .contains(&generation)
+        );
+        platform.fail_release.store(false, SeqCst);
+        bounded(h.runtime.shutdown_with_transport(async { Ok(()) }))
+            .await
+            .unwrap();
+        assert!(!h.runtime.has_owner());
+        assert_eq!(platform.releases.load(SeqCst), before + 2);
+        assert_eq!(
+            platform
+                .completed_releases
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|g| **g == generation)
+                .count(),
+            1
+        );
+        h.runtime
+            .shutdown_with_transport(async { Ok(()) })
+            .await
+            .unwrap();
+        assert_eq!(platform.releases.load(SeqCst), before + 2);
+        assert_eq!(
+            h.phase,
+            TunnelPhase::Connected,
+            "resource join fabricated public Disconnected"
+        );
+    }
+}
+
 fn fixed_config() -> talpid_tunnel::tun_provider::TunConfig {
     let mut config = assigned_config();
     config.addresses = vec![
@@ -2803,7 +2894,11 @@ async fn managed_teardown_revokes_now_but_releases_only_after_transport_join() {
     assert!(h.runtime.has_owner());
     h.runtime.begin_shutdown();
     h.platform.fail_release.store(false, SeqCst);
-    bounded(h.runtime.shutdown()).await.unwrap();
+    // The owned completion may already be ready. It acknowledges the retained
+    // request without needing another public transition or physical event.
+    bounded(h.runtime.shutdown_with_transport(async { Ok(()) }))
+        .await
+        .unwrap();
     assert!(!h.runtime.has_owner());
     assert_eq!(h.commands, ["Disconnect", "Joined"]);
     assert_eq!(h.platform.releases.load(SeqCst), 4);

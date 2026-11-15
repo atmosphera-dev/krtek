@@ -316,6 +316,22 @@ Android system Connect follows the same upstream keyguard and command order even
 while a Partial, full or failed capture is retained. Capture ownership extends
 foreground service lifetime only; it never substitutes for dispatching Connect.
 
+Native WireGuard setup stays in its caller's future and retains upstream pinger
+construction and Drop timing. Managed setup instead cancels the exact request,
+interrupts pending receipt and PQ/DAITA network waits, and joins device/platform
+work already started before releasing its owner. Its private IPv4 probe source
+is optional: an assignment without IPv4 still supports ordinary IPv6, while a
+private send truthfully reports address unavailable. Peer statistics, not private
+probe replies, continue to determine connectivity.
+
+Managed daemon shutdown closes admission and joins the TSM through its own
+completion signal, not public tunnel events or physical-network updates. Local
+socket preparations and sole-fd cleanup then join before platform release. A
+failed release returns a failure that retains the daemon and exact recovery
+record. JNI keeps the runtime and registrations reachable and refuses replacement
+initialization until an explicit shutdown retry succeeds; successful cleanup
+continues through upstream finalization order.
+
 Capture admission and classification select Local, a tunnel target or Drop.
 Tunnel targets translate each received packet or fragment immediately, using
 address checksum deltas; they do not reassemble, remember fragment identities

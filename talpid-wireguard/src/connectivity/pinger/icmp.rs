@@ -211,7 +211,7 @@ fn construct_icmpv4_packet_inner(
 /// attempt secret plus a non-repeating counter identifies only private probes.
 #[cfg(any(target_os = "android", test))]
 pub(crate) struct SmoltcpPinger {
-    socket: talpid_netstack::smoltcp_network::SmoltcpIcmpSocket,
+    socket: Option<talpid_netstack::smoltcp_network::SmoltcpIcmpSocket>,
     gateway: Ipv4Addr,
     id: u16,
     secret: [u8; 32],
@@ -221,7 +221,7 @@ pub(crate) struct SmoltcpPinger {
 #[cfg(any(target_os = "android", test))]
 impl SmoltcpPinger {
     pub(crate) fn new(
-        socket: talpid_netstack::smoltcp_network::SmoltcpIcmpSocket,
+        socket: Option<talpid_netstack::smoltcp_network::SmoltcpIcmpSocket>,
         gateway: Ipv4Addr,
         id: u16,
         secret: [u8; 32],
@@ -240,6 +240,10 @@ impl SmoltcpPinger {
 #[async_trait::async_trait]
 impl super::Pinger for SmoltcpPinger {
     async fn send_icmp(&mut self) -> Result<()> {
+        let socket = self
+            .socket
+            .as_mut()
+            .ok_or_else(|| Error::Write(io::ErrorKind::AddrNotAvailable.into()))?;
         self.counter = self
             .counter
             .checked_add(1)
@@ -252,7 +256,7 @@ impl super::Pinger for SmoltcpPinger {
         message[40..48].copy_from_slice(&self.counter.to_be_bytes());
         let checksum = internet_checksum::checksum(&message);
         message[2..4].copy_from_slice(&checksum);
-        self.socket
+        socket
             .send_to_v4(&message, self.gateway)
             .await
             .map_err(Error::Write)

@@ -19,6 +19,71 @@ fn assigned() -> TunConfig {
     config
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_platform_setup_retains_exact_release_owner() {
+    use futures::FutureExt;
+    let (platform, mut peers) = super::handover::EpochPlatform::new();
+    let pause = Arc::new(Pause::default());
+    let _release = Release(pause.clone());
+    *platform.open_pause.lock().unwrap() = Some(pause.clone());
+    let broker = broker();
+    broker.set_mode(AttachmentMode::ManagedRequired).unwrap();
+    let mut request = broker.request_capture(assigned()).unwrap();
+    let pending = broker.pending_request().unwrap();
+    let cleanup = request.cleanup();
+    let (_updates, updates) = watch::channel(0);
+    let mut owner = FrontendOwner::start(
+        platform.clone(),
+        configuration(&broker),
+        managed_forwarder(Arc::new(Authority::default())),
+        updates,
+        broker.clone(),
+    )
+    .unwrap();
+    bounded(pause.entered.notified()).await;
+    let peer = bounded(peers.recv()).await.unwrap();
+    let (generation, (path, inode)) = platform
+        .descriptors
+        .lock()
+        .unwrap()
+        .iter()
+        .next()
+        .map(|(g, p)| (*g, p.clone()))
+        .unwrap();
+    platform.fail_release.store(generation, SeqCst);
+    cleanup.cancel();
+    assert!(request.configured().await.is_err());
+    {
+        let stop = owner.stop();
+        tokio::pin!(stop);
+        assert!(stop.as_mut().now_or_never().is_none());
+        assert_eq!(std::fs::read_link(&path).unwrap(), inode);
+        assert_eq!(platform.finish_attempts.load(SeqCst), 0);
+        // A delayed platform result must not certify this request or a successor.
+        pause.unblock();
+        assert!(bounded(stop).await.is_err());
+    }
+    assert!(pending.release_ready());
+    assert_ne!(std::fs::read_link(&path).ok(), Some(inode));
+    assert_eq!(platform.finish_attempts.load(SeqCst), 1);
+    assert!(owner.release_failed());
+    assert!(request.configured().await.is_err());
+    let mut successor = broker.request_capture(assigned()).unwrap();
+    let successor_id = broker.pending_request().unwrap().id();
+    cleanup.cancel();
+    drop(request);
+    assert_eq!(broker.pending_request().unwrap().id(), successor_id);
+    assert!(successor.configured().now_or_never().is_none());
+    platform.fail_release.store(0, SeqCst);
+    owner.retry_release().unwrap();
+    owner.stop().await.unwrap();
+    assert_eq!(platform.finish_attempts.load(SeqCst), 2);
+    assert_eq!(*platform.released.lock().unwrap(), vec![generation]);
+    owner.retry_release().unwrap();
+    assert_eq!(platform.finish_attempts.load(SeqCst), 2);
+    drop(peer);
+}
+
 fn configuration(broker: &AttachmentBroker) -> CaptureConfig {
     CaptureConfig::Secured {
         broker: broker.clone(),

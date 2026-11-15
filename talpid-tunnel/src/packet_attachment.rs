@@ -1077,6 +1077,13 @@ impl PendingCaptureRequest {
 }
 
 impl ConfigurationRequest {
+    /// Borrow this operation's cancellation identity, never a later selection.
+    pub fn cleanup(&self) -> TransportCleanup {
+        TransportCleanup {
+            inner: self.inner.clone(),
+            request: Arc::downgrade(&self.request),
+        }
+    }
     /// The transport owner calls this only after its device and private control
     /// tasks have joined. Cancellation/retirement alone never acknowledge it.
     pub fn transport_joined(&self) {

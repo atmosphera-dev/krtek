@@ -31,6 +31,34 @@ pub async fn negotiate_ephemeral_peers(
     obfuscation: Option<&RunningObfuscation>,
     bypass: &Arc<dyn SocketBypass>,
 ) -> Result<NegotiatedPeers, CloseMsg> {
+    negotiate(config, retry_attempt, obfuscation, bypass, None).await
+}
+
+#[cfg(any(target_os = "android", test))]
+pub(crate) async fn negotiate_ephemeral_peers_cancellable(
+    config: &Config,
+    retry_attempt: u32,
+    obfuscation: Option<&RunningObfuscation>,
+    bypass: &Arc<dyn SocketBypass>,
+    mut cancellation: connectivity::CancelReceiver,
+) -> Result<NegotiatedPeers, CloseMsg> {
+    negotiate(
+        config,
+        retry_attempt,
+        obfuscation,
+        bypass,
+        Some(Box::pin(async move { cancellation.cancelled().await })),
+    )
+    .await
+}
+
+async fn negotiate(
+    config: &Config,
+    retry_attempt: u32,
+    obfuscation: Option<&RunningObfuscation>,
+    bypass: &Arc<dyn SocketBypass>,
+    cancellation: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>>,
+) -> Result<NegotiatedPeers, CloseMsg> {
     let timeout = psk_exchange_timeout(retry_attempt);
     // An unreachable relay should fail as fast as the connectivity check would.
     let handshake_timeout = connectivity::establish_timeout(retry_attempt);
@@ -66,21 +94,39 @@ pub async fn negotiate_ephemeral_peers(
         )
     };
 
-    negotiation::negotiate_ephemeral_peers(&negotiation_config, negotiate, ingress_transport)
-        .await
-        .map_err(|error| match error {
-            NegotiationError::Timeout => {
-                log::warn!(
-                    "Timeout while negotiating ephemeral peers \
+    let result = match cancellation {
+        Some(cancellation) => {
+            negotiation::negotiate_ephemeral_peers_cancellable(
+                &negotiation_config,
+                negotiate,
+                ingress_transport,
+                cancellation,
+            )
+            .await
+        }
+        None => {
+            negotiation::negotiate_ephemeral_peers(
+                &negotiation_config,
+                negotiate,
+                ingress_transport,
+            )
+            .await
+        }
+    };
+    result.map_err(|error| match error {
+        NegotiationError::Cancelled => CloseMsg::Stop,
+        NegotiationError::Timeout => {
+            log::warn!(
+                "Timeout while negotiating ephemeral peers \
                      (retry {retry_attempt}, timeout {timeout:?}, \
                      handshake timeout {handshake_timeout:?}, PQ={}, DAITA={})",
-                    negotiate.post_quantum,
-                    negotiate.daita,
-                );
-                CloseMsg::EphemeralPeerNegotiationTimeout
-            }
-            error => CloseMsg::SetupError(Error::EphemeralPeerNegotiationError(error)),
-        })
+                negotiate.post_quantum,
+                negotiate.daita,
+            );
+            CloseMsg::EphemeralPeerNegotiationTimeout
+        }
+        error => CloseMsg::SetupError(Error::EphemeralPeerNegotiationError(error)),
+    })
 }
 
 /// How long to wait for a config service to respond, on attempt `retry_attempt` to connect.
