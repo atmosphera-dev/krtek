@@ -1,11 +1,11 @@
 //! Opaque managed relay IP, with the same boundary as native GotaTun TUN input.
 //! Only Local enters the separate TCP/UDP parser. This adapter neither translates
 //! addresses nor validates transport protocols, checksums, extensions or flows.
-use bytes::BytesMut;
+use bytes::Bytes;
 use gotatun::packet::{Decoder, Ip, IpDecoder, Packet};
 use talpid_types::relay_flow::{
-    BUFFER_OVERHEAD, MAX_RELAY_PACKET_SIZE, RelayAttempt, RelayBuffer, RelayBufferAllocator,
-    RelayFlowError, RelayPacket,
+    MAX_RELAY_PACKET_SIZE, RelayAttempt, RelayBuffer, RelayBufferAllocator, RelayFlowError,
+    RelayPacket,
 };
 use zerocopy::IntoBytes;
 
@@ -65,8 +65,8 @@ pub fn authenticated_return(
 }
 
 /// Convert only at the actual synchronous WireGuard handoff. All queues before
-/// this boundary retain RelayPacket, not Packet<Ip>. Both copies and authority
-/// remain retained through the callback, including the transient native buffer.
+/// this boundary retain RelayPacket, not Packet<Ip>. Unique backing moves; shared
+/// views require both live copies to stay credited through the callback.
 /// The callback must hand off immediately, without awaiting or broker/lifecycle
 /// reentry. Native-owned allocations after handoff are outside our byte budget.
 pub fn handoff<T>(
@@ -74,25 +74,17 @@ pub fn handoff<T>(
     buffers: &dyn RelayBufferAllocator,
     operation: impl FnOnce(Packet<Ip>) -> T,
 ) -> Result<T, RelayFlowError> {
-    packet.handoff(|bytes| encode_handoff(bytes, buffers, operation))?
-}
-
-fn encode_handoff<T>(
-    bytes: &[u8],
-    buffers: &dyn RelayBufferAllocator,
-    operation: impl FnOnce(Packet<Ip>) -> T,
-) -> Result<T, RelayFlowError> {
-    let charge = buffers.try_reserve(bytes.len() + BUFFER_OVERHEAD)?;
-    let native = BytesMut::from(bytes);
-    if native.capacity() + BUFFER_OVERHEAD > charge.bytes() {
-        return Err(RelayFlowError::Full);
-    }
-    let native = Packet::from_bytes(native)
-        .try_into_ip()
-        .map_err(|_| RelayFlowError::Invalid)?;
-    let result = operation(native);
-    drop(charge);
-    Ok(result)
+    packet.handoff_owned(buffers, |bytes| {
+        // Bytes takes ownership of Vec, and unique Vec-backed Bytes converts without
+        // copying. The packet's reservation remains live throughout this callback.
+        let native = Bytes::from(bytes)
+            .try_into_mut()
+            .map_err(|_| RelayFlowError::Invalid)?;
+        let native = Packet::from_bytes(native)
+            .try_into_ip()
+            .map_err(|_| RelayFlowError::Invalid)?;
+        Ok(operation(native))
+    })?
 }
 
 #[cfg(test)]

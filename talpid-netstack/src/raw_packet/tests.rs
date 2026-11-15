@@ -3,7 +3,8 @@ use crate::buffer_budget::BufferBudget;
 use gotatun::tun::MtuWatcher;
 use std::{io, net::IpAddr};
 use talpid_types::relay_flow::{
-    RelayAttemptOwner, RelayCaptureGeneration, RelayCaptureOwner, RelaySources, RelayWriteOutcome,
+    BUFFER_OVERHEAD, RelayAttemptOwner, RelayCaptureGeneration, RelayCaptureOwner, RelaySources,
+    RelayWriteOutcome,
 };
 
 const SOURCE4: [u8; 4] = [10, 64, 0, 2];
@@ -127,7 +128,10 @@ fn roundtrip(bytes: &[u8]) {
     let mut wire_consumer = Vec::new();
     handoff(packet, &budget, |native| {
         wire_consumer.extend_from_slice(native.as_bytes());
-        assert!(budget.used() >= 2 * (bytes.len() + BUFFER_OVERHEAD) + 2 * BUFFER_OVERHEAD);
+        assert_eq!(
+            budget.used(),
+            bytes.len() + BUFFER_OVERHEAD + 2 * BUFFER_OVERHEAD
+        );
     })
     .unwrap();
     assert_eq!(wire_consumer, bytes);
@@ -152,6 +156,57 @@ fn roundtrip(bytes: &[u8]) {
     assert_eq!(capture_consumer, bytes);
     drop(inbound);
     assert_eq!(budget.used(), 2 * BUFFER_OVERHEAD);
+}
+
+#[test]
+fn owned_handoff_keeps_all_live_copy_peaks_credited() {
+    let budget = BufferBudget::new(1024 * 1024);
+    let (capture, owner) = owners(&budget, sources());
+    let attempt = owner.capability();
+    let bytes = ipv4(253, b"owned-native-handoff-nonce", PUBLIC4, 0);
+    let base = budget.used();
+    let charge = bytes.len() + BUFFER_OVERHEAD;
+    for shared in [false, true] {
+        let packet = outbound(&bytes, &attempt, &budget).unwrap();
+        let pointer = packet.view().bytes().as_ptr();
+        let retained = shared.then(|| packet.view());
+        let (observed, same_pointer, live_credit) = handoff(packet, &budget, |native| {
+            (
+                native.as_bytes().to_vec(),
+                native.as_bytes().as_ptr() == pointer,
+                budget.used(),
+            )
+        })
+        .unwrap();
+        // Assert outside the authority guard: a negative must not poison the
+        // owner's mutex and turn the expected test failure into a double panic.
+        assert_eq!(observed, bytes);
+        assert_eq!(same_pointer, !shared);
+        assert_eq!(live_credit, base + charge * if shared { 2 } else { 1 });
+        assert_eq!(budget.used(), base + if shared { charge } else { 0 });
+        drop(retained);
+        assert_eq!(budget.used(), base);
+    }
+    for invalid in [&[][..], &[0; 19][..]] {
+        let packet = attempt
+            .packet(RelayBuffer::copy_from(invalid, &budget).unwrap())
+            .unwrap();
+        assert!(matches!(
+            handoff(packet, &budget, |_| panic!("invalid native handoff")),
+            Err(RelayFlowError::Invalid)
+        ));
+        assert_eq!(budget.used(), base);
+    }
+    let packet = outbound(&bytes, &attempt, &budget).unwrap();
+    let retained = packet.view();
+    let held = budget.reserve(budget.limit() - budget.used()).unwrap();
+    assert!(matches!(
+        handoff(packet, &budget, |_| panic!("uncredited copy")),
+        Err(RelayFlowError::Full)
+    ));
+    assert_eq!(retained.bytes(), bytes);
+    drop((held, retained, attempt, owner, capture));
+    assert_eq!(budget.used(), 0);
 }
 
 #[test]
@@ -374,10 +429,13 @@ fn native_copy_refusal_and_stale_handoff_never_reach_wire_consumer() {
     let (_capture, owner) = owners(&budget, sources());
     let bytes = ipv4(253, b"budgeted", PUBLIC4, 0);
     let packet = outbound(&bytes, &owner.capability(), &budget).unwrap();
+    let retained_copy = packet.view();
     assert!(matches!(
         handoff(packet, &budget, |_| panic!("unfunded handoff")),
         Err(RelayFlowError::Full)
     ));
+    assert_eq!(retained_copy.bytes(), bytes);
+    drop(retained_copy);
     assert_eq!(budget.used(), 2 * BUFFER_OVERHEAD);
     let packet = outbound(&bytes, &owner.capability(), &budget).unwrap();
     let retained = packet.view();

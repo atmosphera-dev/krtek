@@ -689,6 +689,11 @@ async fn managed_capture_delivers_local_nonces_and_never_relays_denied_local() {
         "Local authentication accidentally activated ordinary traffic"
     );
     pair.control.activate().unwrap();
+    bounded(pair.receive.recv())
+        .await
+        .unwrap()
+        .handoff(|bytes| assert_eq!(bytes, public_bytes))
+        .unwrap();
     runtime
         .internal_update(&policy(), TargetState::Secured, TunnelPhase::Connected)
         .await;

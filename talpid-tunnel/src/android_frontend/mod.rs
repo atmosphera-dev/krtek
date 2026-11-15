@@ -12,10 +12,15 @@ pub use fd_format::{CaptureFormat, UnsupportedCaptureFormat};
 mod config;
 mod observation;
 mod owner;
+mod receiver;
 pub use config::{CaptureConfig, CaptureDisposition, CaptureDropReason};
 use observation::Observation;
+pub use receiver::LocalReceiver;
+use receiver::Receiver;
 
-use crate::packet_attachment::{AttachmentBroker, AttachmentReply};
+use crate::packet_attachment::{
+    AttachmentBroker, AttachmentError, AttachmentReply, PendingIngress,
+};
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use std::{
     io,
@@ -94,11 +99,11 @@ impl FrontendOwner {
     pub fn start<A: LocalAuthority>(
         platform: Arc<dyn FrontendPlatform>,
         config: CaptureConfig,
-        forwarder: Forwarder<A>,
+        forwarder: impl Into<LocalReceiver<A>>,
         revalidate: watch::Receiver<u64>,
         broker: AttachmentBroker,
     ) -> io::Result<Self> {
-        owner::start(platform, config, forwarder, revalidate, broker)
+        owner::start(platform, config, forwarder.into(), revalidate, broker)
     }
 
     /// Enqueue one configuration change; `ready` awaits this exact epoch. The
@@ -195,6 +200,7 @@ async fn drive<A: LocalAuthority>(
     let mut buffers = DriveBuffers {
         packet,
         reply: None,
+        pending: None,
         raw_first: false,
     };
     match drive_epoch(
@@ -216,12 +222,21 @@ async fn drive<A: LocalAuthority>(
 struct DriveBuffers {
     packet: talpid_types::relay_flow::RelayBuffer,
     reply: Option<AttachmentReply>,
+    pending: Option<PendingIngress>,
     raw_first: bool,
+}
+
+fn read_buffer(
+    buffers: &dyn talpid_types::relay_flow::RelayBufferAllocator,
+) -> Result<talpid_types::relay_flow::RelayBuffer, talpid_types::relay_flow::RelayFlowError> {
+    use talpid_types::relay_flow::{BUFFER_OVERHEAD, MAX_RELAY_PACKET_SIZE, RelayBuffer};
+    let charge = buffers.try_reserve(MAX_RELAY_PACKET_SIZE + BUFFER_OVERHEAD)?;
+    RelayBuffer::from_reservation(vec![0; MAX_RELAY_PACKET_SIZE], charge)
 }
 
 async fn drive_epoch<A: LocalAuthority>(
     capture: &AsyncFd<BorrowedFd<'_>>,
-    forwarder: &mut Forwarder<A>,
+    forwarder: &mut impl Receiver<A>,
     signals: (&mut watch::Receiver<u64>, &mut oneshot::Receiver<()>),
     session: Option<(&CaptureConfig, &Observation)>,
     buffers: &mut DriveBuffers,
@@ -232,6 +247,7 @@ async fn drive_epoch<A: LocalAuthority>(
     let DriveBuffers {
         packet,
         reply,
+        pending,
         raw_first,
     } = buffers;
     let mut updates_open = true;
@@ -255,6 +271,7 @@ async fn drive_epoch<A: LocalAuthority>(
             },
             _ = async { match &mut observation_updates { Some(updates) => { let _ = updates.changed().await; }, None => std::future::pending().await } } => {},
             _ = async { match &mut broker_updates { Some(updates) => { let _ = updates.changed().await; }, None => std::future::pending().await } } => { forwarder.revalidate(); },
+            _ = async { match pending { Some(packet) => packet.send().await, None => std::future::pending().await } } => { pending.take(); },
             result = async { match lease { Some(lease) => lease.reply().await, None => std::future::pending().await } }, if reply.is_none() => {
                 match result { Ok(packet) => *reply = Some(packet), Err(_) => return owner::Event::Terminal(FrontendState::Failed) }
             },
@@ -262,7 +279,7 @@ async fn drive_epoch<A: LocalAuthority>(
                 if result.is_ok() { forwarder.revalidate(); }
                 else { updates_open = false; }
             }
-            result = capture.readable() => {
+            result = capture.readable(), if pending.is_none() => {
                 let Ok(mut ready) = result else { return owner::Event::Terminal(FrontendState::Failed); };
                 // A continuously readable interface cannot monopolize stop or
                 // authority updates. Readiness is retained when this allowance ends.
@@ -270,7 +287,8 @@ async fn drive_epoch<A: LocalAuthority>(
                     match ready.try_io(|fd| nix::unistd::read(fd.get_ref(), packet).map_err(io::Error::from)) {
                         Ok(Ok(0)) => return owner::Event::Terminal(FrontendState::Failed),
                         Ok(Ok(len)) => {
-                            ingest(forwarder, &packet[..len], session);
+                            *pending = ingest(forwarder, &packet[..len], session);
+                            if pending.is_some() { break; }
                         },
                         Ok(Err(error)) if error.kind() == io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
@@ -308,9 +326,12 @@ async fn drive_epoch<A: LocalAuthority>(
 
 fn drain_checked_local<A: LocalAuthority>(
     capture: &AsyncFd<BorrowedFd<'_>>,
-    forwarder: &mut Forwarder<A>,
+    forwarder: &mut impl Receiver<A>,
     session: Option<(&RelayCapture, &RelaySink)>,
 ) -> io::Result<bool> {
+    let Some(forwarder) = forwarder.receiver() else {
+        return Ok(false);
+    };
     let write = |bytes: &[u8]| {
         capture.try_io(Interest::WRITABLE, |fd| {
             nix::unistd::write(fd, bytes).map_err(io::Error::from)
@@ -329,22 +350,22 @@ fn drain_checked_local<A: LocalAuthority>(
 }
 
 fn ingest<A: LocalAuthority>(
-    forwarder: &mut Forwarder<A>,
+    forwarder: &mut impl Receiver<A>,
     bytes: &[u8],
     session: Option<(&CaptureConfig, &Observation)>,
-) {
+) -> Option<PendingIngress> {
     let Some((config, observation)) = session else {
         forwarder.ingest(bytes);
-        return;
+        return None;
     };
     let Ok(ip) = talpid_netstack::raw_packet::inspect(bytes) else {
-        return;
+        return None;
     };
     if !ip
         .source()
         .is_some_and(|ip| observation.sources.contains(ip))
     {
-        return;
+        return None;
     }
     match config {
         CaptureConfig::Partial(_) => forwarder.ingest(bytes),
@@ -352,12 +373,17 @@ fn ingest<A: LocalAuthority>(
             match ip.destination().map(|ip| disposition(ip)) {
                 Some(CaptureDisposition::Local) => forwarder.ingest(bytes),
                 Some(CaptureDisposition::Tunnel(target)) => {
-                    let _ = observation.lease.try_send_to(target, bytes);
+                    if let Ok(mut packet) = observation.lease.ingress(target, bytes)
+                        && packet.try_send() == Err(AttachmentError::Full)
+                    {
+                        return Some(packet);
+                    }
                 }
                 _ => {}
             }
         }
     }
+    None
 }
 
 fn drain_reply(
@@ -388,7 +414,7 @@ fn drain_reply(
 
 fn drain_fair<A: LocalAuthority>(
     capture: &AsyncFd<BorrowedFd<'_>>,
-    forwarder: &mut Forwarder<A>,
+    forwarder: &mut impl Receiver<A>,
     observation: &Observation,
     local_capture: Option<&RelayCapture>,
     reply: &mut Option<AttachmentReply>,
@@ -423,7 +449,7 @@ fn drain_fair<A: LocalAuthority>(
 
 fn drain_output<A: LocalAuthority>(
     capture: &AsyncFd<BorrowedFd<'_>>,
-    forwarder: &mut Forwarder<A>,
+    forwarder: &mut impl Receiver<A>,
 ) -> io::Result<()> {
     for _ in 0..256 {
         if !drain_checked_local(capture, forwarder, None)? {

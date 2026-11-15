@@ -1,7 +1,9 @@
 //! Production managed entry, also compiled against the platform boundary in Linux tests.
 use super::*;
 use talpid_lan_forwarder::Forwarder;
-use talpid_tunnel::android_frontend::{FrontendOwner, FrontendPlatform, FrontendState};
+use talpid_tunnel::android_frontend::{
+    FrontendOwner, FrontendPlatform, FrontendState, LocalReceiver,
+};
 
 pub struct PlatformFactory(pub Arc<dyn FrontendPlatform>);
 pub struct PlatformOwner {
@@ -23,22 +25,12 @@ impl FrontendFactory for PlatformFactory {
         broker: AttachmentBroker,
     ) -> io::Result<PlatformOwner> {
         let updates = authority.subscribe();
-        let mtu = config.mtu();
         let classifier = authority.clone();
-        log::debug!(
-            "local-receiver-start capture_mtu={mtu} packet_ceiling={}",
-            talpid_lan_forwarder::packet::MAX_PACKET_SIZE
-        );
-        let forwarder =
-            Forwarder::with_mtu(authority.clone(), buffers, usize::from(mtu)).map_err(|error| {
-                match error {
-                    Refused::UnsupportedMtu => io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("Unsupported Local capture MTU {mtu}"),
-                    ),
-                    _ => io::Error::other("Local storage budget full"),
-                }
-            })?;
+        let receiver_authority = authority.clone();
+        let forwarder = LocalReceiver::new(move |mtu| {
+            log::debug!("local-receiver-start capture_mtu={mtu}");
+            Forwarder::with_mtu(receiver_authority.clone(), buffers.clone(), mtu)
+        });
         let owner = FrontendOwner::start(
             self.0.clone(),
             config.into_frontend(classifier),

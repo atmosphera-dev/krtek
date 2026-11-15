@@ -75,6 +75,310 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn owned_packets_wait_for_capacity_in_both_directions() {
+    use futures::FutureExt;
+    let f = Fixture::new();
+    let (request, lease, mut pair) = f.active().await;
+    let capability = pair.control.capability();
+    for index in 0..PACKET_CAPACITY {
+        lease.try_send(&index.to_be_bytes()).unwrap();
+        pair.send.try_send(&index.to_be_bytes()).unwrap();
+    }
+    let mut pending = lease
+        .ingress(RelayTargetId::MULLVAD, b"outbound-capacity-plus-one")
+        .unwrap();
+    let inbound = capability
+        .packet(RelayBuffer::copy_from(b"inbound-capacity-plus-one", &f.application).unwrap())
+        .unwrap();
+    let mut send = Box::pin(pair.send.send_packet(inbound));
+    assert!(send.as_mut().now_or_never().is_none());
+    assert!(pending.send().now_or_never().is_none());
+    pair.receive.recv().await.unwrap();
+    let mut reply = lease.reply().await.unwrap();
+    assert!(matches!(
+        reply.write(|bytes| Ok(bytes.len())),
+        RelayWriteOutcome::Written
+    ));
+    drop(reply);
+    send.await.unwrap();
+    pending.send().await.unwrap();
+    let (writer, consumer) = UnixDatagram::pair().unwrap();
+    for index in 1..=PACKET_CAPACITY {
+        let packet = pair.receive.recv().await.unwrap();
+        packet.handoff(|bytes| writer.send(bytes).unwrap()).unwrap();
+        let mut bytes = [0; 64];
+        let count = consumer.recv(&mut bytes).unwrap();
+        if index == PACKET_CAPACITY {
+            assert_eq!(&bytes[..count], b"outbound-capacity-plus-one");
+        } else {
+            assert_eq!(&bytes[..count], index.to_be_bytes());
+        }
+        let mut reply = lease.reply().await.unwrap();
+        assert!(matches!(
+            reply.write(|bytes| writer.send(bytes)),
+            RelayWriteOutcome::Written
+        ));
+        let count = consumer.recv(&mut bytes).unwrap();
+        if index == PACKET_CAPACITY {
+            assert_eq!(&bytes[..count], b"inbound-capacity-plus-one");
+        } else {
+            assert_eq!(&bytes[..count], index.to_be_bytes());
+        }
+    }
+    drop((pending, capability, pair, lease, request));
+    assert_eq!(f.application.used(), 0);
+}
+
+#[tokio::test]
+async fn capacity_waits_cancel_without_crossing_attempt_or_sink() {
+    use futures::FutureExt;
+    for close in [false, true] {
+        let f = Fixture::new();
+        let (request, lease, pair) = f.active().await;
+        for _ in 0..PACKET_CAPACITY {
+            lease.try_send(b"held").unwrap();
+            pair.send.try_send(b"held").unwrap();
+        }
+        let mut pending = lease
+            .ingress(RelayTargetId::MULLVAD, b"stale-egress")
+            .unwrap();
+        let packet = pair
+            .control
+            .capability()
+            .packet(RelayBuffer::copy_from(b"stale-return", &f.application).unwrap())
+            .unwrap();
+        let mut send = Box::pin(pair.send.send_packet(packet));
+        assert!(send.as_mut().now_or_never().is_none());
+        assert!(pending.send().now_or_never().is_none());
+        if close {
+            f.broker.close();
+        } else {
+            pair.control.detach();
+        }
+        assert!(send.await.is_err());
+        assert!(pending.send().await.is_err());
+        drop((pending, pair, lease, request));
+        assert_eq!(f.application.used(), 0);
+    }
+    // Subscribe before a capacity change, but first poll only afterward: no lost wake.
+    let f = Fixture::new();
+    let (request, lease, mut pair) = f.active().await;
+    for _ in 0..PACKET_CAPACITY {
+        lease.try_send(b"old").unwrap();
+    }
+    let mut pending = lease
+        .ingress(
+            RelayTargetId::MULLVAD,
+            b"must-not-cross-identical-successor",
+        )
+        .unwrap();
+    assert!(pending.send().now_or_never().is_none());
+    pair.receive.recv().await.unwrap();
+    pending.send().await.unwrap();
+    let mut stale = lease
+        .ingress(RelayTargetId::MULLVAD, b"stale-unpolled")
+        .unwrap();
+    pair.control.detach();
+    let receipt = match &*request.status.borrow() {
+        RequestStatus::Ready(outcome) => outcome.receipt.clone(),
+        _ => unreachable!(),
+    };
+    let successor = f.broker.acquire(&receipt).unwrap();
+    successor.control.activate().unwrap();
+    assert!(stale.send().await.is_err());
+    drop((pending, stale, successor, pair, lease, request));
+    assert_eq!(f.application.used(), 0);
+
+    // A capacity-blocked ingress selection is tied to its original descriptor.
+    // An eligible already-attached return may follow a coordinated sink change,
+    // but can never write through the predecessor selector.
+    let f = Fixture::new();
+    let (request, lease, pair) = f.active().await;
+    for _ in 0..PACKET_CAPACITY {
+        lease.try_send(b"held-egress").unwrap();
+        pair.send.try_send(b"held-return").unwrap();
+    }
+    let old_sink = lease.capability().unwrap().sink().unwrap();
+    let mut pending = lease
+        .ingress(RelayTargetId::MULLVAD, b"old-sink-pending")
+        .unwrap();
+    let packet = pair
+        .control
+        .capability()
+        .packet(RelayBuffer::copy_from(b"retained-same-attempt-return", &f.application).unwrap())
+        .unwrap();
+    let mut send = Box::pin(pair.send.send_packet(packet));
+    assert!(send.as_mut().now_or_never().is_none());
+    assert!(pending.send().now_or_never().is_none());
+    let change = lease.begin_handover(None, sources(), 1420).unwrap();
+    assert!(pending.send().await.is_err());
+    assert!(send.as_mut().now_or_never().is_none());
+    change.bind_identity("tun8", None, sources(), 1420).unwrap();
+    let sink = lease.capability().unwrap().sink().unwrap();
+    let mut reply = lease.reply().await.unwrap();
+    assert!(matches!(
+        reply.write_to(&old_sink, |_| panic!("old sink crossed")),
+        RelayWriteOutcome::Retry
+    ));
+    assert!(matches!(
+        reply.write_to(&sink, |bytes| Ok(bytes.len())),
+        RelayWriteOutcome::Written
+    ));
+    drop(reply);
+    send.await.unwrap();
+    for _ in 1..PACKET_CAPACITY {
+        drop(lease.reply().await.unwrap());
+    }
+    let (writer, consumer) = UnixDatagram::pair().unwrap();
+    let mut reply = lease.reply().await.unwrap();
+    assert!(matches!(
+        reply.write_to(&sink, |bytes| writer.send(bytes)),
+        RelayWriteOutcome::Written
+    ));
+    let mut bytes = [0; 64];
+    let count = consumer.recv(&mut bytes).unwrap();
+    assert_eq!(&bytes[..count], b"retained-same-attempt-return");
+    drop((reply, pending, pair, change, lease, request));
+    assert_eq!(f.application.used(), 0);
+
+    // Force a real dequeue exactly between the locked Full result and sleep.
+    // Moving subscription/seen-version after the recheck loses this wakeup.
+    for outbound in [false, true] {
+        let f = Fixture::new();
+        let (request, lease, pair) = f.active().await;
+        for _ in 0..PACKET_CAPACITY {
+            lease.try_send(b"held").unwrap();
+            pair.send.try_send(b"held").unwrap();
+        }
+        let bridge = pair.control.attempt.bridge.clone();
+        let wake = bridge.clone();
+        *bridge.wait_hook.lock().unwrap() = Some(Box::new(move || {
+            let mut queues = wake.queues.lock().unwrap();
+            if outbound {
+                queues.outbound.pop_front();
+            } else {
+                queues.inbound.pop_front();
+            }
+            wake.wake();
+        }));
+        if outbound {
+            let mut pending = lease
+                .ingress(RelayTargetId::MULLVAD, b"wake-race-outbound")
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), pending.send())
+                .await
+                .expect("lost outbound wakeup")
+                .unwrap();
+        } else {
+            let packet = pair
+                .control
+                .capability()
+                .packet(RelayBuffer::copy_from(b"wake-race-return", &f.application).unwrap())
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), pair.send.send_packet(packet))
+                .await
+                .expect("lost inbound wakeup")
+                .unwrap();
+        }
+        drop((bridge, pair, lease, request));
+        assert_eq!(f.application.used(), 0);
+    }
+
+    // Replacing a requested configuration before any carrier attaches must
+    // retire its full pre-carrier bridge, even if the actual fd is reused.
+    for replace_sink in [false, true] {
+        let f = Fixture::new();
+        let (mut old, pending) = f.request();
+        let (lease, receipt) = f.bind(&pending);
+        f.broker.acknowledge(&pending, &receipt).unwrap();
+        let old_receipt = old.configured().await.unwrap();
+        for _ in 0..PACKET_CAPACITY {
+            lease.try_send(b"unattached-old-request").unwrap();
+        }
+        let mut selected = lease
+            .ingress(RelayTargetId::MULLVAD, b"old-full-waiter")
+            .unwrap();
+        assert!(selected.send().now_or_never().is_none());
+        let (mut successor, next) = f.request();
+        let mut change = None;
+        if replace_sink {
+            let replacing = lease.begin_handover(Some(&next), sources(), 1420).unwrap();
+            let receipt = replacing
+                .bind_identity("tun8", Some(100), sources(), 1420)
+                .unwrap();
+            f.broker.acknowledge(&next, &receipt).unwrap();
+            change = Some(replacing);
+        } else {
+            lease.acknowledge_request(&next).unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), selected.send())
+                .await
+                .expect("superseded pre-carrier bridge stranded its waiter")
+                .is_err()
+        );
+        drop(selected);
+        assert_eq!(
+            f.application.used(),
+            0,
+            "superseded pre-carrier bytes retained"
+        );
+        assert!(matches!(
+            f.broker.acquire(&old_receipt),
+            Err(AttachmentError::CaptureUnready)
+        ));
+        let receipt = successor.configured().await.unwrap();
+        lease.try_send(b"only-successor-consumer").unwrap();
+        let mut pair = f.broker.acquire(&receipt).unwrap();
+        pair.control.activate_with_receipt(&receipt).unwrap();
+        old.cancel();
+        let (writer, consumer) = UnixDatagram::pair().unwrap();
+        pair.receive
+            .recv()
+            .await
+            .unwrap()
+            .handoff(|bytes| writer.send(bytes).unwrap())
+            .unwrap();
+        let mut bytes = [0; 64];
+        let count = consumer.recv(&mut bytes).unwrap();
+        assert_eq!(&bytes[..count], b"only-successor-consumer");
+        if let Some(change) = change.as_mut() {
+            change.finish().unwrap();
+        }
+        drop((pair, change, lease, successor, old, pending, next));
+        assert_eq!(f.application.used(), 0);
+    }
+    let f = Fixture::new();
+    let (mut old, pending) = f.request();
+    let (lease, receipt) = f.bind(&pending);
+    f.broker.acknowledge(&pending, &receipt).unwrap();
+    old.configured().await.unwrap();
+    for _ in 0..PACKET_CAPACITY {
+        lease.try_send(b"failed-handover-predecessor").unwrap();
+    }
+    let mut selected = lease
+        .ingress(RelayTargetId::MULLVAD, b"failed-handover-waiter")
+        .unwrap();
+    assert!(selected.send().now_or_never().is_none());
+    let (successor, next) = f.request();
+    let change = lease.begin_handover(Some(&next), sources(), 1420).unwrap();
+    drop(change);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), selected.send())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    drop(selected);
+    assert_eq!(
+        f.application.used(),
+        0,
+        "failed handover retained stale predecessor data"
+    );
+    drop((successor, next, old, pending, lease));
+}
+
+#[tokio::test]
 async fn exact_request_acknowledgement_is_required_before_ordinary_activation() {
     let f = Fixture::new();
     let (mut request, pending) = f.request();
@@ -111,15 +415,16 @@ async fn exact_request_acknowledgement_is_required_before_ordinary_activation() 
         lease.generation()
     );
     let mut pair = f.broker.acquire(&receipt).unwrap();
-    assert_eq!(
-        lease.try_send(b"before connectivity"),
-        Err(AttachmentError::OrdinaryUnready)
-    );
+    lease.try_send(b"before carrier").unwrap();
     assert_eq!(
         pair.send.try_send(b"early return"),
         Err(AttachmentError::OrdinaryUnready)
     );
     pair.control.activate().unwrap();
+    assert_eq!(
+        pair.receive.recv().await.unwrap().view().bytes(),
+        b"before carrier"
+    );
     lease.try_send(b"exact raw bytes").unwrap();
     let packet = pair.receive.recv().await.unwrap();
     assert_eq!(
@@ -689,6 +994,7 @@ async fn storage_refusal_is_immediate_and_dropping_a_half_revokes_queued_packets
     let (_request, lease, mut pair) = f.active().await;
     let held = f.application.reserve(f.application.limit()).unwrap();
     assert_eq!(lease.try_send(b"no credit"), Err(AttachmentError::Full));
+    assert_eq!(f.broker.admission_refusals(), 1);
     assert_eq!(pair.send.try_send(b"no credit"), Err(AttachmentError::Full));
     assert_eq!(f.control.used(), 0);
     drop(held);

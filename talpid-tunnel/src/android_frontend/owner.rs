@@ -102,7 +102,7 @@ struct Retained {
 pub(super) fn start<A: LocalAuthority>(
     platform: Arc<dyn FrontendPlatform>,
     config: CaptureConfig,
-    mut forwarder: Forwarder<A>,
+    mut forwarder: LocalReceiver<A>,
     revalidate: watch::Receiver<u64>,
     broker: AttachmentBroker,
 ) -> io::Result<FrontendOwner> {
@@ -189,7 +189,7 @@ async fn establish<A: LocalAuthority>(
     platform: Arc<dyn FrontendPlatform>,
     mut epoch: Epoch,
     predecessor: Option<i64>,
-    forwarder: &mut Forwarder<A>,
+    forwarder: &mut LocalReceiver<A>,
     revalidate: &mut watch::Receiver<u64>,
     stop: &mut oneshot::Receiver<()>,
     cancelled: &mut bool,
@@ -283,7 +283,7 @@ struct Actor<A: LocalAuthority> {
     broker: AttachmentBroker,
     lease: Arc<CaptureLease>,
     initial: Epoch,
-    forwarder: Forwarder<A>,
+    forwarder: LocalReceiver<A>,
     revalidate: watch::Receiver<u64>,
     stop: oneshot::Receiver<()>,
     started: oneshot::Sender<io::Result<()>>,
@@ -324,9 +324,10 @@ async fn run<A: LocalAuthority>(actor: Actor<A>) -> io::Result<()> {
     let mut ready = Some(started);
     let mut retained: Option<Retained> = None;
     let mut cleanup = None;
-    let mut buffers = forwarder.read_buffer().map(|packet| DriveBuffers {
+    let mut buffers = read_buffer(broker.capture_buffers().as_ref()).map(|packet| DriveBuffers {
         packet,
         reply: None,
+        pending: None,
         raw_first: false,
     });
     let mut terminal = loop {

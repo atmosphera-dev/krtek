@@ -5,7 +5,10 @@ use crate::tun_provider::{ConfigurationError, ConfigurationPurpose, TunConfig};
 use std::{
     collections::VecDeque,
     io,
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use talpid_types::relay_flow::{
     MAX_TARGETS, RelayAttempt, RelayAttemptOwner, RelayBuffer, RelayBufferAllocator,
@@ -76,6 +79,7 @@ struct Configuration {
     status: watch::Sender<RequestStatus>,
     release: watch::Sender<CaptureRelease>,
     release_changes: watch::Sender<u64>,
+    bridge: Arc<Bridge>,
     _storage: Arc<dyn RelayBufferReservation>,
 }
 
@@ -150,8 +154,58 @@ struct Capture {
 }
 
 struct Queues {
-    outbound: VecDeque<RelayPacket>,
+    outbound: VecDeque<RelayBuffer>,
     inbound: VecDeque<RelayPacket>,
+    generation: u64,
+    retired: bool,
+}
+
+struct Bridge {
+    queues: Mutex<Queues>,
+    outbound: Notify,
+    changed: watch::Sender<u64>,
+    _storage: Arc<dyn RelayBufferReservation>,
+    #[cfg(test)]
+    wait_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl Bridge {
+    fn new(buffers: &dyn RelayBufferAllocator) -> Result<Arc<Self>, AttachmentError> {
+        let storage = buffers.try_reserve(CHANNEL_STORAGE)?;
+        Ok(Arc::new(Self {
+            queues: Mutex::new(Queues {
+                outbound: VecDeque::with_capacity(PACKET_CAPACITY),
+                inbound: VecDeque::with_capacity(PACKET_CAPACITY),
+                generation: 0,
+                retired: false,
+            }),
+            outbound: Notify::new(),
+            changed: watch::channel(0).0,
+            _storage: storage,
+            #[cfg(test)]
+            wait_hook: Mutex::new(None),
+        }))
+    }
+    fn wake(&self) {
+        self.changed
+            .send_modify(|revision| *revision = revision.checked_add(1).expect("bridge revision"));
+    }
+    #[cfg(test)]
+    fn before_wait(&self) {
+        let hook = self.wait_hook.lock().expect("capacity hook").take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    fn retire(&self) {
+        let mut queues = self.queues.lock().expect("attachment queues");
+        queues.retired = true;
+        queues.generation = queues.generation.checked_add(1).expect("bridge generation");
+        queues.outbound.clear();
+        queues.inbound.clear();
+        self.wake();
+        self.outbound.notify_one();
+    }
 }
 
 struct Attempt {
@@ -159,8 +213,7 @@ struct Attempt {
     target: RelayTargetId,
     request: Arc<Configuration>,
     owner: RelayAttemptOwner,
-    queues: Mutex<Queues>,
-    outbound: Notify,
+    bridge: Arc<Bridge>,
     cancelled: watch::Sender<bool>,
     _storage: Arc<dyn RelayBufferReservation>,
 }
@@ -169,10 +222,7 @@ impl Attempt {
     fn retire(&self) {
         self.owner.retire();
         self.cancelled.send_replace(true);
-        let mut queues = self.queues.lock().expect("attachment queues");
-        queues.outbound.clear();
-        queues.inbound.clear();
-        self.outbound.notify_one();
+        self.bridge.retire();
     }
 }
 
@@ -196,6 +246,18 @@ struct State {
 impl State {
     fn attempt(&self, target: RelayTargetId) -> Option<&Arc<Attempt>> {
         self.attempts.iter().flatten().find(|a| a.target == target)
+    }
+    /// A superseded pre-carrier queue has no future consumer. An already
+    /// attached target instead keeps its independent attempt across handover.
+    fn retire_unattached_bridge(&self, configuration: &Configuration) {
+        if !self
+            .attempts
+            .iter()
+            .flatten()
+            .any(|attempt| Arc::ptr_eq(&attempt.bridge, &configuration.bridge))
+        {
+            configuration.bridge.retire();
+        }
     }
     fn detach_target(&mut self, target: RelayTargetId) {
         if let Some(slot) = self
@@ -221,6 +283,7 @@ impl State {
                 owner.retire();
             }
             if let Some(config) = capture.config {
+                config.bridge.retire();
                 config.status.send_if_modified(|status| {
                     if matches!(
                         status,
@@ -276,11 +339,25 @@ struct Inner {
     application: Arc<dyn RelayBufferAllocator>,
     capture: Arc<dyn RelayBufferAllocator>,
     control: Arc<dyn RelayBufferAllocator>,
+    admission_refusals: AtomicU64,
     _storage: Arc<dyn RelayBufferReservation>,
 }
 
 impl Inner {
     fn publish(&self, state: &State) {
+        // Capacity and selector loss share the same exact bridge wake. Waiters
+        // subscribe before rechecking, and never hold these locks while asleep.
+        for attempt in state.attempts.iter().flatten() {
+            attempt.bridge.wake();
+            attempt.bridge.outbound.notify_one();
+        }
+        if let Some(config) = state
+            .capture
+            .as_ref()
+            .and_then(|capture| capture.config.as_ref())
+        {
+            config.bridge.wake();
+        }
         self.changes.send_if_modified(|snapshot| {
             let next = state.snapshot();
             if *snapshot == next {
@@ -373,6 +450,17 @@ pub struct AttachmentReply {
     packet: RelayPacket,
 }
 
+/// One already-read packet, selected for an exact request, bridge generation and
+/// descriptor epoch. Waiting for capacity never reselects a successor.
+pub struct PendingIngress {
+    inner: Weak<Inner>,
+    request: Arc<Configuration>,
+    bridge: Arc<Bridge>,
+    generation: u64,
+    sink: RelaySink,
+    packet: Option<RelayBuffer>,
+}
+
 impl AttachmentBroker {
     pub fn same_broker(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
@@ -407,6 +495,7 @@ impl AttachmentBroker {
                 application,
                 capture,
                 control,
+                admission_refusals: AtomicU64::new(0),
                 _storage: storage,
             }),
         })
@@ -429,6 +518,12 @@ impl AttachmentBroker {
     }
     pub fn application_buffers(&self) -> Arc<dyn RelayBufferAllocator> {
         self.inner.application.clone()
+    }
+    pub fn capture_buffers(&self) -> Arc<dyn RelayBufferAllocator> {
+        self.inner.capture.clone()
+    }
+    pub fn admission_refusals(&self) -> u64 {
+        self.inner.admission_refusals.load(Ordering::Relaxed)
     }
 
     /// Latest route input for future target requests. Existing requests stay
@@ -517,6 +612,7 @@ impl AttachmentBroker {
         purpose: ConfigurationPurpose,
     ) -> Result<ConfigurationRequest, AttachmentError> {
         let storage = self.inner.capture.try_reserve(1024)?;
+        let bridge = Bridge::new(self.inner.capture.as_ref())?;
         let mut state = self.inner.state.lock().expect("attachment state");
         if state.closed {
             return Err(AttachmentError::Closed);
@@ -547,6 +643,7 @@ impl AttachmentBroker {
             })
             .0,
             release_changes: self.inner.release_changes.clone(),
+            bridge,
             _storage: storage,
         });
         state.next_request = id;
@@ -796,8 +893,18 @@ impl AttachmentBroker {
                 applied: applied.clone(),
                 cause: None,
             }));
-        state.capture.as_mut().expect("matching receipt").config = Some(request.0.clone());
+        let previous = state
+            .capture
+            .as_mut()
+            .expect("matching receipt")
+            .config
+            .replace(request.0.clone());
         state.capture.as_mut().expect("matching receipt").profile = Some(applied);
+        if let Some(previous) = previous
+            && !Arc::ptr_eq(&previous, &request.0)
+        {
+            state.retire_unattached_bridge(&previous);
+        }
         state.request.take();
         self.inner.publish(&state);
         Ok(true)
@@ -835,7 +942,11 @@ impl AttachmentBroker {
         mtu: u16,
     ) -> Result<TransportPair, AttachmentError> {
         receipt.target_configuration()?;
-        let storage = self.inner.capture.try_reserve(CHANNEL_STORAGE)?;
+        let bridge = if target == RelayTargetId::MULLVAD {
+            receipt.target_configuration()?.bridge.clone()
+        } else {
+            Bridge::new(self.inner.capture.as_ref())?
+        };
         let mut state = self.inner.state.lock().expect("attachment state");
         if state.paused && target == RelayTargetId::MULLVAD {
             return Err(AttachmentError::OrdinaryUnready);
@@ -889,14 +1000,11 @@ impl AttachmentBroker {
                 .upgrade()
                 .ok_or(AttachmentError::CaptureUnready)?,
             owner,
-            queues: Mutex::new(Queues {
-                outbound: VecDeque::with_capacity(PACKET_CAPACITY),
-                inbound: VecDeque::with_capacity(PACKET_CAPACITY),
-            }),
-            outbound: Notify::new(),
+            bridge: bridge.clone(),
             cancelled: watch::channel(false).0,
-            _storage: storage,
+            _storage: bridge._storage.clone(),
         });
+        bridge.queues.lock().expect("attachment queues").retired = false;
         let control = || AttemptControl {
             inner: Arc::downgrade(&self.inner),
             attempt: attempt.clone(),
@@ -1158,6 +1266,7 @@ fn cancel_configuration(inner: &Weak<Inner>, request: &Arc<Configuration>) {
             state.detach_target(RelayTargetId::MULLVAD);
         }
         request.status.send_replace(RequestStatus::Cancelled);
+        request.bridge.retire();
         inner.publish(&state);
         inner.replies.notify_one();
     }
@@ -1382,6 +1491,14 @@ impl CaptureLease {
     }
 
     pub fn try_send_to(&self, target: RelayTargetId, bytes: &[u8]) -> Result<(), AttachmentError> {
+        self.ingress(target, bytes)?.try_send()
+    }
+
+    pub fn ingress(
+        &self,
+        target: RelayTargetId,
+        bytes: &[u8],
+    ) -> Result<PendingIngress, AttachmentError> {
         let state = self.inner.state.lock().expect("attachment state");
         if !state
             .capture
@@ -1390,10 +1507,50 @@ impl CaptureLease {
         {
             return Err(AttachmentError::Stale);
         }
-        let attempt = state
-            .attempt(target)
+        let capture = state.capture.as_ref().expect("checked capture");
+        let sink = capture
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.capability().sink())
             .ok_or(AttachmentError::OrdinaryUnready)?;
-        enqueue(&self.inner, attempt, bytes, true)
+        let (request, bridge, attached) = if let Some(attempt) = state.attempt(target) {
+            (&attempt.request, &attempt.bridge, true)
+        } else if target == RelayTargetId::MULLVAD && !state.paused {
+            let request = capture
+                .config
+                .as_ref()
+                .ok_or(AttachmentError::OrdinaryUnready)?;
+            (request, &request.bridge, false)
+        } else {
+            return Err(AttachmentError::OrdinaryUnready);
+        };
+        if !attached
+            && (request.purpose != ConfigurationPurpose::Target
+                || !matches!(&*request.status.borrow(), RequestStatus::Ready(outcome) if outcome.cause.is_none()))
+        {
+            return Err(AttachmentError::OrdinaryUnready);
+        }
+        let queues = bridge.queues.lock().expect("attachment queues");
+        if queues.retired {
+            return Err(AttachmentError::Stale);
+        }
+        let packet =
+            RelayBuffer::copy_from(bytes, self.inner.application.as_ref()).map_err(|error| {
+                if error == RelayFlowError::Full {
+                    self.inner
+                        .admission_refusals
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                AttachmentError::from(error)
+            })?;
+        Ok(PendingIngress {
+            inner: Arc::downgrade(&self.inner),
+            request: request.clone(),
+            bridge: bridge.clone(),
+            generation: queues.generation,
+            sink,
+            packet: Some(packet),
+        })
     }
     /// Checked Local sink authority, independent of every target's readiness.
     pub fn capability(&self) -> Option<RelayCapture> {
@@ -1427,12 +1584,14 @@ impl CaptureLease {
                         continue;
                     };
                     let packet = attempt
+                        .bridge
                         .queues
                         .lock()
                         .expect("attachment queues")
                         .inbound
                         .pop_front();
                     if let Some(packet) = packet {
+                        attempt.bridge.wake();
                         state.next_reply = (index + 1) % MAX_TARGETS;
                         return Ok(AttachmentReply {
                             inner: Arc::downgrade(&self.inner),
@@ -1541,6 +1700,11 @@ impl CaptureEpochChange {
                 .map(Arc::downgrade)
                 .unwrap_or_default(),
         };
+        // Binding makes rollback impossible. Only now retire an unattached
+        // predecessor queue; a positive pre-establish rollback keeps it intact.
+        if let Some(previous) = &self.previous_config {
+            state.retire_unattached_bridge(previous);
+        }
         self.inner.publish(&state);
         self.inner.replies.notify_one();
         Ok(receipt)
@@ -1604,6 +1768,11 @@ impl Drop for CaptureEpochChange {
     fn drop(&mut self) {
         if !self.completed {
             (epoch_revoker(&self.inner, self.session, self.generation))();
+            // The failed transaction also owns an unattached predecessor's
+            // pending data. It is no longer reachable through current capture.
+            if let Some(previous) = &self.previous_config {
+                previous.bridge.retire();
+            }
         }
     }
 }
@@ -1611,6 +1780,65 @@ impl Drop for CaptureEpochChange {
 impl Drop for CaptureLease {
     fn drop(&mut self) {
         self.retire();
+    }
+}
+
+impl PendingIngress {
+    pub fn try_send(&mut self) -> Result<(), AttachmentError> {
+        let inner = self.inner.upgrade().ok_or(AttachmentError::Closed)?;
+        let state = inner.state.lock().expect("attachment state");
+        if state.closed {
+            return Err(AttachmentError::Closed);
+        }
+        let current = state
+            .capture
+            .as_ref()
+            .and_then(|capture| capture.owner.as_ref())
+            .and_then(|owner| owner.capability().sink());
+        let attached = state
+            .attempts
+            .iter()
+            .flatten()
+            .any(|attempt| Arc::ptr_eq(&attempt.bridge, &self.bridge));
+        if !current.is_some_and(|sink| sink.same_sink(&self.sink))
+            || (!attached
+                && matches!(
+                    &*self.request.status.borrow(),
+                    RequestStatus::Cancelled | RequestStatus::Failed(_)
+                ))
+        {
+            return Err(AttachmentError::Stale);
+        }
+        let mut queues = self.bridge.queues.lock().expect("attachment queues");
+        if queues.retired || queues.generation != self.generation {
+            return Err(AttachmentError::Stale);
+        }
+        if self.packet.is_none() {
+            return Err(AttachmentError::Closed);
+        }
+        if queues.outbound.len() == PACKET_CAPACITY {
+            return Err(AttachmentError::Full);
+        }
+        queues
+            .outbound
+            .push_back(self.packet.take().ok_or(AttachmentError::Closed)?);
+        self.bridge.outbound.notify_one();
+        Ok(())
+    }
+    pub async fn send(&mut self) -> Result<(), AttachmentError> {
+        let mut changed = self.bridge.changed.subscribe();
+        loop {
+            match self.try_send() {
+                Err(AttachmentError::Full) => {}
+                result => return result,
+            }
+            #[cfg(test)]
+            self.bridge.before_wait();
+            changed
+                .changed()
+                .await
+                .map_err(|_| AttachmentError::Closed)?;
+        }
     }
 }
 
@@ -1623,7 +1851,7 @@ fn enqueue(
     if !attempt.owner.capability().current() {
         return Err(AttachmentError::OrdinaryUnready);
     }
-    let mut queues = attempt.queues.lock().expect("attachment queues");
+    let mut queues = attempt.bridge.queues.lock().expect("attachment queues");
     let length = if outbound {
         queues.outbound.len()
     } else {
@@ -1632,14 +1860,12 @@ fn enqueue(
     if length == PACKET_CAPACITY {
         return Err(AttachmentError::Full);
     }
-    let packet = attempt
-        .owner
-        .capability()
-        .packet(RelayBuffer::copy_from(bytes, inner.application.as_ref())?)?;
+    let bytes = RelayBuffer::copy_from(bytes, inner.application.as_ref())?;
     if outbound {
-        queues.outbound.push_back(packet);
-        attempt.outbound.notify_one();
+        queues.outbound.push_back(bytes);
+        attempt.bridge.outbound.notify_one();
     } else {
+        let packet = attempt.owner.capability().packet(bytes)?;
         queues.inbound.push_back(packet);
         inner.replies.notify_one();
     }
@@ -1647,6 +1873,21 @@ fn enqueue(
 }
 
 impl AttemptControl {
+    pub async fn ready(&self) -> Result<(), AttachmentError> {
+        let mut changed = self.attempt.bridge.changed.subscribe();
+        loop {
+            if !self.live() {
+                return Err(AttachmentError::Stale);
+            }
+            if self.current() {
+                return Ok(());
+            }
+            changed
+                .changed()
+                .await
+                .map_err(|_| AttachmentError::Closed)?;
+        }
+    }
     /// Private control may run while ordinary authority is still Pending.
     pub fn live(&self) -> bool {
         !*self.attempt.cancelled.borrow()
@@ -1657,8 +1898,8 @@ impl AttemptControl {
     pub fn current(&self) -> bool {
         self.capability().current()
     }
-    /// Called by the transport owner after installing the real carrier and
-    /// authenticating connectivity. Capture readiness is checked again here.
+    /// Called by the transport owner at actual carrier start, independently of
+    /// connectivity/Up. Capture readiness is checked again here.
     pub fn activate(&self) -> Result<(), AttachmentError> {
         self.activate_checked(None)
     }
@@ -1682,6 +1923,8 @@ impl AttemptControl {
             return Err(AttachmentError::CaptureUnready);
         }
         self.attempt.owner.activate()?;
+        self.attempt.bridge.outbound.notify_one();
+        self.attempt.bridge.wake();
         inner.publish(&state);
         Ok(())
     }
@@ -1716,20 +1959,23 @@ impl Drop for AttemptControl {
 impl TransportReceive {
     pub async fn recv(&mut self) -> Result<RelayPacket, AttachmentError> {
         loop {
-            let wake = self.control.attempt.outbound.notified();
+            let wake = self.control.attempt.bridge.outbound.notified();
             if *self.control.attempt.cancelled.borrow() {
                 return Err(AttachmentError::Stale);
             }
-            if let Some(packet) = self
-                .control
-                .attempt
-                .queues
-                .lock()
-                .expect("attachment queues")
-                .outbound
-                .pop_front()
+            if self.control.current()
+                && let Some(packet) = self
+                    .control
+                    .attempt
+                    .bridge
+                    .queues
+                    .lock()
+                    .expect("attachment queues")
+                    .outbound
+                    .pop_front()
             {
-                return Ok(packet);
+                self.control.attempt.bridge.wake();
+                return self.control.capability().packet(packet).map_err(Into::into);
             }
             wake.await;
         }
@@ -1737,6 +1983,24 @@ impl TransportReceive {
 }
 
 impl TransportSend {
+    /// Already-owned return bytes wait for capacity or exact retirement. A watch
+    /// subscription precedes the locked recheck, so dequeue/close cannot be lost.
+    pub async fn send_packet(&self, packet: RelayPacket) -> Result<(), AttachmentError> {
+        let mut changed = self.control.attempt.bridge.changed.subscribe();
+        let mut packet = Some(packet);
+        loop {
+            match self.enqueue_return_ref(&mut packet) {
+                Err(AttachmentError::Full | AttachmentError::OrdinaryUnready) => {}
+                result => return result,
+            }
+            #[cfg(test)]
+            self.control.attempt.bridge.before_wait();
+            changed
+                .changed()
+                .await
+                .map_err(|_| AttachmentError::Closed)?;
+        }
+    }
     /// Move already-accounted output without copying it out of its attempt.
     /// The broker still checks the exact queue owner.
     pub fn try_send_packet(&self, packet: RelayPacket) -> Result<(), AttachmentError> {
@@ -1750,6 +2014,9 @@ impl TransportSend {
         self.enqueue_return(packet)
     }
     fn enqueue_return(&self, packet: RelayPacket) -> Result<(), AttachmentError> {
+        self.enqueue_return_ref(&mut Some(packet))
+    }
+    fn enqueue_return_ref(&self, packet: &mut Option<RelayPacket>) -> Result<(), AttachmentError> {
         let inner = self
             .control
             .inner
@@ -1762,19 +2029,31 @@ impl TransportSend {
         {
             return Err(AttachmentError::Stale);
         }
+        if !packet
+            .as_ref()
+            .ok_or(AttachmentError::Closed)?
+            .view()
+            .attempt()
+            .same_attempt(&self.control.capability())
+        {
+            return Err(AttachmentError::Stale);
+        }
         if !self.control.current() {
             return Err(AttachmentError::OrdinaryUnready);
         }
         let mut queues = self
             .control
             .attempt
+            .bridge
             .queues
             .lock()
             .expect("attachment queues");
         if queues.inbound.len() == PACKET_CAPACITY {
             return Err(AttachmentError::Full);
         }
-        queues.inbound.push_back(packet);
+        queues
+            .inbound
+            .push_back(packet.take().expect("owned return"));
         inner.replies.notify_one();
         Ok(())
     }

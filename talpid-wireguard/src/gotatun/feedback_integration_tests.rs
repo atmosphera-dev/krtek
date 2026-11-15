@@ -123,6 +123,7 @@ impl GatedTunnel {
             .await
             .unwrap();
         pair.owner.installed();
+        pair.owner.activate().unwrap();
         Self {
             device,
             owner: pair.owner,
@@ -193,6 +194,137 @@ async fn inject(input: &mpsc::Sender<Packet<Ip>>, bytes: &[u8]) {
         .await
         .unwrap();
 }
+#[cfg(unix)]
+#[tokio::test]
+async fn pressure_preserves_ordinary_and_private_consumer_progress() {
+    use futures::FutureExt;
+    use talpid_tunnel::packet_attachment::PACKET_CAPACITY;
+    use talpid_types::relay_flow::RelayTargetId;
+    let (broker, root, credit) = broker();
+    let mut config = config();
+    let (remote, mut observations, _) = remote_controlled(&mut config, false).await;
+    let pending = projected(&broker, &config);
+    let capture = bind(&broker);
+    let mut started = GotaTun::new(
+        PlaintextSource::Managed(pending),
+        Arc::new(NoopBypass),
+        None,
+        &config,
+        None,
+        String::new(),
+    )
+    .await
+    .unwrap();
+    // Real carrier ordinary output starts before connectivity/Up is evaluated.
+    let early = packet(&config, false, 17, b"carrier-before-Up", false, false);
+    capture.try_send(&early).unwrap();
+    assert_eq!(
+        observed(&mut observations).await,
+        packet(&config, false, 17, b"carrier-before-Up", true, false)
+    );
+    assert_eq!(capture_bytes(&capture).await, application_reply(&early));
+    started.shutdown().await;
+    drop(started);
+    let pending = projected(&broker, &config);
+    capture
+        .acknowledge_request(&broker.pending_request().unwrap())
+        .unwrap();
+    let client = GatedTunnel::new(pending, &config).await;
+    let mut check = client.check().await;
+    let (pending_return, return_waiting) = tokio::sync::oneshot::channel();
+    *client.owner.return_pending.lock().unwrap() = Some(pending_return);
+    client.gate.enabled.store(true, Ordering::Release);
+    let held = packet(&config, false, 17, b"held-native-handoff", false, false);
+    capture.try_send(&held).unwrap();
+    client.gate.held_after(0).await;
+    for index in 0..PACKET_CAPACITY {
+        capture
+            .try_send(&packet(
+                &config,
+                false,
+                17,
+                &index.to_be_bytes(),
+                false,
+                false,
+            ))
+            .unwrap();
+    }
+    let nonce = packet(
+        &config,
+        false,
+        17,
+        b"capacity-plus-one-terminal-nonce",
+        false,
+        false,
+    );
+    let mut selected = capture.ingress(RelayTargetId::MULLVAD, &nonce).unwrap();
+    assert!(selected.send().now_or_never().is_none());
+    local_progress(&capture.capability().unwrap());
+    client.gate.enabled.store(false, Ordering::Release);
+    client.gate.permits.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(2), selected.send())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        observed(&mut observations).await,
+        packet(&config, false, 17, b"held-native-handoff", true, false)
+    );
+    // Hold the capture return consumer until its bounded bridge is saturated;
+    // the already-owned extra return must survive without false send success.
+    for index in 0..PACKET_CAPACITY {
+        assert_eq!(
+            observed(&mut observations).await,
+            packet(&config, false, 17, &index.to_be_bytes(), true, false)
+        );
+    }
+    assert_eq!(
+        observed(&mut observations).await,
+        packet(
+            &config,
+            false,
+            17,
+            b"capacity-plus-one-terminal-nonce",
+            true,
+            false
+        )
+    );
+    tokio::time::timeout(Duration::from_secs(2), return_waiting)
+        .await
+        .expect("owned native return never waited for capacity")
+        .unwrap();
+    assert_eq!(capture_bytes(&capture).await, application_reply(&held));
+    for index in 0..PACKET_CAPACITY {
+        assert_eq!(
+            capture_bytes(&capture).await,
+            application_reply(&packet(
+                &config,
+                false,
+                17,
+                &index.to_be_bytes(),
+                false,
+                false
+            ))
+        );
+    }
+    assert_eq!(capture_bytes(&capture).await, application_reply(&nonce));
+    let prior = client.owner.ledger.lock().unwrap().highest;
+    assert!(check.establish_connectivity(&client).await.unwrap());
+    private_done(&client.owner, prior).await;
+    local_progress(&capture.capability().unwrap());
+    drop(selected);
+    client.shutdown().await;
+    drop(check);
+    capture.retire();
+    drop(capture);
+    assert_eq!(credit.used(), 0);
+    remote.stop().await;
+    // Root retains the fixed regions while broker lives; all packet bytes refund.
+    drop(broker);
+    drop(credit);
+    assert_eq!(root.used(), 0);
+}
+
 #[cfg(unix)]
 fn local_progress(session: &talpid_types::relay_flow::RelayCapture) {
     let sink = session.sink().unwrap();

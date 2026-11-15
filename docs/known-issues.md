@@ -68,6 +68,12 @@ Each issue in this document should provide, at least, the following:
   ESP tunnel mode and UDP NAT-T retain their ordinary paths. Unknown active
   routing formats and fragmented ICMP errors missing required rewrite fields
   likewise cannot be mapped statelessly; no fragment state or reassembly is added.
+* Capture ingress shares one ordered descriptor. When the bounded ordinary
+  bridge and its one pending selection are exhausted, later Local ingress must
+  wait for capacity or retirement. Before that limit, ordinary pre-carrier data
+  does not stall Local. Available Local/private/ordinary output and cancellation
+  remain scheduled; exhausted native return storage can also backpressure later
+  decrypted packets, as with a blocked native TUN write.
 
 ### Potential leaks just after macOS boot
 

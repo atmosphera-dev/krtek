@@ -281,7 +281,7 @@ impl<A: LocalAuthority> Forwarder<A> {
         // Both queues, one token/encoder peak and a receive scratch are funded
         // before startup. They cannot compete with newly admitted input bytes.
         let replies = region(&*buffers, REPLY_STORAGE_BYTES)?;
-        let input = region(&*buffers, 2 * (MAX_PACKET_SIZE + BUFFER_OVERHEAD))?;
+        let input = region(&*buffers, MAX_PACKET_SIZE + BUFFER_OVERHEAD)?;
         let scratch_charge = buffers
             .try_reserve(MAX_PACKET_SIZE + BUFFER_OVERHEAD)
             .map_err(|_| Refused::Full)?;
@@ -331,15 +331,6 @@ impl<A: LocalAuthority> Forwarder<A> {
             self.mtu = mtu;
         }
         Ok(())
-    }
-
-    /// Precharged capture scratch, kept by the frontend through its read loop.
-    pub fn read_buffer(&self) -> Result<RelayBuffer, Refused> {
-        let charge = self
-            .input
-            .try_reserve(MAX_PACKET_SIZE + BUFFER_OVERHEAD)
-            .map_err(|_| Refused::Full)?;
-        RelayBuffer::from_reservation(vec![0; MAX_PACKET_SIZE], charge).map_err(|_| Refused::Full)
     }
 
     fn flow_storage(&self, transport: Transport) -> Result<FlowStorage, Refused> {

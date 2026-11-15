@@ -324,6 +324,23 @@ is optional: an assignment without IPv4 still supports ordinary IPv6, while a
 private send truthfully reports address unavailable. Peer statistics, not private
 probe replies, continue to determine connectivity.
 
+The exact attached carrier admits ordinary traffic when GotaTun starts, before
+connectivity and obfuscator commitment publish Up. Before carrier start, the
+request owns the same bounded outbound bridge that the carrier will consume.
+Ordinary ingress is retained there without blocking later Local ingress while
+capacity remains. A full bridge retains one already-read exact selection and
+stops further descriptor reads, while control, cleanup and available output keep
+running. No requested carrier means ordinary traffic stays blocked.
+
+Both bridge directions keep their 256-item bounds. Already-owned return data
+waits for queue capacity or exact retirement, with dequeue/close notifications
+registered before the locked capacity recheck. Capture owns its credited read
+scratch independently of Local. The Local receiver is constructed only on actual
+Local ingress and retained across compatible sink changes. Ordinary data never
+enters its parser or flow accounting. Unique owned backing moves to native
+handoff; retained views require a separately credited copy. Native allocations
+after handoff are outside the shared 64 MiB root and region proof.
+
 Managed daemon shutdown closes admission and joins the TSM through its own
 completion signal, not public tunnel events or physical-network updates. Local
 socket preparations and sole-fd cleanup then join before platform release. A

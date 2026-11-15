@@ -11,7 +11,9 @@ use gotatun::{
 use std::{io, time::Duration};
 use talpid_net::bypass::NoopBypass;
 use talpid_netstack::buffer_budget::BufferBudget;
-use talpid_tunnel::packet_attachment::{AttachmentBroker, AttachmentMode, CaptureLease};
+use talpid_tunnel::packet_attachment::{
+    AttachmentBroker, AttachmentError, AttachmentMode, CaptureLease,
+};
 use talpid_types::{
     net::wireguard::{PrivateKey, TunnelConfig},
     relay_flow::{RelaySources, RelayWriteOutcome},
@@ -868,8 +870,25 @@ async fn crypto(multihop: bool) {
     let owner = client.managed().unwrap();
     let (cancel, receiver) = CancelToken::new();
     let mut check = Check::new_with_smoltcp(owner.pinger().unwrap(), 0, receiver);
-    assert!(!broker.snapshot().ordinary_ready);
-    assert!(capture.try_send(&ipv4(17, b"early-must-drop")).is_err());
+    assert!(broker.snapshot().ordinary_ready);
+    let early = ipv4(17, b"carrier-before-connectivity");
+    capture.try_send(&early).unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), observed.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        early
+    );
+    let mut early_reply = capture.reply().await.unwrap();
+    assert!(matches!(
+        early_reply.write(|bytes| {
+            assert_eq!(bytes, application_reply(&early));
+            Ok(bytes.len())
+        }),
+        RelayWriteOutcome::Written
+    ));
+    drop(early_reply);
     tokio::time::timeout(
         Duration::from_secs(5),
         establish_and_observe(&mut check, &client, &owner, async { Ok(()) }),
@@ -1132,7 +1151,14 @@ async fn installed_managed_target_crosses_fd_epochs_without_reusing_the_old_rece
         tokio::time::timeout(Duration::from_secs(1), owner.cancelled())
             .await
             .unwrap();
-        assert!(capture.try_send(&ipv4(17, b"retired-target")).is_err());
+        let successor_nonce = ipv4(17, b"only-requested-successor-may-consume");
+        if retire_session {
+            assert!(capture.try_send(&successor_nonce).is_err());
+        } else {
+            // The independent successor configuration is still requested. It
+            // retains input, but cannot send it through the retired old device.
+            capture.try_send(&successor_nonce).unwrap();
+        }
         assert!(
             tokio::time::timeout(Duration::from_millis(30), observed.recv())
                 .await
@@ -1144,6 +1170,22 @@ async fn installed_managed_target_crosses_fd_epochs_without_reusing_the_old_rece
                 .is_err()
         );
         client.shutdown().await;
+        if !retire_session {
+            let receipt = successor.as_mut().unwrap().configured().await.unwrap();
+            let mut next = broker.acquire(&receipt).unwrap();
+            next.control.activate_with_receipt(&receipt).unwrap();
+            let (fd, consumer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+            tokio::time::timeout(Duration::from_secs(2), next.receive.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .handoff(|bytes| fd.send(bytes).unwrap())
+                .unwrap();
+            let mut bytes = [0; 128];
+            let count = consumer.recv(&mut bytes).unwrap();
+            assert_eq!(&bytes[..count], successor_nonce);
+            drop(next);
+        }
         let finished = change.as_mut().unwrap().finish();
         if retire_session {
             assert_eq!(
@@ -1275,10 +1317,16 @@ async fn private_matching_rejects_replay_and_does_not_claim_application_icmp() {
     let mut bad = good.clone();
     bad[69] ^= 1;
     // A malformed checksum cannot satisfy the private consumer.
-    pair.send
-        .send(Packet::<[u8]>::copy_from(&bad).try_into_ip().unwrap())
-        .await
-        .unwrap();
+    {
+        use futures::FutureExt;
+        assert!(
+            pair.send
+                .send(Packet::<[u8]>::copy_from(&bad).try_into_ip().unwrap())
+                .now_or_never()
+                .is_none(),
+            "unready ordinary return reported false success"
+        );
+    }
     assert_eq!(pair.owner.ledger.lock().unwrap().live.len(), 1);
     pair.send
         .send(Packet::<[u8]>::copy_from(&good).try_into_ip().unwrap())
@@ -1387,7 +1435,7 @@ async fn receipt_loss_and_cancel_after_authenticated_check_refuse_activation() {
                 result = &mut setup => panic!("setup ended before final barrier: {result:?}"),
                 _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("real authenticated Check did not complete"),
             }
-            assert!(!broker.snapshot().ordinary_ready);
+            assert!(broker.snapshot().ordinary_ready);
             if lose_receipt {
                 capture.retire();
             } else {

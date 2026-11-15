@@ -186,6 +186,9 @@ impl fmt::Debug for RelaySinkIdentity {
 pub struct RelaySink(Arc<RelaySinkIdentity>);
 
 impl RelaySink {
+    pub fn same_sink(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
     pub fn identity(&self) -> &RelaySinkIdentity {
         &self.0
     }
@@ -667,7 +670,8 @@ fn emit_records(records: [Option<AuthorityRecord>; MAX_TARGETS]) {
     }
 }
 
-/// Only the lifecycle owner can activate an attempt after real readiness.
+/// Only the lifecycle owner can activate an attempt at actual carrier start.
+/// This authority does not attest connectivity or publish a tunnel Up event.
 /// A packet producer receives the narrower cloneable RelayAttempt capability.
 pub struct RelayAttemptOwner(RelayAttempt);
 
@@ -789,6 +793,27 @@ pub enum RelayWriteOutcome {
 }
 
 impl RelayPacket {
+    /// Consume unique credited backing at the native boundary. Immutable views
+    /// require a separately funded copy; keep both reservations through handoff.
+    pub fn handoff_owned<T>(
+        self,
+        buffers: &dyn RelayBufferAllocator,
+        operation: impl FnOnce(Vec<u8>) -> T,
+    ) -> Result<T, RelayFlowError> {
+        if self.consumed {
+            return Err(RelayFlowError::Closed);
+        }
+        self.attempt.with_current(|| {
+            let buffer = match Arc::try_unwrap(self.storage) {
+                Ok(buffer) => buffer,
+                Err(shared) => RelayBuffer::copy_from(&shared, buffers)?,
+            };
+            let RelayBuffer { bytes, _charge } = buffer;
+            let result = operation(bytes);
+            drop(_charge);
+            Ok(result)
+        })?
+    }
     /// Mutate only through the packet's exact live authority. Unique backing
     /// stays in place; immutable views force a separately credited copy. No
     /// naked buffer or replacement attempt escapes this conversion.

@@ -1116,9 +1116,8 @@ async fn establish_and_activate<T, R>(
             return Err(CloseMsg::PingErr);
         }
         if let Some(owner) = managed {
-            owner.activate().map_err(|_| CloseMsg::PingErr)?;
             // Queue Up under the same exact authority as packet writes. A loss
-            // after activation but before publication must refuse the enqueue.
+            // after carrier start but before publication must refuse the enqueue.
             return owner
                 .publish(|| publish(result))
                 .map_err(|_| CloseMsg::PingErr);

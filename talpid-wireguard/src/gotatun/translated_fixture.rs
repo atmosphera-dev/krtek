@@ -207,11 +207,13 @@ async fn translated_singlehop_and_multihop_consumers_see_both_address_domains() 
         let owner = client.managed().unwrap();
         let (_cancel, receiver) = CancelToken::new();
         let mut check = Check::new_with_smoltcp(owner.pinger().unwrap(), 0, receiver);
-        assert!(
-            capture
-                .try_send(&packet(&config, false, 17, b"early", false, false))
-                .is_err()
+        let early = packet(&config, false, 17, b"early", false, false);
+        capture.try_send(&early).unwrap();
+        assert_eq!(
+            observed(&mut observations).await,
+            packet(&config, false, 17, b"early", true, false)
         );
+        assert_eq!(capture_bytes(&capture).await, application_reply(&early));
         establish_and_observe(&mut check, &client, &owner, async { Ok(()) })
             .await
             .unwrap();

@@ -362,6 +362,22 @@ fn udp(flow: Flow, bytes: &[u8]) -> Vec<u8> {
     .unwrap()
 }
 async fn udp_echo(ipv6: bool) -> (SocketAddr, mpsc::UnboundedReceiver<Vec<u8>>, JoinHandle<()>) {
+    udp_echo_reporting(ipv6, |bytes, _| bytes).await
+}
+/// Also reports the physical sender endpoint, i.e. Local's real UDP socket.
+async fn udp_echo_with_peer(
+    ipv6: bool,
+) -> (
+    SocketAddr,
+    mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>,
+    JoinHandle<()>,
+) {
+    udp_echo_reporting(ipv6, |bytes, peer| (bytes, peer)).await
+}
+async fn udp_echo_reporting<T: Send + 'static>(
+    ipv6: bool,
+    report: fn(Vec<u8>, SocketAddr) -> T,
+) -> (SocketAddr, mpsc::UnboundedReceiver<T>, JoinHandle<()>) {
     let socket = UdpSocket::bind(if ipv6 { "[::1]:0" } else { "127.0.0.1:0" })
         .await
         .unwrap();
@@ -370,7 +386,7 @@ async fn udp_echo(ipv6: bool) -> (SocketAddr, mpsc::UnboundedReceiver<Vec<u8>>, 
     let task = tokio::spawn(async move {
         let mut bytes = vec![0; MAX_PACKET_SIZE];
         while let Ok((len, peer)) = socket.recv_from(&mut bytes).await {
-            hits.send(bytes[..len].to_vec()).unwrap();
+            hits.send(report(bytes[..len].to_vec(), peer)).unwrap();
             socket.send_to(&bytes[..len], peer).await.unwrap();
         }
     });
@@ -754,7 +770,7 @@ async fn empty_interface_loop_has_no_progress_for_one_real_second() {
     let future = tokio::spawn(async move {
         let capture = AsyncFd::new(fd.as_fd()).unwrap();
         let mut forwarder = test_forwarder(Arc::new(Authority::default()));
-        let packet = forwarder.read_buffer().unwrap();
+        let packet = read_buffer(managed::broker().capture_buffers().as_ref()).unwrap();
         let mut driven = Box::pin(drive(&capture, &mut forwarder, rx, stopped, None, packet));
         poll_fn(move |cx| {
             count.fetch_add(1, SeqCst);
@@ -790,7 +806,7 @@ async fn exhausted_input_is_consumed_without_readiness_spin_then_recovers() {
     let future = tokio::spawn(async move {
         let capture = AsyncFd::new(fd.as_fd()).unwrap();
         let terminal = {
-            let packet = forwarder.read_buffer().unwrap();
+            let packet = read_buffer(managed::broker().capture_buffers().as_ref()).unwrap();
             let mut driven = Box::pin(drive(&capture, &mut forwarder, rx, stopped, None, packet));
             poll_fn(move |cx| {
                 count.fetch_add(1, SeqCst);

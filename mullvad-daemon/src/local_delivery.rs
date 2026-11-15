@@ -420,6 +420,7 @@ impl DeliveryConfig {
         own_broker(self) && own_broker(other) && sources(self) == sources(other)
     }
 
+    #[cfg(test)]
     fn mtu(&self) -> u16 {
         self.router_config().map_or(
             talpid_tunnel::tun_provider::transport::LOCAL_ONLY_MTU,

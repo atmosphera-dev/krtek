@@ -328,6 +328,12 @@ impl GotaTun {
                     #[cfg(any(target_os = "android", test))]
                     if let Some(owner) = &managed {
                         owner.installed();
+                        if let Err(error) = owner.activate() {
+                            owner.revoke();
+                            devices.stop().await;
+                            owner.stop_after_device().await;
+                            return Err(TunnelError::FatalStartWireguardError(Box::new(error)));
+                        }
                     }
                     return Ok(Self {
                         interface_name,

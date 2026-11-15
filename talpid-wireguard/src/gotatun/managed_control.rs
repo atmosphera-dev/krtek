@@ -26,8 +26,8 @@ use talpid_netstack::{
 };
 use talpid_tunnel::{
     packet_attachment::{
-        AttachmentBroker, AttachmentError, AttemptControl, CaptureReceipt, ConfigurationRequest,
-        TransportPair, TransportReceive, TransportSend,
+        AttachmentBroker, AttemptControl, CaptureReceipt, ConfigurationRequest, TransportPair,
+        TransportReceive, TransportSend,
     },
     tun_provider::TunConfig,
 };
@@ -284,6 +284,8 @@ impl PendingManaged {
             path: Mutex::new(path),
             _storage: storage,
             installed: AtomicBool::new(false),
+            #[cfg(test)]
+            return_pending: Mutex::new(None),
         });
         Ok(ManagedPair {
             send: ManagedSend {
@@ -331,6 +333,8 @@ pub(crate) struct ManagedControl {
     path: Mutex<TargetPacketPath>,
     _storage: Option<Arc<dyn RelayBufferReservation>>,
     installed: AtomicBool,
+    #[cfg(test)]
+    return_pending: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl ManagedControl {
@@ -630,15 +634,37 @@ impl IpSend for ManagedSend {
             }
             Reply::Discard => Ok(()),
             Reply::Application => {
-                if let Ok(packet) = self.owner.translate(&bytes, Direction::Inbound) {
-                    match self.owner.ordinary_send.try_send_packet(packet) {
-                        Ok(()) => (),
-                        Err(AttachmentError::Full) => self.owner.refused(TranslationError::Full),
-                        Err(AttachmentError::OrdinaryUnready) => {
-                            self.owner.refused(TranslationError::Stale)
-                        }
-                        Err(_) => return Err(unavailable()),
+                self.owner
+                    .control
+                    .ready()
+                    .await
+                    .map_err(|_| unavailable())?;
+                match self.owner.translate(&bytes, Direction::Inbound) {
+                    Ok(packet) => {
+                        drop(bytes);
+                        let send = self.owner.ordinary_send.send_packet(packet);
+                        tokio::pin!(send);
+                        #[cfg(test)]
+                        let send = std::future::poll_fn(|cx| {
+                            let result = std::future::Future::poll(send.as_mut(), cx);
+                            if result.is_pending()
+                                && let Some(observer) = self
+                                    .owner
+                                    .return_pending
+                                    .lock()
+                                    .expect("owned return observer")
+                                    .take()
+                            {
+                                let _ = observer.send(());
+                            }
+                            result
+                        });
+                        send.await.map_err(|_| unavailable())?;
                     }
+                    Err(TranslationError::Stale) => return Err(unavailable()),
+                    // Pre-ownership validation/budget refusals are counted by
+                    // the mapper; they never masquerade as an owned queue send.
+                    Err(_) => {}
                 }
                 Ok(())
             }

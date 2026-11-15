@@ -20,6 +20,194 @@ fn assigned() -> TunConfig {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn carrier_ready_forwards_before_up_without_dropping_pending_ingress() {
+    let (platform, peer) = Platform::new();
+    let broker = broker();
+    let (mut request, config) = managed(&broker);
+    let authority = Arc::new(Authority::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let constructed = calls.clone();
+    let local_credit = Arc::new(talpid_netstack::buffer_budget::BufferBudget::new(
+        30 * 1024 * 1024,
+    ));
+    let receiver = LocalReceiver::new(move |mtu| {
+        constructed.fetch_add(1, SeqCst);
+        Forwarder::with_mtu(authority.clone(), local_credit.clone(), mtu)
+    });
+    let (_updates, updates) = watch::channel(0);
+    let mut owner =
+        FrontendOwner::start(platform.clone(), config, receiver, updates, broker.clone()).unwrap();
+    bounded(owner.ready()).await.unwrap();
+    let receipt = bounded(request.configured()).await.unwrap();
+    assert_eq!(calls.load(SeqCst), 0);
+    // Negotiation is held: no transport has acquired the requested carrier.
+    let (finish_negotiation, negotiated) = oneshot::channel();
+    let carrier_broker = broker.clone();
+    let carrier_receipt = receipt.clone();
+    let carrier = tokio::spawn(async move {
+        negotiated.await.unwrap();
+        let transport = carrier_broker.acquire(&carrier_receipt).unwrap();
+        transport
+            .control
+            .activate_with_receipt(&carrier_receipt)
+            .unwrap();
+        transport
+    });
+    let early = raw(253, b"retained-before-carrier-nonce");
+    send(&peer, &early).await;
+    for sequence in 1..crate::packet_attachment::PACKET_CAPACITY {
+        send(&peer, &raw(253, &sequence.to_be_bytes())).await;
+    }
+    let (udp_address, mut hits, echo) = udp_echo_with_peer(false).await;
+    let local = Flow {
+        source: "172.27.1.1:48100".parse().unwrap(),
+        destination: udp_address,
+        transport: Transport::Udp,
+    };
+    // The echo server records Local's physical UDP endpoint. A replacement
+    // socket for the same flow would arrive from a different endpoint.
+    send(&peer, &udp(local, b"local-udp-before-negotiation")).await;
+    let (payload, local_socket) = bounded(hits.recv()).await.unwrap();
+    assert_eq!(payload, b"local-udp-before-negotiation");
+    assert_eq!(
+        packet::parse(&bounded(receive(&peer)).await)
+            .unwrap()
+            .payload,
+        b"local-udp-before-negotiation"
+    );
+    send(&peer, &udp(local, b"local-udp-repeat-while-held")).await;
+    assert_eq!(
+        bounded(hits.recv()).await.unwrap(),
+        (b"local-udp-repeat-while-held".to_vec(), local_socket)
+    );
+    assert_eq!(
+        packet::parse(&bounded(receive(&peer)).await)
+            .unwrap()
+            .payload,
+        b"local-udp-repeat-while-held"
+    );
+    let (tcp, mut accepts, server) = tcp_echo(false).await;
+    let mut app = App::new(Flow {
+        source: "172.27.1.1:48101".parse().unwrap(),
+        destination: tcp,
+        transport: Transport::Tcp,
+    });
+    app.nonce(&peer, b"local-tcp-before-negotiation").await;
+    bounded(accepts.recv()).await.unwrap();
+    assert_eq!(calls.load(SeqCst), 1);
+    assert!(!carrier.is_finished());
+    finish_negotiation.send(()).unwrap();
+    let mut transport = bounded(carrier).await.unwrap();
+    let (writer, consumer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+    for sequence in 0..crate::packet_attachment::PACKET_CAPACITY {
+        bounded(transport.receive.recv())
+            .await
+            .unwrap()
+            .handoff(|bytes| writer.send(bytes).unwrap())
+            .unwrap();
+        let mut bytes = [0; 128];
+        let n = consumer.recv(&mut bytes).unwrap();
+        assert_eq!(
+            &bytes[..n],
+            if sequence == 0 {
+                early.clone()
+            } else {
+                raw(253, &sequence.to_be_bytes())
+            }
+        );
+    }
+    // No Up publication exists in this bridge fixture. The original Local
+    // sockets and receiver keep their identity after carrier start.
+    app.nonce(&peer, b"same-local-tcp-after-carrier").await;
+    assert!(accepts.try_recv().is_err());
+    send(&peer, &udp(local, b"same-local-udp-after-carrier")).await;
+    assert_eq!(
+        bounded(hits.recv()).await.unwrap(),
+        (b"same-local-udp-after-carrier".to_vec(), local_socket)
+    );
+    assert_eq!(calls.load(SeqCst), 1);
+    let reply = bounded(receive(&peer)).await;
+    assert_eq!(
+        packet::parse(&reply).unwrap().payload,
+        b"same-local-udp-after-carrier"
+    );
+    request.cancel();
+    send(&peer, &raw(253, b"no-request-must-not-escape")).await;
+    send(&peer, &udp(local, b"local-without-request")).await;
+    assert_eq!(
+        bounded(hits.recv()).await.unwrap().0,
+        b"local-without-request"
+    );
+    let reply = bounded(receive(&peer)).await;
+    assert_eq!(
+        packet::parse(&reply).unwrap().payload,
+        b"local-without-request"
+    );
+    assert!(transport.receive.recv().await.is_err());
+    request.transport_joined();
+    owner.stop().await.unwrap();
+    echo.abort();
+    server.abort();
+
+    // An armed receiver-construction failure is not an ordinary startup
+    // dependency. Rules-off classification never invokes the Local factory.
+    let (platform, peer) = Platform::new();
+    let broker = self::broker();
+    let (mut request, mut config) = managed(&broker);
+    let enabled = Arc::new(AtomicBool::new(false));
+    let policy = enabled.clone();
+    if let CaptureConfig::Secured { disposition, .. } = &mut config {
+        *disposition = Arc::new(move |destination| {
+            if policy.load(SeqCst) && destination.is_loopback() {
+                CaptureDisposition::Local
+            } else {
+                CaptureDisposition::Tunnel(talpid_types::relay_flow::RelayTargetId::MULLVAD)
+            }
+        });
+    }
+    let failures = Arc::new(AtomicUsize::new(0));
+    let seen = failures.clone();
+    let receiver = LocalReceiver::<Authority>::new(move |_| {
+        seen.fetch_add(1, SeqCst);
+        Err(Refused::Full)
+    });
+    let (_updates, updates) = watch::channel(0);
+    let mut owner =
+        FrontendOwner::start(platform, config, receiver, updates, broker.clone()).unwrap();
+    bounded(owner.ready()).await.unwrap();
+    let receipt = request.configured().await.unwrap();
+    let mut transport = broker.acquire(&receipt).unwrap();
+    transport.control.activate().unwrap();
+    let nonce = raw(253, b"ordinary-with-Local-failure-armed");
+    send(&peer, &nonce).await;
+    assert_eq!(
+        bounded(transport.receive.recv())
+            .await
+            .unwrap()
+            .view()
+            .bytes(),
+        nonce
+    );
+    assert_eq!(failures.load(SeqCst), 0);
+    enabled.store(true, SeqCst);
+    send(&peer, &udp(local, b"Local-demand-construction-fails")).await;
+    send(&peer, &nonce).await;
+    assert_eq!(
+        bounded(transport.receive.recv())
+            .await
+            .unwrap()
+            .view()
+            .bytes(),
+        nonce
+    );
+    assert_eq!(failures.load(SeqCst), 1);
+    assert_eq!(*owner.state().borrow(), FrontendState::Running);
+    request.cancel();
+    request.transport_joined();
+    owner.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_platform_setup_retains_exact_release_owner() {
     use futures::FutureExt;
     let (platform, mut peers) = super::handover::EpochPlatform::new();
@@ -826,14 +1014,23 @@ async fn local_and_raw_consumers_share_capture_without_denied_local_fallback() {
     bounded(owner.ready()).await.unwrap();
     let receipt = bounded(request.configured()).await.unwrap();
     let mut transport = broker.acquire(&receipt).unwrap();
-    // An installed but unauthenticated carrier cannot replay ordinary input.
-    send(&peer, &raw(1, b"pending-dropped")).await;
+    // Pending carrier input is retained, but cannot reach its consumer yet.
+    let early = raw(1, b"pending-retained");
+    send(&peer, &early).await;
     assert!(
         tokio::time::timeout(Duration::from_millis(50), transport.receive.recv())
             .await
             .is_err()
     );
     transport.control.activate().unwrap();
+    assert_eq!(
+        bounded(transport.receive.recv())
+            .await
+            .unwrap()
+            .view()
+            .bytes(),
+        early
+    );
     let (address, mut hits, echo) = udp_echo(false).await;
     let local = Flow {
         source: "172.27.1.1:48000".parse().unwrap(),
@@ -1108,7 +1305,7 @@ async fn blocked_raw_output_retains_credit_is_idle_and_responds_to_loss_and_stop
             }
             filled_tx.send(filled).unwrap();
             let mut forwarder = managed_forwarder(Arc::new(Authority::default()));
-            let packet = forwarder.read_buffer().unwrap();
+            let packet = read_buffer(broker.capture_buffers().as_ref()).unwrap();
             let terminal = {
                 let mut driven = Box::pin(drive(
                     &capture,
