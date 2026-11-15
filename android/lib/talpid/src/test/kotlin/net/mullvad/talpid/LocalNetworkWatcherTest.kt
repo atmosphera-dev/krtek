@@ -157,12 +157,16 @@ class LocalNetworkWatcherTest {
             assertEquals(1, pushes.size)
             val oldCallback = source.event
             watcher.stop()
-            assertFalse(watcher.attach(2))
+            assertTrue(watcher.attach(2))
+            assertTrue(watcher.detach(2))
             watcher.start()
             oldCallback(LocalNetworkEvent.Available(10, false))
             assertTrue(watcher.attach(2))
             runCurrent()
-            assertEquals(listOf(1L, 2L), pushes.map { it.first })
+            assertEquals(
+                listOf(1L, 2L),
+                pushes.filter { it.second.observerRunning }.map { it.first },
+            )
             assertTrue(pushes.last().second.sequence > pushes.first().second.sequence)
             assertTrue(pushes.last().second.networks.isEmpty())
             watcher.stop()
@@ -171,15 +175,87 @@ class LocalNetworkWatcherTest {
     @Test
     fun `should disable only the watcher on subscription failure`() = runTest {
         val source = FakeSource().apply { fail = true }
+        val pushes = mutableListOf<LocalNetworkSnapshot>()
         val watcher =
             LocalNetworkWatcher(source, backgroundScope, StandardTestDispatcher(testScheduler)) {
                 _,
-                _ ->
-                error("Unexpected push")
+                value ->
+                pushes += value
             }
         watcher.start()
-        assertFalse(watcher.attach(1))
+        assertTrue(watcher.attach(1))
         assertEquals(1, source.stops)
+        runCurrent()
+        assertFalse(pushes.single().observerRunning)
+        watcher.stop()
+    }
+
+    @Test
+    fun `should observe only while policy or editor demands Local state`() = runTest {
+        val source = FakeSource()
+        val pushes = mutableListOf<LocalNetworkSnapshot>()
+        val watcher =
+            LocalNetworkWatcher(source, backgroundScope, StandardTestDispatcher(testScheduler)) {
+                _,
+                value ->
+                pushes += value
+            }
+        val demand = LocalNetworkDemand { if (it) watcher.start() else watcher.stop() }
+        assertTrue(watcher.attach(1))
+        demand.policy(false)
+        demand.editor(false)
+        runCurrent()
+        assertEquals(0, source.accessReads)
+        assertEquals(0, source.identityReads)
+        assertTrue(source.flags.isEmpty())
+        assertFalse(pushes.last().observerRunning)
+        demand.policy(true)
+        runCurrent()
+        assertEquals(1, source.flags.size)
+        demand.editor(true)
+        demand.policy(false)
+        assertEquals(1, source.flags.size)
+        assertTrue(pushes.last().observerRunning)
+        source.failStop = true
+        demand.editor(false)
+        assertFalse(pushes.last().observerRunning)
+        val reads = source.accessReads to source.identityReads
+        source.changed()
+        runCurrent()
+        assertEquals(reads, source.accessReads to source.identityReads)
+    }
+
+    @Test
+    fun `should reject stale callbacks and require fresh state after demand resumes`() = runTest {
+        val source = FakeSource()
+        val pushes = mutableListOf<LocalNetworkSnapshot>()
+        val watcher =
+            LocalNetworkWatcher(source, backgroundScope, StandardTestDispatcher(testScheduler)) {
+                _,
+                value ->
+                pushes += value
+            }
+        assertTrue(watcher.attach(7))
+        watcher.start()
+        source.emit(LocalNetworkEvent.Available(9, false))
+        runCurrent()
+        val old = source.event
+        val oldSequence = pushes.last().sequence
+        source.onStop = { assertFalse(pushes.last().observerRunning) }
+        watcher.stop()
+        assertEquals(
+            LocalSocketPreparation.INACTIVE,
+            watcher.withCurrentNetwork(9, oldSequence, false) { error("stopped authority") },
+        )
+        old(LocalNetworkEvent.Update(9) { error("stopped callback read identity") })
+        watcher.start()
+        old(LocalNetworkEvent.Available(99, false))
+        old(LocalNetworkEvent.Update(9) { error("old epoch read identity") })
+        runCurrent()
+        assertTrue(pushes.last().networks.isEmpty())
+        assertTrue(pushes.last().sequence > oldSequence)
+        assertTrue(source.flags.size == 2)
+        source.onStop = {}
         watcher.stop()
     }
 
@@ -203,6 +279,17 @@ class LocalNetworkWatcherTest {
         assertTrue(Modifier.isNative(published.modifiers))
         assertTrue(Modifier.isStatic(published.modifiers))
         assertEquals(Void.TYPE, published.returnType)
+        assertEquals(
+            Boolean::class.javaPrimitiveType,
+            service
+                .getDeclaredMethod(
+                    "setLocalNetworkPolicyDemand",
+                    Long::class.javaPrimitiveType,
+                    Long::class.javaPrimitiveType,
+                    Boolean::class.javaPrimitiveType,
+                )
+                .returnType,
+        )
         assertEquals(
             Long::class.javaPrimitiveType,
             LocalNetworkSnapshot::class.java.getDeclaredMethod("getSequence").returnType,
@@ -307,8 +394,15 @@ class LocalNetworkWatcherTest {
         val flags = mutableListOf<Boolean>()
         var stops = 0
         var fail = false
+        var failStop = false
+        var accessReads = 0
+        var identityReads = 0
+        var onStop: () -> Unit = {}
 
-        override fun readAccess(): LocalIdentityAccess = access
+        override fun readAccess(): LocalIdentityAccess {
+            accessReads++
+            return access
+        }
 
         override fun network(handle: Long): Network? = null
 
@@ -324,13 +418,18 @@ class LocalNetworkWatcherTest {
         }
 
         override fun stop() {
+            onStop()
             stops++
+            if (failStop) throw SecurityException()
         }
 
         override fun withLegacyIdentity(
             networks: List<LocalPhysicalNetwork>,
             allowed: Boolean,
-        ): List<LocalPhysicalNetwork> = networks
+        ): List<LocalPhysicalNetwork> {
+            identityReads++
+            return networks
+        }
 
         fun emit(value: LocalNetworkEvent) = event(value)
     }

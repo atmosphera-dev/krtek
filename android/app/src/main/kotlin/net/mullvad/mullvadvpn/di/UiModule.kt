@@ -88,7 +88,6 @@ import net.mullvad.mullvadvpn.lib.repository.ProblemReportRepository
 import net.mullvad.mullvadvpn.lib.repository.RelayListFilterRepository
 import net.mullvad.mullvadvpn.lib.repository.RelayListRepository
 import net.mullvad.mullvadvpn.lib.repository.RelayOverridesRepository
-import net.mullvad.mullvadvpn.lib.repository.SettingsRepository
 import net.mullvad.mullvadvpn.lib.repository.SplashCompleteRepository
 import net.mullvad.mullvadvpn.lib.repository.SplitTunnelingRepository
 import net.mullvad.mullvadvpn.lib.repository.VoucherRepository
@@ -158,7 +157,6 @@ val uiModule = module {
     single { androidContext().contentResolver }
 
     single { ChangelogRepository(get(), get(), get()) }
-    single { SettingsRepository(get()) }
     single {
         ProblemReportRepository(
             context = androidContext(),

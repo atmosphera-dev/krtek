@@ -2,6 +2,158 @@ use crate::types::{FromProtobufTypeError, proto};
 use mullvad_types::{constraints::Constraint, settings::CURRENT_SETTINGS_VERSION};
 use talpid_error::ErrorExt;
 
+/// A client read is not a trusted daemon policy or a mutation. Unrepresentable
+/// Local bytes remain at this boundary without poisoning ordinary settings.
+#[derive(Clone)]
+pub struct LocalPolicyRead {
+    pub policy: Option<mullvad_types::settings::local_network_access::LocalNetworkAccess>,
+    raw: Option<proto::LocalNetworkAccess>,
+}
+
+impl LocalPolicyRead {
+    pub fn raw(&self) -> Option<&proto::LocalNetworkAccess> {
+        self.raw.as_ref()
+    }
+    fn from_wire(raw: Option<proto::LocalNetworkAccess>) -> Self {
+        let policy = match raw.as_ref() {
+            None => Some(Default::default()),
+            Some(wire) => super::local_network_access::read_local_policy(wire.clone()).ok(),
+        };
+        Self {
+            raw: raw.filter(|_| policy.is_none()),
+            policy,
+        }
+    }
+}
+
+impl std::fmt::Debug for LocalPolicyRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.policy {
+            Some(policy) => std::fmt::Debug::fmt(policy, f),
+            None => f.write_str("LocalNetworkAccess(unavailable)"),
+        }
+    }
+}
+
+/// The ordinary projection has the same client-facing fields as upstream. It is
+/// deliberately not deserializable/persistable as daemon settings.
+#[derive(Clone)]
+pub struct SettingsRead {
+    pub relay_settings: mullvad_types::relay_constraints::RelaySettings,
+    pub obfuscation_settings: mullvad_types::relay_constraints::ObfuscationSettings,
+    pub custom_lists: mullvad_types::custom_list::CustomListsSettings,
+    pub api_access_methods: mullvad_types::access_method::Settings,
+    pub update_default_location: bool,
+    pub allow_lan: bool,
+    pub local_network_access: LocalPolicyRead,
+    #[cfg(not(target_os = "android"))]
+    pub lockdown_mode: bool,
+    pub auto_connect: bool,
+    pub tunnel_options: mullvad_types::settings::TunnelOptions,
+    pub relay_overrides: Vec<mullvad_types::relay_constraints::RelayOverride>,
+    pub show_beta_releases: bool,
+    #[cfg(any(windows, target_os = "android", target_os = "macos"))]
+    pub split_tunnel: mullvad_types::settings::SplitTunnelSettings,
+    pub settings_version: mullvad_types::settings::SettingsVersion,
+    pub recents: Option<mullvad_types::settings::Recents>,
+    #[cfg(not(target_os = "android"))]
+    pub rollout_threshold_seed: Option<u32>,
+}
+
+impl std::fmt::Debug for SettingsRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("Settings");
+        debug
+            .field("relay_settings", &self.relay_settings)
+            .field("obfuscation_settings", &self.obfuscation_settings)
+            .field("custom_lists", &self.custom_lists)
+            .field("api_access_methods", &self.api_access_methods)
+            .field("update_default_location", &self.update_default_location)
+            .field("allow_lan", &self.allow_lan)
+            .field("local_network_access", &self.local_network_access);
+        #[cfg(not(target_os = "android"))]
+        debug.field("lockdown_mode", &self.lockdown_mode);
+        debug
+            .field("auto_connect", &self.auto_connect)
+            .field("tunnel_options", &self.tunnel_options)
+            .field("relay_overrides", &self.relay_overrides)
+            .field("show_beta_releases", &self.show_beta_releases);
+        #[cfg(any(windows, target_os = "android", target_os = "macos"))]
+        debug.field("split_tunnel", &self.split_tunnel);
+        debug
+            .field("settings_version", &self.settings_version)
+            .field("recents", &self.recents);
+        #[cfg(not(target_os = "android"))]
+        debug.field("rollout_threshold_seed", &self.rollout_threshold_seed);
+        debug.finish()
+    }
+}
+
+impl SettingsRead {
+    pub fn get_relay_settings(&self) -> mullvad_types::relay_constraints::RelaySettings {
+        self.relay_settings.clone()
+    }
+
+    /// Explicit adapter for consumers that require the entire typed policy.
+    /// Ordinary settings readers need not call this and never inherit its error.
+    pub fn into_representable_settings(
+        self,
+    ) -> Result<mullvad_types::settings::Settings, FromProtobufTypeError> {
+        Ok(mullvad_types::settings::Settings {
+            relay_settings: self.relay_settings,
+            obfuscation_settings: self.obfuscation_settings,
+            custom_lists: self.custom_lists,
+            api_access_methods: self.api_access_methods,
+            update_default_location: self.update_default_location,
+            allow_lan: self.allow_lan,
+            local_network_access: self.local_network_access.policy.ok_or_else(|| {
+                FromProtobufTypeError::invalid_argument("Local policy read unavailable")
+            })?,
+            #[cfg(not(target_os = "android"))]
+            lockdown_mode: self.lockdown_mode,
+            auto_connect: self.auto_connect,
+            tunnel_options: self.tunnel_options,
+            relay_overrides: self.relay_overrides,
+            show_beta_releases: self.show_beta_releases,
+            #[cfg(any(windows, target_os = "android", target_os = "macos"))]
+            split_tunnel: self.split_tunnel,
+            settings_version: self.settings_version,
+            recents: self.recents,
+            #[cfg(not(target_os = "android"))]
+            rollout_threshold_seed: self.rollout_threshold_seed,
+        })
+    }
+}
+
+impl TryFrom<proto::Settings> for SettingsRead {
+    type Error = FromProtobufTypeError;
+    fn try_from(mut wire: proto::Settings) -> Result<Self, Self::Error> {
+        let local_network_access = LocalPolicyRead::from_wire(wire.local_network_access.take());
+        let settings = mullvad_types::settings::Settings::try_from(wire)?;
+        Ok(Self {
+            relay_settings: settings.relay_settings,
+            obfuscation_settings: settings.obfuscation_settings,
+            custom_lists: settings.custom_lists,
+            api_access_methods: settings.api_access_methods,
+            update_default_location: settings.update_default_location,
+            allow_lan: settings.allow_lan,
+            local_network_access,
+            #[cfg(not(target_os = "android"))]
+            lockdown_mode: settings.lockdown_mode,
+            auto_connect: settings.auto_connect,
+            tunnel_options: settings.tunnel_options,
+            relay_overrides: settings.relay_overrides,
+            show_beta_releases: settings.show_beta_releases,
+            #[cfg(any(windows, target_os = "android", target_os = "macos"))]
+            split_tunnel: settings.split_tunnel,
+            settings_version: settings.settings_version,
+            recents: settings.recents,
+            #[cfg(not(target_os = "android"))]
+            rollout_threshold_seed: settings.rollout_threshold_seed,
+        })
+    }
+}
+
 impl From<&mullvad_types::settings::Settings> for proto::Settings {
     fn from(settings: &mullvad_types::settings::Settings) -> Self {
         #[cfg(any(windows, target_os = "android", target_os = "macos"))]
@@ -154,7 +306,7 @@ impl TryFrom<proto::Settings> for mullvad_types::settings::Settings {
             allow_lan: settings.allow_lan,
             local_network_access: settings
                 .local_network_access
-                .map(TryInto::try_into)
+                .map(super::local_network_access::read_local_policy)
                 .transpose()?
                 .unwrap_or_default(),
             #[cfg(not(target_os = "android"))]

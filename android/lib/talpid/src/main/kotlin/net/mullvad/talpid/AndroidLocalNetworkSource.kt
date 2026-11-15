@@ -217,14 +217,18 @@ internal class AndroidLocalNetworkSource(private val context: Context) : LocalNe
                         LocalNetworkWatcher.ETHERNET
                     else -> 0
                 }
-            val identity =
-                if (
-                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-                        transport == LocalNetworkWatcher.WIFI
-                )
-                    platformSsid((capabilities.transportInfo as? WifiInfo)?.ssid)?.encodedBytes()
-                else null
             return LocalNetworkEvent.Update(network.networkHandle) {
+                // The watcher applies this callback only under its current
+                // demand/epoch lock. A queued callback after stop must not even
+                // read the identity, rather than reading it and discarding it.
+                val identity =
+                    if (
+                        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                            transport == LocalNetworkWatcher.WIFI
+                    )
+                        platformSsid((capabilities.transportInfo as? WifiInfo)?.ssid)
+                            ?.encodedBytes()
+                    else null
                 it.copy(transport = transport, capabilitiesFresh = true, ssidHex = identity)
             }
         }

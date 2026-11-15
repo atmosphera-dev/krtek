@@ -4,9 +4,15 @@ import java.net.InetAddress
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import net.mullvad.mullvadvpn.lib.grpc.ManagementService
 import net.mullvad.mullvadvpn.lib.model.Constraint
 import net.mullvad.mullvadvpn.lib.model.CustomDnsOptions
@@ -27,6 +33,18 @@ class SettingsRepository(
 ) {
     val localNetworkStatus
         get() = managementService.localNetworkStatus
+
+    private val localEditors = MutableStateFlow(0)
+    val localNetworkEditorDemand: Flow<Boolean> = localEditors.map { it > 0 }.distinctUntilChanged()
+
+    suspend fun observeLocalNetworkForEditor(): Nothing {
+        localEditors.update { it + 1 }
+        try {
+            awaitCancellation()
+        } finally {
+            localEditors.update { it - 1 }
+        }
+    }
 
     val settingsUpdates: StateFlow<Settings?> =
         managementService.settings.stateIn(

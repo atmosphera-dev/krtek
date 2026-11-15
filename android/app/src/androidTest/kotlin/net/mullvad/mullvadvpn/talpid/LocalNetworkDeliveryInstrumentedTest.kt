@@ -196,7 +196,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                 Consumer().use { consumer ->
                     consumer.identity()
                     val configured =
-                        checkNotNull(repository.settingsUpdates.value).localNetworkAccess
+                        checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
                     val forwarding =
                         expectation
                             ?: if (
@@ -236,7 +236,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         ruleState: LocalRuleState?,
         expectedTunnel: String = args.getString("krtek_expect_tunnel", "Disconnected"),
     ): LocalNetworkStatus = runBlocking {
-        val policy = checkNotNull(repository.settingsUpdates.value).localNetworkAccess
+        val policy = checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
         val peerRuleIds =
             policy.rules
                 .filter { it.enabled && it.cidrs.any { cidr -> cidr.toString() == "$peer/32" } }
@@ -958,7 +958,7 @@ class LocalNetworkDeliveryInstrumentedTest {
             consumer,
             repository,
             connection ->
-            val original = checkNotNull(repository.settingsUpdates.value).localNetworkAccess
+            val original = checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
             val policy = peerPolicy()
             try {
                 setPolicy(repository, policy)
@@ -1021,7 +1021,7 @@ class LocalNetworkDeliveryInstrumentedTest {
     ) =
         withConsumer(null, testTimeout = consumerCaseTimeout()) { consumer, repository, connection
             ->
-            val original = checkNotNull(repository.settingsUpdates.value).localNetworkAccess
+            val original = checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
             val policy = peerPolicy()
             val timeline = File(target.filesDir, "krtek-probes/${UUID.randomUUID()}-states.jsonl")
             timeline.parentFile?.mkdirs()
@@ -1104,7 +1104,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         )
         val config =
             appliedConfiguration(
-                checkNotNull(repository.settingsUpdates.value).localNetworkAccess,
+                checkNotNull(repository.settingsUpdates.value?.localNetworkAccess),
                 ForwardingAvailability.Active,
                 "Connected",
                 fixedCapture = true,
@@ -1169,7 +1169,7 @@ class LocalNetworkDeliveryInstrumentedTest {
             assertTrue(error.errorState.isBlocking)
             report("parameter_error_observed", "NoMatchingRelay")
             appliedConfiguration(
-                checkNotNull(repository.settingsUpdates.value).localNetworkAccess,
+                checkNotNull(repository.settingsUpdates.value?.localNetworkAccess),
                 ForwardingAvailability.Active,
                 "Error",
                 fixedCapture = true,
@@ -1671,7 +1671,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         policy: LocalNetworkAccess,
         block: () -> Unit,
     ) = runBlocking {
-        val original = checkNotNull(repository.settingsUpdates.value).localNetworkAccess
+        val original = checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
         try {
             assertTrue(repository.setLocalNetworkAccess(policy, original).isRight())
             withTimeout(10_000) {
@@ -1679,7 +1679,7 @@ class LocalNetworkDeliveryInstrumentedTest {
             }
             block()
         } finally {
-            val current = checkNotNull(repository.settingsUpdates.value).localNetworkAccess
+            val current = checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
             check(current == original || current == policy) { "Concurrent configuration retained" }
             if (current != original)
                 assertTrue(repository.setLocalNetworkAccess(original, current).isRight())
@@ -1868,7 +1868,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                 val state = withTimeout(30_000) { connection.tunnelState.first() }
                 assertTrue(state is TunnelState.Connected)
             }
-            val policy = checkNotNull(repository.settingsUpdates.value).localNetworkAccess
+            val policy = checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
             val forwarding =
                 if (policy.enabled && policy.rules.any { it.enabled && it.cidrs.isNotEmpty() })
                     ForwardingAvailability.Active
@@ -2023,7 +2023,7 @@ class LocalNetworkDeliveryInstrumentedTest {
             consumer.identity()
             awaitState(repository, connection, forwarding, ruleState)
             appliedConfiguration(
-                checkNotNull(repository.settingsUpdates.value).localNetworkAccess,
+                checkNotNull(repository.settingsUpdates.value?.localNetworkAccess),
                 forwarding,
             )
             if (transport == "exit-check") {
@@ -2065,7 +2065,7 @@ class LocalNetworkDeliveryInstrumentedTest {
 
     private fun setPolicy(repository: SettingsRepository, policy: LocalNetworkAccess) =
         runBlocking {
-            val current = checkNotNull(repository.settingsUpdates.value).localNetworkAccess
+            val current = checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
             assertTrue(repository.setLocalNetworkAccess(policy, current).isRight())
             withTimeout(10_000) {
                 repository.settingsUpdates.first { it?.localNetworkAccess == policy }
@@ -2093,7 +2093,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         block: (Consumer, SettingsRepository, ConnectionProxy, LocalNetworkAccess) -> Unit,
     ) =
         withConsumer(null, testTimeout = testTimeout) { consumer, repository, connection ->
-            val original = checkNotNull(repository.settingsUpdates.value).localNetworkAccess
+            val original = checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
             val policy = peerPolicy()
             try {
                 setPolicy(repository, policy)
@@ -2138,7 +2138,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         connection: ConnectionProxy,
         previousGeneration: String? = null,
     ): AppliedCapture {
-        val policy = checkNotNull(repository.settingsUpdates.value).localNetworkAccess
+        val policy = checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
         awaitState(
             repository,
             connection,
@@ -2164,7 +2164,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         repository: SettingsRepository,
         connection: ConnectionProxy,
     ): AppliedCapture {
-        val policy = checkNotNull(repository.settingsUpdates.value).localNetworkAccess
+        val policy = checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
         awaitState(repository, connection, ForwardingAvailability.Off, null, "Connected")
         consumer.identity()
         val config = appliedConfiguration(policy, ForwardingAvailability.Off, "Connected")

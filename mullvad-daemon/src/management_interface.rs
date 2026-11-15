@@ -290,7 +290,10 @@ impl ManagementService for ManagementServiceImpl {
             .policy
             .ok_or_else(|| Status::invalid_argument("missing local network policy"))?
             .try_into()?;
-        let expected = update.expected.map(TryInto::try_into).transpose()?;
+        let expected = update
+            .expected
+            .map(types::local_policy_for_compare_set)
+            .transpose()?;
         log::debug!("set_local_network_access");
         let (tx, rx) = oneshot::channel();
         self.send_command_to_daemon(DaemonCommand::SetLocalNetworkAccess(tx, policy, expected))?;

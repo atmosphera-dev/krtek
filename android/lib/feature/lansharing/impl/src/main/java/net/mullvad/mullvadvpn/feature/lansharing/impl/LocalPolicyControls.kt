@@ -33,31 +33,43 @@ internal fun LocalPolicyControls(state: LocalNetworkSharingUiState, actions: Loc
         Modifier.fillMaxWidth().padding(bottom = Dimens.screenBottomMarginNew),
         verticalArrangement = Arrangement.spacedBy(Dimens.smallPadding),
     ) {
-        LocalPolicyHeader(state) { if (it) confirmEnable = true else actions.onEnabled(false) }
-        if (state.saving) {
-            Text(stringResource(R.string.local_access_saving))
-        } else if (state.editor.draft == null) {
-            state.error?.let { Text(stringResource(it), color = MaterialTheme.colorScheme.error) }
-            if (state.policy.rules.isEmpty()) Text(stringResource(R.string.local_access_empty))
-            state.policy.rules.forEach { rule ->
-                LocalRuleRow(
-                    rule = rule,
-                    condition = state.status?.rules?.find { it.id == rule.id }?.state,
-                    onEdit = { actions.onEdit(rule) },
-                    onDelete = { actions.onRequestDelete(rule) },
-                    onRequestAccess = { actions.onRequestAccess(rule.ssidIds.isNotEmpty()) },
-                )
-                HorizontalDivider()
-            }
-            PrimaryButton(
-                text = stringResource(R.string.local_access_add_rule),
-                onClick = { actions.onEdit(null) },
+        if (!state.policyEditable) {
+            Text(
+                stringResource(
+                    if (state.policyReadable) R.string.local_access_policy_invalid
+                    else R.string.local_access_policy_unreadable
+                ),
+                color = MaterialTheme.colorScheme.error,
             )
         } else {
-            LocalRuleEditorControls(state, actions)
+            LocalPolicyHeader(state) { if (it) confirmEnable = true else actions.onEnabled(false) }
+            if (state.saving) {
+                Text(stringResource(R.string.local_access_saving))
+            } else if (state.editor.draft == null) {
+                state.error?.let {
+                    Text(stringResource(it), color = MaterialTheme.colorScheme.error)
+                }
+                if (state.policy.rules.isEmpty()) Text(stringResource(R.string.local_access_empty))
+                state.policy.rules.forEach { rule ->
+                    LocalRuleRow(
+                        rule = rule,
+                        condition = state.status?.rules?.find { it.id == rule.id }?.state,
+                        onEdit = { actions.onEdit(rule) },
+                        onDelete = { actions.onRequestDelete(rule) },
+                        onRequestAccess = { actions.onRequestAccess(rule.ssidIds.isNotEmpty()) },
+                    )
+                    HorizontalDivider()
+                }
+                PrimaryButton(
+                    text = stringResource(R.string.local_access_add_rule),
+                    onClick = { actions.onEdit(null) },
+                )
+            } else {
+                LocalRuleEditorControls(state, actions)
+            }
         }
     }
-    if (confirmEnable) {
+    if (confirmEnable && state.policyEditable) {
         LocalPolicyConfirmation(
             title = R.string.local_access_enable_title,
             confirm = R.string.enable,
@@ -70,21 +82,31 @@ internal fun LocalPolicyControls(state: LocalNetworkSharingUiState, actions: Loc
                 stringResource(state.confirmationMessage(), stringResource(R.string.app_name)),
         )
     }
-    state.deleteTarget?.let { target ->
-        LocalPolicyConfirmation(
-            title = R.string.local_access_delete_title,
-            confirm = R.string.local_access_delete,
-            onConfirm = {
-                actions.onDelete(UUID.fromString(target.id))
-            },
-            onCancel = actions.onCancelDelete,
-            description =
-                stringResource(
-                    R.string.local_access_delete_description,
-                    target.displayName(stringResource(R.string.local_access_unnamed)),
-                ),
-        )
-    }
+    LocalPolicyEditConfirmations(state, actions)
+}
+
+@Composable
+private fun LocalPolicyEditConfirmations(
+    state: LocalNetworkSharingUiState,
+    actions: LocalPolicyActions,
+) {
+    state.deleteTarget
+        ?.takeIf { state.policyEditable }
+        ?.let { target ->
+            LocalPolicyConfirmation(
+                title = R.string.local_access_delete_title,
+                confirm = R.string.local_access_delete,
+                onConfirm = {
+                    actions.onDelete(UUID.fromString(target.id))
+                },
+                onCancel = actions.onCancelDelete,
+                description =
+                    stringResource(
+                        R.string.local_access_delete_description,
+                        target.displayName(stringResource(R.string.local_access_unnamed)),
+                    ),
+            )
+        }
     if (state.editor.confirmDiscard) {
         LocalPolicyConfirmation(
             title = R.string.local_access_discard_title,

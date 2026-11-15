@@ -762,7 +762,10 @@ async fn intersect_with_current_location(
 pub async fn get_all_pickable_relays(
     mullvad_client: &mut MullvadProxyClient,
 ) -> anyhow::Result<Vec<WireguardRelay>> {
-    let settings = mullvad_client.get_settings().await?;
+    let settings = mullvad_client
+        .get_settings()
+        .await?
+        .into_representable_settings()?;
     let relay_list = mullvad_client.get_relay_locations().await?;
     let relay_selector =
         mullvad_daemon_relay_selector::relay_selector::RelaySelectorIO::from_settings(
@@ -806,7 +809,10 @@ async fn get_single_relay_location_constraint(
         relay_constraints.location = location;
         Ok((exit, relay_constraints))
     }
-    let settings = mullvad_client.get_settings().await?;
+    let settings = mullvad_client
+        .get_settings()
+        .await?
+        .into_representable_settings()?;
     let relay_list = mullvad_client.get_relay_locations().await?;
     let bridge_list = mullvad_client.get_bridges().await?;
     let relay_selector = get_daemon_relay_selector(settings, relay_list, bridge_list);

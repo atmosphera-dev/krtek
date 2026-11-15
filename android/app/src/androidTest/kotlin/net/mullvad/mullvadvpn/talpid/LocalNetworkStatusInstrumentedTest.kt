@@ -48,7 +48,9 @@ class LocalNetworkStatusInstrumentedTest {
                             }
                         )
                         .localNetworkAccess
+                        .let { checkNotNull(it) }
                 assertEquals(LocalNetworkAccess(), original, "Preserve unexpected policy")
+                driver.click(target.getString(R.string.local_access_add_rule))
                 val known =
                     withTimeout(10_000) {
                             repository.localNetworkStatus.filterNotNull().first {
@@ -56,6 +58,7 @@ class LocalNetworkStatusInstrumentedTest {
                             }
                         }
                         .currentWifi as ConnectedWifi.Known
+                driver.click(target.getString(android.R.string.cancel))
                 val rule =
                     LocalBypassRule(
                         UUID.randomUUID(),

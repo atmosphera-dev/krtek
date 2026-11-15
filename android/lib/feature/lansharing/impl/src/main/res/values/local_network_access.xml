@@ -88,6 +88,10 @@
     <string name="local_access_wifi_unknown">Wi-Fi name is unavailable</string>
     <string name="local_access_multiple_networks">More than one network matches</string>
     <string name="local_access_observer_unavailable">Local network status is unavailable</string>
+    <string name="local_access_policy_unreadable">Local rules could not be read. Editing is
+    unavailable; stored rules have not been changed.</string>
+    <string name="local_access_policy_invalid">Stored Local rules are invalid. Editing is
+    unavailable; stored rules have not been changed.</string>
     <string name="local_access_waiting_status">Waiting for rule status</string>
     <string name="local_access_connected_wifi">Use connected Wi-Fi</string>
     <string name="local_access_wifi_location_off">Turn on Location to read the Wi-Fi name.</string>

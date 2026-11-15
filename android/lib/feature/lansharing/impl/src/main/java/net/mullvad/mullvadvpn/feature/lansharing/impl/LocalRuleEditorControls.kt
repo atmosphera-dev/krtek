@@ -86,10 +86,12 @@ internal fun LocalRuleEditorActions(
     ) {
         HorizontalDivider()
         state.error?.let { Text(stringResource(it), color = MaterialTheme.colorScheme.error) }
-        PrimaryButton(
-            text = stringResource(R.string.local_access_save),
-            onClick = actions.onSave,
-        )
+        if (state.policyEditable) {
+            PrimaryButton(
+                text = stringResource(R.string.local_access_save),
+                onClick = actions.onSave,
+            )
+        }
         PrimaryTextButton(
             onClick = actions.onClose,
             text = stringResource(android.R.string.cancel),

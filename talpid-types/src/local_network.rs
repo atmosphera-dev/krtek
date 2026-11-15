@@ -112,14 +112,33 @@ impl fmt::Debug for LocalPhysicalPrefix {
 pub struct LocalNetworkFeedState {
     pub latest: Option<Arc<LocalNetworkSnapshot>>,
     pub closed: bool,
+    sequence: i64,
 }
 
 /// One replaceable record, one notification receiver; no per-observation queue.
-#[derive(Debug)]
 pub struct LocalNetworkFeed {
     registration: i64,
     sender: watch::Sender<LocalNetworkFeedState>,
     receiver: Mutex<Option<watch::Receiver<LocalNetworkFeedState>>>,
+    demand: Mutex<ObservationDemand>,
+}
+
+type DemandObserver = Arc<dyn Fn(i64, bool) + Send + Sync>;
+
+#[derive(Default)]
+struct ObservationDemand {
+    sequence: i64,
+    wanted: bool,
+    observer: Option<DemandObserver>,
+}
+
+impl fmt::Debug for LocalNetworkFeed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalNetworkFeed")
+            .field("registration", &self.registration)
+            .field("state", &self.latest())
+            .finish_non_exhaustive()
+    }
 }
 
 impl LocalNetworkFeed {
@@ -132,6 +151,7 @@ impl LocalNetworkFeed {
             registration,
             sender,
             receiver: Mutex::new(Some(receiver)),
+            demand: Mutex::new(ObservationDemand::default()),
         })
     }
 
@@ -146,6 +166,39 @@ impl LocalNetworkFeed {
     /// The daemon owns this receiver. Clones of the feed cannot claim a second one.
     pub fn take_receiver(&self) -> Option<watch::Receiver<LocalNetworkFeedState>> {
         self.receiver.lock().unwrap().take()
+    }
+
+    /// The daemon owns policy demand. The optional platform callback is never
+    /// called under a feed lock and cannot turn attachment into a startup gate.
+    pub fn observe_policy_demand(&self, observer: DemandObserver) {
+        let (sequence, wanted) = {
+            let mut demand = self.demand.lock().unwrap();
+            demand.observer = Some(observer.clone());
+            (demand.sequence, demand.wanted)
+        };
+        observer(sequence, wanted);
+    }
+
+    pub fn set_policy_demand(&self, wanted: bool) {
+        let delivery = {
+            let mut demand = self.demand.lock().unwrap();
+            let wanted = wanted && !self.latest().closed;
+            if wanted == demand.wanted {
+                return;
+            }
+            demand.wanted = wanted;
+            demand.sequence = demand
+                .sequence
+                .checked_add(1)
+                .expect("Local demand sequence exhausted");
+            demand
+                .observer
+                .clone()
+                .map(|observer| (observer, demand.sequence, wanted))
+        };
+        if let Some((observer, sequence, wanted)) = delivery {
+            observer(sequence, wanted);
+        }
     }
 
     /// Optional platform registration never prevents its caller from starting the daemon.
@@ -168,19 +221,14 @@ impl LocalNetworkFeed {
             return false;
         }
         self.sender.send_if_modified(|state| {
-            if state.closed
-                || state
-                    .latest
-                    .as_ref()
-                    .is_some_and(|previous| previous.sequence >= snapshot.sequence)
-            {
+            if state.closed || state.sequence >= snapshot.sequence {
                 return false;
             }
+            state.sequence = snapshot.sequence;
             if snapshot.observer_running {
                 state.latest = Some(Arc::new(snapshot));
             } else {
                 state.latest = None;
-                state.closed = true;
             }
             true
         })
@@ -195,6 +243,7 @@ impl LocalNetworkFeed {
             state.closed = true;
             true
         });
+        self.set_policy_demand(false);
     }
 }
 
@@ -244,6 +293,34 @@ mod tests {
         assert!(!feed.publish(7, snapshot(2)));
         assert_eq!(feed.latest().latest.unwrap().sequence, 2);
         assert!(!receiver.has_changed().unwrap());
+        let mut suspended = snapshot(3);
+        suspended.observer_running = false;
+        assert!(feed.publish(7, suspended));
+        assert!(!feed.latest().closed);
+        assert!(feed.latest().latest.is_none());
+        assert!(!feed.publish(7, snapshot(2)));
+        assert!(feed.publish(7, snapshot(4)));
+        assert_eq!(feed.latest().latest.unwrap().sequence, 4);
+        let demands = Arc::new(Mutex::new(Vec::new()));
+        let recorded = demands.clone();
+        let weak = Arc::downgrade(&feed);
+        feed.set_policy_demand(true);
+        feed.observe_policy_demand(Arc::new(move |sequence, wanted| {
+            assert!(
+                weak.upgrade().unwrap().demand.try_lock().is_ok(),
+                "callback under demand lock"
+            );
+            recorded.lock().unwrap().push((sequence, wanted));
+        }));
+        feed.set_policy_demand(true);
+        feed.set_policy_demand(false);
+        feed.set_policy_demand(true);
+        feed.close();
+        feed.set_policy_demand(true);
+        assert_eq!(
+            *demands.lock().unwrap(),
+            vec![(1, true), (2, false), (3, true), (4, false)]
+        );
     }
 
     #[test]
@@ -300,9 +377,10 @@ mod tests {
                 ..LocalNetworkSnapshot::default()
             }
         ));
-        assert!(feed.latest().closed);
+        assert!(!feed.latest().closed);
         assert!(feed.latest().latest.is_none());
-        assert!(!feed.publish(7, snapshot(3)));
+        assert!(!feed.publish(7, snapshot(1)));
+        assert!(feed.publish(7, snapshot(3)));
         let invalid = LocalNetworkFeed::new(0);
         assert!(!invalid.register(|_| -> Result<bool, ()> { panic!("must not attach") }));
         assert!(invalid.latest().closed);

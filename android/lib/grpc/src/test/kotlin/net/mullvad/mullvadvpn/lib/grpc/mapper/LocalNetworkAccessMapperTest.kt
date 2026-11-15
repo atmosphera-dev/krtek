@@ -75,14 +75,14 @@ class LocalNetworkAccessMapperTest {
                 rule.copy(cidrs = emptyList()),
             )) {
             assertFailsWith<IllegalArgumentException> {
-                policy().copy(rules = listOf(invalid)).toDomain()
+                policy().copy(rules = listOf(invalid)).toDomain().fromDomain()
             }
         }
         assertFailsWith<IllegalArgumentException> {
-            policy().copy(rules = List(65) { rule }).toDomain()
+            policy().copy(rules = List(65) { rule }).toDomain().fromDomain()
         }
         assertFailsWith<IllegalArgumentException> {
-            policy().copy(rules = listOf(rule, rule)).toDomain()
+            policy().copy(rules = listOf(rule, rule)).toDomain().fromDomain()
         }
         val repeated =
             policy()
@@ -95,10 +95,31 @@ class LocalNetworkAccessMapperTest {
                             )
                         )
                 )
-        assertEquals(policy().toDomain(), repeated.toDomain())
+        assertEquals(repeated, repeated.toDomain().fromDomain())
         assertEquals(
             net.mullvad.mullvadvpn.lib.model.LocalNetworkAccess(),
             LocalNetworkAccess().toDomain(),
         )
+    }
+
+    @Test
+    fun `should keep Local read errors separate from strict mutations`() {
+        val rule = policy().rules.single()
+        for (raw in
+            listOf(
+                policy().copy(enabled = false, rules = listOf(rule.copy(cidrs = emptyList()))),
+                policy().copy(rules = listOf(rule, rule)),
+                policy().copy(rules = listOf(rule.copy(name = "x".repeat(65)))),
+            )) {
+            val read = raw.toDomain()
+            assertEquals(raw.enabled, read.enabled)
+            assertEquals(raw.rules.map { it.name }, read.rules.map { it.name })
+            kotlin.test.assertTrue(read.validationError() != null)
+            assertFailsWith<IllegalArgumentException> { read.fromDomain() }
+            assertFailsWith<IllegalArgumentException> {
+                LocalNetworkPolicyUpdate(expected = read.fromDomain())
+            }
+        }
+        assertEquals(policy(), policy().toDomain().fromDomain())
     }
 }

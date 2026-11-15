@@ -14,7 +14,8 @@ data class Settings(
     val splitTunnelSettings: SplitTunnelSettings,
     val apiAccessMethodSettings: List<ApiAccessMethodSetting>,
     val recents: Recents,
-    val localNetworkAccess: LocalNetworkAccess = LocalNetworkAccess(),
+    // Null means the Local wire policy could not be represented, never OFF/empty.
+    val localNetworkAccess: LocalNetworkAccess? = LocalNetworkAccess(),
 ) {
     companion object
 }

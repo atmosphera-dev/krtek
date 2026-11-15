@@ -30,6 +30,8 @@ internal class LocalNetworkWatcher(
     private var published: LocalNetworkSnapshot? = null
     private var worker: Job? = null
 
+    fun registered(value: Long): Boolean = synchronized(lock) { value > 0 && registration == value }
+
     fun start(): Unit =
         synchronized(lock) {
             if (running) return
@@ -37,35 +39,46 @@ internal class LocalNetworkWatcher(
             try {
                 access = source.readAccess()
                 subscribe()
-                worker =
-                    scope.launch(ioDispatcher) {
-                        for (ignored in changes) {
-                            // A suspended receiver can reserve one signal while another is pending.
-                            changes.tryReceive()
-                            deliver()
-                        }
-                    }
+                ensureWorker()
                 changed()
             } catch (_: RuntimeException) {
                 unavailable()
             }
         }
 
-    fun stop(): Unit =
-        synchronized(lock) {
-            running = false
-            epoch++
-            registration = 0
-            networks.clear()
-            source.stop()
-            worker?.cancel()
-            worker = null
-        }
+    fun stop() {
+        val revoked =
+            synchronized(lock) {
+                if (!running) return
+                running = false
+                epoch++
+                networks.clear()
+                published = null
+                pending = false
+                Triple(epoch, registration, inactiveSnapshot())
+            }
+        // Registration survives observation suspension. Revoke published physical
+        // authority before stopping the source; old callbacks retain the old epoch.
+        if (revoked.second != 0L) publish(revoked.second, revoked.third)
+        synchronized(lock) { if (epoch == revoked.first) stopSource() }
+    }
+
+    private fun ensureWorker() {
+        if (worker != null) return
+        worker =
+            scope.launch(ioDispatcher) {
+                for (ignored in changes) {
+                    changes.tryReceive()
+                    deliver()
+                }
+            }
+    }
 
     fun attach(value: Long): Boolean =
         synchronized(lock) {
-            if (!running || value <= 0 || registration != 0L) return false
+            if (value <= 0 || registration != 0L) return false
             registration = value
+            ensureWorker()
             changed()
             true
         }
@@ -133,21 +146,41 @@ internal class LocalNetworkWatcher(
         running = false
         epoch++
         networks.clear()
-        source.stop()
+        published = null
+        stopSource()
         Logger.w("Local network watcher unavailable")
+    }
+
+    private fun stopSource() {
+        try {
+            source.stop()
+        } catch (_: RuntimeException) {
+            Logger.w("Local network source cleanup unavailable")
+        }
     }
 
     private fun deliver() {
         val delivery =
             synchronized(lock) {
-                if (!running) return
-                val snapshot = observation()
+                val snapshot = if (running) observation() else inactiveSnapshot()
                 published = snapshot
                 pending = false
                 if (registration == 0L) null else registration to snapshot
             }
         delivery?.let { publish(it.first, it.second) }
     }
+
+    private fun inactiveSnapshot() =
+        LocalNetworkSnapshot(
+            ++sequence,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            arrayListOf(),
+        )
 
     private fun observation(): LocalNetworkSnapshot =
         try {
@@ -190,6 +223,33 @@ internal class LocalNetworkWatcher(
     companion object {
         const val WIFI = 1
         const val ETHERNET = 2
+    }
+}
+
+/** Serialize the two independent owners; neither can cancel the other's demand. */
+internal class LocalNetworkDemand(private val apply: (Boolean) -> Unit) {
+    private var policy = false
+    private var editor = false
+    private var wanted = false
+
+    @Synchronized
+    fun policy(value: Boolean) {
+        policy = value
+        reconcile()
+    }
+
+    @Synchronized
+    fun editor(value: Boolean) {
+        editor = value
+        reconcile()
+    }
+
+    private fun reconcile() {
+        val next = policy || editor
+        if (next != wanted) {
+            wanted = next
+            apply(next)
+        }
     }
 }
 

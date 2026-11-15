@@ -37,26 +37,47 @@ impl TryFrom<proto::LocalNetworkAccess> for LocalNetworkAccess {
     type Error = FromProtobufTypeError;
 
     fn try_from(policy: proto::LocalNetworkAccess) -> Result<Self, Self::Error> {
-        // Refuse oversized repeated fields before allocating a second policy.
-        if policy.rules.len() > MAX_RULES {
-            return Err(FromProtobufTypeError::invalid_argument(
-                "too many local rules",
-            ));
-        }
-        let mut policy = Self {
-            enabled: policy.enabled,
-            rules: policy
-                .rules
-                .into_iter()
-                .map(LocalBypassRule::try_from)
-                .collect::<Result<_, _>>()?,
-        };
-        policy
-            .validate()
-            .map_err(|error| FromProtobufTypeError::invalid_argument(error.to_string()))?;
+        let mut policy = local_policy_for_compare_set(policy)?;
         policy.deduplicate();
         Ok(policy)
     }
+}
+
+/// Strict validation without changing the caller's exact expected snapshot.
+pub fn local_policy_for_compare_set(
+    policy: proto::LocalNetworkAccess,
+) -> Result<LocalNetworkAccess, FromProtobufTypeError> {
+    // Refuse oversized repeated fields before allocating a second policy.
+    if policy.rules.len() > MAX_RULES {
+        return Err(FromProtobufTypeError::invalid_argument(
+            "too many local rules",
+        ));
+    }
+    let policy = LocalNetworkAccess {
+        enabled: policy.enabled,
+        rules: policy
+            .rules
+            .into_iter()
+            .map(LocalBypassRule::try_from)
+            .collect::<Result<_, _>>()?,
+    };
+    policy
+        .validate()
+        .map_err(|error| FromProtobufTypeError::invalid_argument(error.to_string()))?;
+    Ok(policy)
+}
+
+pub(super) fn read_local_policy(
+    policy: proto::LocalNetworkAccess,
+) -> Result<LocalNetworkAccess, FromProtobufTypeError> {
+    Ok(LocalNetworkAccess {
+        enabled: policy.enabled,
+        rules: policy
+            .rules
+            .into_iter()
+            .map(read_local_rule)
+            .collect::<Result<_, _>>()?,
+    })
 }
 
 impl TryFrom<proto::LocalBypassRule> for LocalBypassRule {
@@ -71,28 +92,32 @@ impl TryFrom<proto::LocalBypassRule> for LocalBypassRule {
                 "local rule exceeds input limits",
             ));
         }
-        Ok(Self {
-            id: super::arg_from_str(&rule.id, "invalid local rule identifier")?,
-            name: rule.name,
-            enabled: rule.enabled,
-            // Parsing errors can contain suggested addresses. Never put their
-            // payload into the RPC status or its diagnostic representation.
-            cidrs: rule
-                .cidrs
-                .into_iter()
-                .map(|text| super::arg_from_str(&text, "invalid local prefix"))
-                .collect::<Result<_, _>>()?,
-            ssid_ids: rule
-                .ssid_ids
-                .into_iter()
-                .map(|bytes| {
-                    SsidIdentity::from_bytes(bytes).ok_or_else(|| {
-                        FromProtobufTypeError::invalid_argument("invalid SSID byte identity")
-                    })
-                })
-                .collect::<Result<_, _>>()?,
-        })
+        read_local_rule(rule)
     }
+}
+
+fn read_local_rule(rule: proto::LocalBypassRule) -> Result<LocalBypassRule, FromProtobufTypeError> {
+    Ok(LocalBypassRule {
+        id: super::arg_from_str(&rule.id, "invalid local rule identifier")?,
+        name: rule.name,
+        enabled: rule.enabled,
+        // Parsing errors can contain suggested addresses. Never put their
+        // payload into the RPC status or its diagnostic representation.
+        cidrs: rule
+            .cidrs
+            .into_iter()
+            .map(|text| super::arg_from_str(&text, "invalid local prefix"))
+            .collect::<Result<_, _>>()?,
+        ssid_ids: rule
+            .ssid_ids
+            .into_iter()
+            .map(|bytes| {
+                SsidIdentity::from_bytes(bytes).ok_or_else(|| {
+                    FromProtobufTypeError::invalid_argument("invalid SSID byte identity")
+                })
+            })
+            .collect::<Result<_, _>>()?,
+    })
 }
 
 #[cfg(test)]
@@ -114,6 +139,116 @@ mod tests {
                 ssid_ids: vec![SsidIdentity::from_bytes(vec![0, 255, 65, 32]).unwrap()],
             }],
         }
+    }
+
+    #[test]
+    fn local_read_conversion_isolated_from_unrelated_settings() {
+        let base = mullvad_types::settings::Settings::default();
+        // Compare with the original settings read projection. Its existing
+        // allowed-IP normalization is not a Local-policy behavior change.
+        let base =
+            mullvad_types::settings::Settings::try_from(proto::Settings::from(&base)).unwrap();
+        let mut semantic = policy();
+        semantic.enabled = false;
+        semantic.rules[0].cidrs.clear();
+        for invalid in [
+            semantic.clone(),
+            {
+                let mut duplicate = policy();
+                duplicate.rules.push(duplicate.rules[0].clone());
+                duplicate
+            },
+            {
+                let mut long = policy();
+                long.rules[0].name = "x".repeat(65);
+                long
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+            let mut wire = proto::Settings::from(&base);
+            wire.local_network_access = Some((&invalid).into());
+            let read = crate::types::SettingsRead::try_from(wire).unwrap();
+            assert_eq!(read.relay_settings, base.relay_settings);
+            assert_eq!(read.tunnel_options, base.tunnel_options);
+            assert_eq!(read.api_access_methods, base.api_access_methods);
+            assert_eq!(read.local_network_access.policy.as_ref(), Some(&invalid));
+            assert!(read.local_network_access.raw().is_none());
+            assert_eq!(
+                read.into_representable_settings()
+                    .unwrap()
+                    .local_network_access,
+                invalid
+            );
+        }
+        let mut wire = proto::Settings::from(&base);
+        wire.local_network_access = None;
+        let absent = crate::types::SettingsRead::try_from(wire.clone()).unwrap();
+        assert_eq!(
+            absent.local_network_access.policy,
+            Some(LocalNetworkAccess::default())
+        );
+        let mut raw = proto::LocalNetworkAccess::from(&policy());
+        raw.rules[0].id = "secret-invalid-id".into();
+        wire.local_network_access = Some(raw.clone());
+        let read = crate::types::SettingsRead::try_from(wire).unwrap();
+        assert!(read.local_network_access.policy.is_none());
+        assert_eq!(read.local_network_access.raw(), Some(&raw));
+        assert_eq!(read.tunnel_options, base.tunnel_options);
+        assert!(!format!("{read:?}").contains("secret-invalid-id"));
+        assert!(read.into_representable_settings().is_err());
+        let malformed_event = crate::client::DaemonEvent::try_from(
+            proto::daemon_event::Event::LocalNetworkStatus(proto::LocalNetworkStatus::default()),
+        )
+        .unwrap();
+        assert!(matches!(
+            malformed_event,
+            crate::client::DaemonEvent::LocalNetworkStatusUnavailable
+        ));
+    }
+
+    #[test]
+    fn local_mutation_validation_and_compare_set_remain_strict() {
+        let original = policy();
+        let mut invalid = proto::LocalNetworkAccess::from(&original);
+        invalid.enabled = false;
+        invalid.rules[0].cidrs.clear();
+        for (new, expected) in [
+            (invalid.clone(), Some((&original).into())),
+            ((&original).into(), Some(invalid)),
+        ] {
+            let update = proto::LocalNetworkPolicyUpdate {
+                policy: Some(new),
+                expected,
+            };
+            let new = LocalNetworkAccess::try_from(update.policy.unwrap());
+            let expected = update
+                .expected
+                .map(local_policy_for_compare_set)
+                .transpose();
+            assert!(new.is_err() || expected.is_err());
+        }
+        let mut repeated = original.clone();
+        let prefix = repeated.rules[0].cidrs[0];
+        let ssid = repeated.rules[0].ssid_ids[0].clone();
+        repeated.rules[0].cidrs.push(prefix);
+        repeated.rules[0].ssid_ids.push(ssid);
+        let wire = proto::LocalNetworkAccess::from(&repeated);
+        assert_eq!(
+            local_policy_for_compare_set(wire.clone()).unwrap(),
+            repeated
+        );
+        assert_eq!(LocalNetworkAccess::try_from(wire).unwrap(), original);
+        assert_eq!(
+            proto::SettingsKey::from(mullvad_types::settings::SettingsKey::LocalNetworkAccess)
+                as i32,
+            13
+        );
+        let encoded = proto::Settings {
+            local_network_access: Some(Default::default()),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert_eq!(encoded, vec![0x7a, 0]); // Settings field 15, length-delimited.
     }
 
     #[test]

@@ -9,8 +9,11 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.WhileSubscribed
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -40,6 +43,14 @@ class LocalNetworkSharingViewModel(
 
     init {
         viewModelScope.launch {
+            editor
+                .map { it.draft != null }
+                .distinctUntilChanged()
+                .collectLatest { open ->
+                    if (open) settingsRepository.observeLocalNetworkForEditor()
+                }
+        }
+        viewModelScope.launch {
             combine(settingsRepository.localNetworkStatus, editor) { status, edit ->
                     status?.currentWifi to edit.waitingForWifi
                 }
@@ -60,7 +71,8 @@ class LocalNetworkSharingViewModel(
                 LocalNetworkSharingUiState(
                         lanSharingEnabled = settings.allowLan,
                         isModal = isModal,
-                        policy = settings.localNetworkAccess,
+                        policy = settings.localNetworkAccess ?: LocalNetworkAccess(),
+                        policyReadable = settings.localNetworkAccess != null,
                         status = status,
                         editor = edit,
                         saving = busy,
@@ -80,7 +92,14 @@ class LocalNetworkSharingViewModel(
     }
 
     fun edit(rule: LocalBypassRule?) {
-        if (saving.value || editor.value.draft != null) return
+        val policy = settingsRepository.settingsUpdates.value?.localNetworkAccess
+        if (
+            saving.value ||
+                editor.value.draft != null ||
+                policy == null ||
+                policy.validationError() != null
+        )
+            return
         val draft = rule?.let(LocalRuleDraft::from) ?: LocalRuleDraft(UUID.randomUUID().toString())
         setEditor(LocalEditorState(draft, draft))
         error.value = null
@@ -150,7 +169,7 @@ class LocalNetworkSharingViewModel(
         update: (LocalNetworkAccess) -> LocalNetworkAccess,
     ) {
         val current = settingsRepository.settingsUpdates.value?.localNetworkAccess
-        if (saving.value || current == null) return
+        if (saving.value || current == null || current.validationError() != null) return
         val replacement = update(current)
         if (replacement.validationError() != null) {
             error.value = R.string.local_access_invalid_rule

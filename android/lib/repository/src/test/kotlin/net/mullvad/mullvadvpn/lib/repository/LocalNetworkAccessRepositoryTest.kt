@@ -9,7 +9,9 @@ import kotlin.test.assertEquals
 import kotlin.test.assertSame
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import net.mullvad.mullvadvpn.lib.grpc.ManagementService
 import net.mullvad.mullvadvpn.lib.model.LocalNetworkAccess
@@ -17,6 +19,7 @@ import net.mullvad.mullvadvpn.lib.model.LocalNetworkStatus
 import net.mullvad.mullvadvpn.lib.model.SetLocalNetworkAccessError
 import org.junit.jupiter.api.Test
 
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class LocalNetworkAccessRepositoryTest {
     @Test
     fun `should forward expected policy and retain typed command failures`() = runTest {
@@ -37,5 +40,20 @@ class LocalNetworkAccessRepositoryTest {
             repository.setLocalNetworkAccess(policy, expected),
         )
         coVerify(exactly = 1) { service.setLocalNetworkAccess(policy, expected) }
+        // Editor lifetime is repository/controller state, not an RPC command.
+        val demands = mutableListOf<Boolean>()
+        backgroundScope.launch { repository.localNetworkEditorDemand.collect { demands += it } }
+        runCurrent()
+        assertEquals(listOf(false), demands)
+        val editorOne = backgroundScope.launch { repository.observeLocalNetworkForEditor() }
+        val editorTwo = backgroundScope.launch { repository.observeLocalNetworkForEditor() }
+        runCurrent()
+        assertEquals(listOf(false, true), demands)
+        editorOne.cancel()
+        runCurrent()
+        assertEquals(true, demands.last())
+        editorTwo.cancel()
+        runCurrent()
+        assertEquals(listOf(false, true, false), demands)
     }
 }

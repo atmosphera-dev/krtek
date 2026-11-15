@@ -821,6 +821,159 @@ mod test {
         );
     }
 
+    #[tokio::test]
+    async fn invalid_local_read_never_rewrites_stored_policy_or_blocks_other_settings() {
+        use mullvad_types::settings::local_network_access::LocalBypassRule;
+        let directory =
+            std::path::PathBuf::from(std::env::var_os("TMPDIR").expect("disk-backed TMPDIR"))
+                .join(format!("local-read-{}", rand::random::<u64>()));
+        std::fs::create_dir(&directory).unwrap();
+        let mut original = Settings::default();
+        original.allow_lan = true;
+        original.local_network_access = LocalNetworkAccess {
+            enabled: false,
+            rules: vec![LocalBypassRule {
+                id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                name: "x".repeat(65),
+                enabled: true,
+                cidrs: vec![],
+                ssid_ids: vec![],
+            }],
+        };
+        let path = directory.join(SETTINGS_FILE);
+        let bytes = serde_json::to_vec_pretty(&original).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut loaded = SettingsPersister::load(&directory).await;
+        assert_eq!(loaded.settings, original);
+        let wire = mullvad_management_interface::types::Settings::from(&loaded.settings);
+        let read = mullvad_management_interface::types::SettingsRead::try_from(wire).unwrap();
+        assert!(read.allow_lan);
+        assert_eq!(
+            read.local_network_access.policy.as_ref(),
+            Some(&original.local_network_access)
+        );
+        assert!(
+            loaded
+                .set_local_network_access(
+                    original.local_network_access.clone(),
+                    Some(original.local_network_access.clone())
+                )
+                .await
+                .is_err()
+        );
+        let mut conflicting = LocalNetworkAccess::default();
+        conflicting.enabled = true;
+        assert!(
+            loaded
+                .set_local_network_access(LocalNetworkAccess::default(), Some(conflicting))
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(loaded.settings, original);
+        assert!(
+            loaded
+                .update(|settings| settings.allow_lan = false)
+                .await
+                .unwrap()
+        );
+        let changed = std::fs::read(&path).unwrap();
+        let reread = SettingsPersister::read_only(&directory).await;
+        assert!(!reread.allow_lan);
+        assert_eq!(reread.local_network_access, original.local_network_access);
+        assert_eq!(std::fs::read(&path).unwrap(), changed);
+        // The upstream malformed-JSON path is unchanged, on a private fixture.
+        let recovered = SettingsPersister::load_inner(|| async {
+            SettingsPersister::load_from_bytes(b"not JSON")
+        })
+        .await;
+        assert!(recovered.should_save);
+        assert!(recovered.settings.lockdown_mode);
+        let feed = talpid_types::local_network::LocalNetworkFeed::new(7);
+        let demands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = demands.clone();
+        let observed_feed = std::sync::Arc::downgrade(&feed);
+        feed.observe_policy_demand(std::sync::Arc::new(move |sequence, wanted| {
+            recorded.lock().unwrap().push((sequence, wanted));
+            observed_feed.upgrade().unwrap().publish(
+                7,
+                talpid_types::local_network::LocalNetworkSnapshot {
+                    sequence: sequence + 1,
+                    observer_running: wanted,
+                    ..Default::default()
+                },
+            );
+        }));
+        let mut runtime = crate::local_network::LocalNetworkRuntime::new(
+            &LocalNetworkAccess::default(),
+            Some(feed),
+        );
+        let mut valid = original.local_network_access.clone();
+        valid.enabled = true;
+        valid.rules[0].name = "Local".into();
+        valid.rules[0].cidrs = vec!["192.168.240.0/28".parse().unwrap()];
+        let phase = crate::local_network::TunnelPhase::Disconnected;
+        let target = mullvad_types::states::TargetState::Unsecured;
+        runtime.update(&valid, target, phase).await;
+        assert!(runtime.status().observer_available);
+        valid.enabled = false;
+        runtime.update(&valid, target, phase).await;
+        assert!(!runtime.status().observer_available);
+        runtime
+            .update(
+                &LocalNetworkAccess {
+                    enabled: true,
+                    rules: vec![],
+                },
+                target,
+                phase,
+            )
+            .await;
+        valid.enabled = true;
+        runtime.update(&valid, target, phase).await;
+        runtime.begin_shutdown();
+        assert_eq!(
+            *demands.lock().unwrap(),
+            vec![(0, false), (1, true), (2, false), (3, true), (4, false)]
+        );
+        // Valid read snapshots may contain repeated entries. Expected values
+        // stay exact for CAS, while the new policy is still normalized.
+        let prefix = valid.rules[0].cidrs[0];
+        valid.rules[0].cidrs.push(prefix);
+        loaded.settings.local_network_access = valid.clone();
+        loaded.save().await.unwrap();
+        let expected =
+            mullvad_management_interface::types::local_policy_for_compare_set((&valid).into())
+                .unwrap();
+        let replacement = LocalNetworkAccess::try_from(
+            mullvad_management_interface::types::LocalNetworkAccess::from(&valid),
+        )
+        .unwrap();
+        assert!(
+            loaded
+                .set_local_network_access(replacement.clone(), Some(expected))
+                .await
+                .unwrap()
+        );
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(loaded.settings.local_network_access, replacement);
+        assert_eq!(
+            SettingsPersister::read_only(&directory)
+                .await
+                .local_network_access,
+            replacement
+        );
+        assert!(
+            loaded
+                .set_local_network_access(LocalNetworkAccess::default(), Some(valid))
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), after);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
     /// The [`SettingsPersister`] should always succeed when deserializing a
     /// [`Settings`] object from disk. However, there is a distinction between
     /// different error cases.

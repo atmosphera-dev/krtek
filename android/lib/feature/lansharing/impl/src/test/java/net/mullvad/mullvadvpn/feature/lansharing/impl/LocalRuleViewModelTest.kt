@@ -52,6 +52,10 @@ class LocalRuleViewModelTest {
         mockk<SettingsRepository> {
             every { settingsUpdates } returns settings
             every { localNetworkStatus } returns status
+            coEvery { observeLocalNetworkForEditor() } coAnswers
+                {
+                    kotlinx.coroutines.awaitCancellation()
+                }
         }
     private val handle = SavedStateHandle()
     private lateinit var viewModel: LocalNetworkSharingViewModel
@@ -66,6 +70,71 @@ class LocalRuleViewModelTest {
     @AfterEach
     fun tearDown() {
         viewModel.viewModelScope.cancel()
+    }
+
+    @Test
+    fun `should keep one editor observation lease through draft and wifi changes`() = runTest {
+        var acquired = 0
+        var released = 0
+        coEvery { repository.observeLocalNetworkForEditor() } coAnswers
+            {
+                acquired++
+                try {
+                    kotlinx.coroutines.awaitCancellation()
+                } finally {
+                    released++
+                }
+            }
+        assertFalse(checkNotNull(settings.value?.localNetworkAccess).enabled)
+        viewModel.uiState.test {
+            awaitItem()
+            viewModel.edit(null)
+            runCurrent()
+            assertEquals(1 to 0, acquired to released)
+            for (name in listOf("P", "Pr", "Printer")) {
+                viewModel.updateDraft { it.copy(name = name, addresses = "10.0.0.0/8") }
+                runCurrent()
+                assertEquals(1 to 0, acquired to released)
+            }
+            status.value =
+                LocalNetworkStatus(
+                    1u,
+                    true,
+                    ForwardingAvailability.Off,
+                    ConnectedWifi.Unknown(WifiUnknownReason.PermissionMissing),
+                    emptyList(),
+                )
+            viewModel.useConnectedWifi()
+            runCurrent()
+            assertNotNull(content().editor.wifiMessage)
+            assertEquals(1 to 0, acquired to released)
+            status.value =
+                checkNotNull(status.value)
+                    .copy(
+                        revision = 2u,
+                        currentWifi =
+                            ConnectedWifi.Known(
+                                checkNotNull(
+                                    net.mullvad.mullvadvpn.lib.model.SsidIdentity.fromBytes(
+                                        "Home".toByteArray()
+                                    )
+                                )
+                            ),
+                    )
+            runCurrent()
+            assertNull(content().editor.wifiMessage)
+            assertEquals(1 to 0, acquired to released)
+            viewModel.closeEditor()
+            runCurrent()
+            assertTrue(content().editor.confirmDiscard)
+            assertEquals(1 to 0, acquired to released)
+            viewModel.discard()
+            runCurrent()
+            assertNull(content().editor.draft)
+            assertEquals(1 to 1, acquired to released)
+            coVerify(exactly = 1) { repository.observeLocalNetworkForEditor() }
+            cancelAndIgnoreRemainingEvents()
+        }
     }
 
     @Test
@@ -215,6 +284,56 @@ class LocalRuleViewModelTest {
         runCurrent()
         coVerify(exactly = 1) {
             repository.setLocalNetworkAccess(policy.copy(enabled = true), policy)
+        }
+        val invalidRule =
+            checkNotNull(
+                    LocalRuleDraft(java.util.UUID.randomUUID().toString(), addresses = "10.0.0.0/8")
+                        .rule()
+                )
+                .copy(cidrs = emptyList())
+        viewModel.uiState.test {
+            awaitItem()
+            for (unreadable in listOf(null, LocalNetworkAccess(rules = listOf(invalidRule)))) {
+                settings.value = mockk {
+                    every { allowLan } returns true
+                    every { localNetworkAccess } returns unreadable
+                }
+                runCurrent()
+                assertTrue(content().lanSharingEnabled)
+                assertFalse(content().policyEditable)
+                viewModel.setPolicyEnabled(false)
+                viewModel.edit(null)
+                viewModel.delete(invalidRule.id)
+                runCurrent()
+                assertNull(content().editor.draft)
+            }
+            settings.value = mockk {
+                every { allowLan } returns true
+                every { localNetworkAccess } returns policy
+            }
+            runCurrent()
+            viewModel.edit(null)
+            viewModel.updateDraft { it.copy(name = "Unsaved draft") }
+            runCurrent()
+            val draft = content().editor.draft
+            settings.value = mockk {
+                every { allowLan } returns true
+                every { localNetworkAccess } returns null
+            }
+            runCurrent()
+            viewModel.closeEditor()
+            runCurrent()
+            assertFalse(content().policyEditable)
+            assertEquals(draft, content().editor.draft)
+            assertTrue(content().editor.confirmDiscard)
+            viewModel.keepEditing()
+            runCurrent()
+            assertEquals(draft, content().editor.draft)
+            viewModel.discard()
+            runCurrent()
+            assertNull(content().editor.draft)
+            coVerify(exactly = 1) { repository.setLocalNetworkAccess(any(), any()) }
+            cancelAndIgnoreRemainingEvents()
         }
     }
 

@@ -7,9 +7,13 @@ data class LocalNetworkSharingUiState(
     val lanSharingEnabled: Boolean,
     val isModal: Boolean = false,
     val policy: LocalNetworkAccess = LocalNetworkAccess(),
+    val policyReadable: Boolean = true,
     val status: LocalNetworkStatus? = null,
     val editor: LocalEditorState = LocalEditorState(),
     val saving: Boolean = false,
     val error: Int? = null,
     val deleteTarget: LocalRuleDeleteTarget? = null,
-)
+) {
+    val policyEditable: Boolean
+        get() = policyReadable && policy.validationError() == null
+}

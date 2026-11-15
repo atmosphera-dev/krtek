@@ -1,12 +1,12 @@
 //! Client that returns and takes mullvad types as arguments instead of prost-generated types
 use crate::types;
+use crate::types::SettingsRead as Settings;
 #[cfg(not(target_os = "android"))]
 use futures::{Stream, StreamExt};
 use mullvad_types::{
     access_method::AccessMethodSetting,
     device::{DeviceEvent, RemoveDeviceEvent},
     relay_list::RelayList,
-    settings::Settings,
     states::TunnelState,
     version::AppVersionInfo,
 };
@@ -50,6 +50,7 @@ pub enum DaemonEvent {
     NewAccessMethod(AccessMethodSetting),
     LeakDetected(LeakInfo),
     LocalNetworkStatus(mullvad_types::settings::local_network_access::status::LocalNetworkStatus),
+    LocalNetworkStatusUnavailable,
 }
 
 impl TryFrom<types::daemon_event::Event> for DaemonEvent {
@@ -83,10 +84,10 @@ impl TryFrom<types::daemon_event::Event> for DaemonEvent {
             types::daemon_event::Event::LeakInfo(leak) => {
                 LeakInfo::try_from(leak).map(DaemonEvent::LeakDetected)
             }
-            types::daemon_event::Event::LocalNetworkStatus(status) => status
+            types::daemon_event::Event::LocalNetworkStatus(status) => Ok(status
                 .try_into()
                 .map(DaemonEvent::LocalNetworkStatus)
-                .map_err(Error::InvalidResponse),
+                .unwrap_or(DaemonEvent::LocalNetworkStatusUnavailable)),
         }
     }
 }

@@ -1328,7 +1328,9 @@ impl Daemon {
                         break;
                     }
                 }
-                Wake::Feed => self.update_local_network_status().await,
+                // Physical/permission observations update Local authority, not
+                // retry intent for an ordinary Mullvad configuration operation.
+                Wake::Feed => self.refresh_local_network_status(false).await,
                 Wake::Broker => self.refresh_local_network_status(false).await,
                 Wake::Owner => {
                     let status = self.local_network.owner_changed(

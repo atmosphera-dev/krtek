@@ -42,13 +42,15 @@ import org.junit.jupiter.api.Test
 
 class TalpidVpnServiceFrontendTest {
     private lateinit var service: FrontendService
+    private lateinit var serviceInstance: FrontendService
 
     @BeforeEach
     fun setup() {
         mockkStatic("net.mullvad.mullvadvpn.lib.common.util.VpnServiceUtilsKt")
         mockkStatic(Looper::class)
         every { Looper.getMainLooper() } returns mockk()
-        service = spyk(FrontendService(), recordPrivateCalls = true)
+        serviceInstance = FrontendService()
+        service = spyk(serviceInstance, recordPrivateCalls = true)
         every { service getProperty "connectivityListener" } returns
             mockk<ConnectivityListener>(relaxed = true)
         every { service.prepareVpnSafe() } returns Prepared.right()
@@ -650,9 +652,26 @@ class TalpidVpnServiceFrontendTest {
             TalpidVpnService::class.java.getDeclaredField("localNetworkWatcher").apply {
                 isAccessible = true
                 set(service, fixture.watcher)
+                // spyk copies fields; the demand callback was constructed on
+                // the original instance, so both must own this same fixture.
+                set(serviceInstance, fixture.watcher)
             }
-            fixture.invoke("start")
-            fixture.invoke("attach", 1L)
+            assertTrue(service.attachLocalNetwork(1L))
+            runCurrent()
+            assertEquals(0, fixture.starts)
+            assertFalse(service.setLocalNetworkPolicyDemand(2L, 1L, true))
+            assertEquals(0, fixture.starts)
+            assertTrue(service.setLocalNetworkPolicyDemand(1L, 2L, true))
+            runCurrent()
+            assertEquals(1, fixture.starts)
+            assertTrue(service.setLocalNetworkPolicyDemand(1L, 1L, false))
+            service.setLocalNetworkEditorDemand(true)
+            assertTrue(service.setLocalNetworkPolicyDemand(1L, 3L, false))
+            assertEquals(1, fixture.starts)
+            service.setLocalNetworkEditorDemand(false)
+            assertTrue(service.setLocalNetworkPolicyDemand(1L, 4L, true))
+            runCurrent()
+            assertEquals(2, fixture.starts)
             fixture.event("Available", 9L, false)
             runCurrent()
             assertEquals(
@@ -707,6 +726,7 @@ class TalpidVpnServiceFrontendTest {
                     duplicate.close()
                 }
             } finally {
+                assertTrue(service.detachLocalNetwork(1L))
                 fixture.invoke("stop")
                 service.finishLocalFrontend(1)
                 update?.join(1000)
@@ -723,6 +743,7 @@ class TalpidVpnServiceFrontendTest {
         private val watcherType = Class.forName("net.mullvad.talpid.LocalNetworkWatcher")
         private var callback: (Any) -> Unit = {}
         var sequence = 0L
+        var starts = 0
         private val access =
             Class.forName("net.mullvad.talpid.LocalIdentityAccess")
                 .getDeclaredConstructor(*Array(5) { Boolean::class.javaPrimitiveType })
@@ -735,6 +756,7 @@ class TalpidVpnServiceFrontendTest {
                     "network" -> network
                     "withLegacyIdentity" -> args[0]
                     "start" -> {
+                        starts++
                         callback = args[1] as (Any) -> Unit
                         Unit
                     }

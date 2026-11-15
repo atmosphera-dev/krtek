@@ -316,6 +316,31 @@ Android system Connect follows the same upstream keyguard and command order even
 while a Partial, full or failed capture is retained. Capture ownership extends
 foreground service lifetime only; it never substitutes for dispatching Connect.
 
+Local status is auxiliary to the original management subscription. Its initial
+RPC or a malformed Local event can make Local unavailable without cancelling
+tunnel, account, relay or ordinary settings updates. A subscription-scoped
+revision watermark also covers malformed samples. Samples retain their exact
+subscription generation, including a reply completing after stop/start, so a late
+initial result cannot replace a newer event; the next valid sample can recover Local status.
+Policy reads retain exact representable values and their validation result.
+Unrepresentable Local protobufs stay at the management conversion boundary and
+are exposed as a Local read error, never as an OFF/empty replacement. Local
+mutations still require valid input and a valid read. Upstream disk loading,
+defaults and malformed-file recovery are unchanged.
+
+The daemon owns policy observation demand through the Local registration, not
+through cached management settings. The editor contributes a separate demand
+lease. The Local bridge registration outlives its observation demand. With Local off
+or no enabled rules and no open editor, there are no Local source subscriptions
+or Wi-Fi identity reads. Policy or editor demand starts fresh observation; the
+last demand revokes published physical authority before stopping its source.
+Old callbacks and samples cannot restore it. Capture observation and the
+upstream default-network listener retain their independent lifetimes; Local
+feed events do not grant Mullvad retry intent. Default CLI status/listen fetches
+and prints Local only for a configured policy, or an explicit `status local`
+request. Disabled configured rules remain visible; JSON/debug output retains
+its existing valid-settings representation.
+
 Native WireGuard setup stays in its caller's future and retains upstream pinger
 construction and Drop timing. Managed setup instead cancels the exact request,
 interrupts pending receipt and PQ/DAITA network waits, and joins device/platform

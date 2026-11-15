@@ -7,6 +7,7 @@ mod custom_tunnel;
 mod device;
 mod features;
 mod local_network_access;
+pub use local_network_access::local_policy_for_compare_set;
 mod local_network_status;
 mod location;
 mod logging;
@@ -15,6 +16,7 @@ pub mod relay_constraints;
 mod relay_list;
 mod relay_selector;
 mod settings;
+pub use settings::{LocalPolicyRead, SettingsRead};
 mod settings_key_list;
 #[cfg(target_os = "windows")]
 mod split_tunnel;

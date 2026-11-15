@@ -40,6 +40,11 @@ import net.mullvad.talpid.util.UnderlyingConnectivityStatusResolver
 @Suppress("TooManyFunctions")
 open class TalpidVpnService : LifecycleVpnService() {
     private lateinit var localNetworkWatcher: LocalNetworkWatcher
+    private val localNetworkDemand = LocalNetworkDemand {
+        if (it) localNetworkWatcher.start() else localNetworkWatcher.stop()
+    }
+    private val localPolicyRegistrationLock = Any()
+    private var localPolicyDemandSequence = -1L
     private val localFrontendOwnership = LocalFrontendOwnership()
     private var captureRegistration = 0L
     private val captureObservers = mutableMapOf<Long, LocalCaptureNetworkObserver>()
@@ -74,7 +79,6 @@ open class TalpidVpnService : LifecycleVpnService() {
             )
         connectivityListener.register(lifecycleScope)
         localNetworkWatcher = LocalNetworkWatcher(AndroidLocalNetworkSource(this), lifecycleScope)
-        localNetworkWatcher.start()
     }
 
     @CallSuper
@@ -86,10 +90,43 @@ open class TalpidVpnService : LifecycleVpnService() {
 
     // Used by JNI. Attach is the only way to enable native delivery.
     @Suppress("Unused")
-    fun attachLocalNetwork(registration: Long): Boolean = localNetworkWatcher.attach(registration)
+    fun attachLocalNetwork(registration: Long): Boolean =
+        synchronized(localPolicyRegistrationLock) {
+            localNetworkWatcher.attach(registration).also { attached ->
+                if (attached) {
+                    localPolicyDemandSequence = -1L
+                    localNetworkDemand.policy(false)
+                }
+            }
+        }
+
+    fun setLocalNetworkEditorDemand(demanded: Boolean) = localNetworkDemand.editor(demanded)
+
+    // Used by JNI. Policy demand comes from the daemon, never a cached UI read.
+    @Suppress("Unused")
+    fun setLocalNetworkPolicyDemand(
+        registration: Long,
+        sequence: Long,
+        demanded: Boolean,
+    ): Boolean =
+        synchronized(localPolicyRegistrationLock) {
+            if (!localNetworkWatcher.registered(registration) || sequence < 0) return false
+            if (sequence < localPolicyDemandSequence) return true
+            localPolicyDemandSequence = sequence
+            localNetworkDemand.policy(demanded)
+            true
+        }
 
     @Suppress("Unused")
-    fun detachLocalNetwork(registration: Long): Boolean = localNetworkWatcher.detach(registration)
+    fun detachLocalNetwork(registration: Long): Boolean =
+        synchronized(localPolicyRegistrationLock) {
+            localNetworkWatcher.detach(registration).also { detached ->
+                if (detached) {
+                    localPolicyDemandSequence = -1L
+                    localNetworkDemand.policy(false)
+                }
+            }
+        }
 
     @Suppress("Unused")
     fun attachCaptureNetwork(registration: Long): Boolean =

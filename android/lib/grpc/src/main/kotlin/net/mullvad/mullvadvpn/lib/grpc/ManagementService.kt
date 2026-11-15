@@ -21,6 +21,7 @@ import java.net.InetAddress
 import java.net.Proxy
 import java.util.concurrent.TimeUnit
 import kotlin.time.Duration.Companion.seconds
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -238,14 +239,59 @@ class ManagementService(
     private val _mutableSettings = MutableStateFlow<ModelSettings?>(null)
     val settings: Flow<ModelSettings> = _mutableSettings.filterNotNull()
 
+    // Raw unrepresentable Local fields stay here, not in an OFF/default policy.
+    private var unreadableLocalPolicy: mullvad_daemon.management_interface.LocalNetworkAccess? =
+        null
     private val _localNetworkStatus = MutableStateFlow<LocalNetworkStatus?>(null)
     val localNetworkStatus: StateFlow<LocalNetworkStatus?> = _localNetworkStatus.asStateFlow()
 
-    private fun acceptLocalNetworkStatus(status: LocalNetworkStatus) {
-        _localNetworkStatus.update { current ->
-            status.takeIf { current == null || status.revision >= current.revision } ?: current
+    private val localStatusLock = Any()
+    private var localStatusRevision: ULong? = null
+    private var localSubscriptionGeneration = 0L
+
+    private fun acceptLocalNetworkStatus(
+        status: mullvad_daemon.management_interface.LocalNetworkStatus,
+        subscription: Long,
+    ) {
+        val revision = status.revision.toULong()
+        synchronized(localStatusLock) {
+            if (
+                subscription != localSubscriptionGeneration ||
+                    localStatusRevision?.let { revision < it } == true
+            )
+                return
+            localStatusRevision = revision
+        }
+        // Conversion cannot hold up stop/reset. Commit only to the same live
+        // subscription and revision after decoding, including malformed samples.
+        val sample =
+            try {
+                status.toDomain()
+            } catch (_: IllegalArgumentException) {
+                Logger.w("Local network status sample unavailable")
+                unavailableLocalStatus(revision)
+            }
+        synchronized(localStatusLock) {
+            if (
+                subscription != localSubscriptionGeneration ||
+                    localStatusRevision?.let { revision < it } == true
+            )
+                return
+            _localNetworkStatus.value = sample
         }
     }
+
+    private fun unavailableLocalStatus(revision: ULong) =
+        LocalNetworkStatus(
+            revision = revision,
+            observerAvailable = false,
+            forwarding = net.mullvad.mullvadvpn.lib.model.ForwardingAvailability.NotAvailable,
+            currentWifi =
+                net.mullvad.mullvadvpn.lib.model.ConnectedWifi.Unknown(
+                    net.mullvad.mullvadvpn.lib.model.WifiUnknownReason.Pending
+                ),
+            rules = emptyList(),
+        )
 
     private val _mutableVersionInfo = MutableStateFlow<ModelAppVersionInfo?>(null)
     val versionInfo: Flow<ModelAppVersionInfo> = _mutableVersionInfo.filterNotNull()
@@ -274,8 +320,9 @@ class ManagementService(
     }
 
     fun stop() {
-        job?.cancel(message = "ManagementService stopped")
-            ?: error("ManagementService already stopped")
+        val active = job ?: error("ManagementService already stopped")
+        synchronized(localStatusLock) { localSubscriptionGeneration++ }
+        active.cancel(message = "ManagementService stopped")
         job = null
     }
 
@@ -284,7 +331,14 @@ class ManagementService(
             while (isActive) {
                 // Each subscription belongs to one daemon lifetime. Its revisions
                 // may restart below the previous daemon's last sample.
-                _localNetworkStatus.value = null
+                val subscription =
+                    synchronized(localStatusLock) {
+                        if (!isActive) return@withContext
+                        localSubscriptionGeneration++
+                        localStatusRevision = null
+                        _localNetworkStatus.value = null
+                        localSubscriptionGeneration
+                    }
                 try {
                     // Coroutine scope is used to make sure that both the event listener and the
                     // initial state fetch are done before it will loop again.
@@ -293,10 +347,10 @@ class ManagementService(
                     coroutineScope {
                         launch {
                             val channel = grpc.EventsListen().executeIn(this, Unit)
-                            channel.receiveAsFlow().collect(::handleEvent)
+                            channel.receiveAsFlow().collect { handleEvent(it, subscription) }
                         }
 
-                        getInitialServiceState()
+                        getInitialServiceState(subscription)
                     }
                 } catch (e: IOException) {
                     Logger.e("Failed to fetch subscribe to events", e)
@@ -305,7 +359,7 @@ class ManagementService(
             }
         }
 
-    private fun handleEvent(daemonEvent: DaemonEvent) {
+    private fun handleEvent(daemonEvent: DaemonEvent, subscription: Long) {
         if (extensiveLogging) {
             daemonEvent.logSafeEventSummary()
         }
@@ -318,9 +372,9 @@ class ManagementService(
             is DaemonEvent.Event.NewAccessMethod ->
                 _mutableCurrentAccessMethod.update { event.value.toDomain() }
             is DaemonEvent.Event.RelayList -> _mutableRelayList.update { event.value.toDomain() }
-            is DaemonEvent.Event.Settings -> _mutableSettings.update { event.value.toDomain() }
+            is DaemonEvent.Event.Settings -> _mutableSettings.update { readSettings(event.value) }
             is DaemonEvent.Event.LocalNetworkStatus ->
-                acceptLocalNetworkStatus(event.value.toDomain())
+                acceptLocalNetworkStatus(event.value, subscription)
             is DaemonEvent.Event.TunnelState ->
                 _mutableTunnelState.update { event.value.toDomain() }
             is DaemonEvent.Event.VersionInfo ->
@@ -379,7 +433,14 @@ class ManagementService(
     private suspend fun getTunnelState(): ModelTunnelState =
         grpc.GetTunnelState().execute(Unit).toDomain()
 
-    private suspend fun getSettings(): ModelSettings = grpc.GetSettings().execute(Unit).toDomain()
+    private fun readSettings(wire: mullvad_daemon.management_interface.Settings): ModelSettings =
+        wire.toDomain().also {
+            unreadableLocalPolicy =
+                wire.local_network_access.takeIf { _ -> it.localNetworkAccess == null }
+        }
+
+    private suspend fun getSettings(): ModelSettings =
+        readSettings(grpc.GetSettings().execute(Unit))
 
     private suspend fun getDeviceState(): ModelDeviceState =
         grpc.GetDevice().execute(Unit).toDomain()
@@ -453,14 +514,32 @@ class ManagementService(
             .onLeft { Logger.e("Get account history error") }
             .mapLeft(GetAccountHistoryError::Unknown)
 
-    private suspend fun CoroutineScope.getInitialServiceState() {
+    private suspend fun CoroutineScope.getInitialServiceState(subscription: Long) {
         Logger.d { "Fetching initial service state" }
         awaitAll(
             async { _mutableTunnelState.update { getTunnelState() } },
             async { _mutableDeviceState.update { getDeviceState() } },
             async { _mutableSettings.update { getSettings() } },
             async {
-                acceptLocalNetworkStatus(grpc.GetLocalNetworkStatus().execute(Unit).toDomain())
+                try {
+                    acceptLocalNetworkStatus(
+                        grpc.GetLocalNetworkStatus().execute(Unit),
+                        subscription,
+                    )
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    // An auxiliary RPC cannot cancel upstream's shared initial fetches/listener.
+                    // Do not erase a newer event that arrived while this request was pending.
+                    Logger.w("Initial Local network status unavailable")
+                    synchronized(localStatusLock) {
+                        if (
+                            subscription == localSubscriptionGeneration &&
+                                localStatusRevision == null
+                        )
+                            _localNetworkStatus.value = unavailableLocalStatus(0uL)
+                    }
+                }
             },
             async { _mutableVersionInfo.update { getVersionInfo().getOrNull() } },
             async { _mutableRelayList.update { getRelayList() } },
@@ -658,6 +737,10 @@ class ManagementService(
         expected: LocalNetworkAccess? = null,
     ): Either<SetLocalNetworkAccessError, Unit> =
         Either.catch {
+                val current = _mutableSettings.value?.localNetworkAccess
+                require(current != null && current.validationError() == null) {
+                    "Local policy read unavailable or invalid"
+                }
                 grpc
                     .SetLocalNetworkAccess()
                     .execute(

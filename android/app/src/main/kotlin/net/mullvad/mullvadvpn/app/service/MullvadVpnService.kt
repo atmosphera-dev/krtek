@@ -30,6 +30,7 @@ import net.mullvad.mullvadvpn.lib.model.TunnelState
 import net.mullvad.mullvadvpn.lib.pushnotification.NotificationChannelFactory
 import net.mullvad.mullvadvpn.lib.pushnotification.NotificationManager
 import net.mullvad.mullvadvpn.lib.repository.ConnectionProxy
+import net.mullvad.mullvadvpn.lib.repository.SettingsRepository
 import net.mullvad.talpid.TalpidVpnService
 import org.koin.android.ext.android.getKoin
 import org.koin.core.context.loadKoinModules
@@ -41,6 +42,7 @@ class MullvadVpnService : MullvadVpnServiceLifecycle() {
     override lateinit var keyguardManager: KeyguardManager
 
     private lateinit var managementService: ManagementService
+    private lateinit var settingsRepository: SettingsRepository
     private lateinit var migrateSplitTunneling: MigrateSplitTunneling
     private lateinit var apiEndpointFromIntentHolder: ApiEndpointFromIntentHolder
     override lateinit var connectionProxy: ConnectionProxy
@@ -58,6 +60,7 @@ class MullvadVpnService : MullvadVpnServiceLifecycle() {
             get<NotificationChannelFactory>()
 
             managementService = get()
+            settingsRepository = get()
 
             foregroundNotificationHandler =
                 ForegroundNotificationManager(this@MullvadVpnService, get())
@@ -88,6 +91,10 @@ class MullvadVpnService : MullvadVpnServiceLifecycle() {
 
         Logger.i("Start management service")
         managementService.start()
+
+        lifecycleScope.launch {
+            settingsRepository.localNetworkEditorDemand.collect(::setLocalNetworkEditorDemand)
+        }
 
         observeNonblockingErrors(managementService.tunnelState)
     }

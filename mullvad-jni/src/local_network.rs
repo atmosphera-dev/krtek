@@ -69,6 +69,43 @@ impl LocalNetworkRegistration {
             let _ = env.exception_clear();
             *ACTIVE.lock().unwrap() = None;
             log::warn!("Local network watcher registration unavailable; continuing daemon startup");
+        } else {
+            let jvm = registration.jvm.clone();
+            let service = registration.service.clone();
+            let feed = Arc::downgrade(&registration.feed);
+            let id = registration.feed.registration();
+            registration
+                .feed
+                .observe_policy_demand(Arc::new(move |sequence, wanted| {
+                    let accepted = catch_unwind(AssertUnwindSafe(|| {
+                        let Ok(env) = jvm.attach_current_thread_as_daemon() else {
+                            return false;
+                        };
+                        let result = env
+                            .call_method(
+                                service.as_obj(),
+                                "setLocalNetworkPolicyDemand",
+                                "(JJZ)Z",
+                                &[
+                                    JValue::Long(id),
+                                    JValue::Long(sequence),
+                                    JValue::Bool(u8::from(wanted)),
+                                ],
+                            )
+                            .and_then(|value| value.z());
+                        if result.is_err() {
+                            let _ = env.exception_clear();
+                        }
+                        result.unwrap_or(false)
+                    }))
+                    .unwrap_or(false);
+                    if !accepted {
+                        log::warn!("Local network policy observation unavailable");
+                        if let Some(feed) = feed.upgrade() {
+                            feed.close();
+                        }
+                    }
+                }));
         }
         registration
     }

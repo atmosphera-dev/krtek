@@ -372,8 +372,13 @@ internal fun Settings.toDomain(): ModelSettings =
         customLists = custom_lists?.custom_lists?.map { it.toDomain() }.orEmpty(),
         allowLan = allow_lan,
         localNetworkAccess =
-            local_network_access?.toDomain()
-                ?: net.mullvad.mullvadvpn.lib.model.LocalNetworkAccess(),
+            if (local_network_access == null) net.mullvad.mullvadvpn.lib.model.LocalNetworkAccess()
+            else
+                try {
+                    local_network_access.toDomain()
+                } catch (_: IllegalArgumentException) {
+                    null
+                },
         tunnelOptions = tunnel_options!!.toDomain(),
         relayOverrides = relay_overrides.map { it.toDomain() },
         showBetaReleases = show_beta_releases,

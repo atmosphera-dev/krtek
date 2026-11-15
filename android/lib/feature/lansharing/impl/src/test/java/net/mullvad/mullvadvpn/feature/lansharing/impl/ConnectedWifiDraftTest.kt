@@ -46,6 +46,10 @@ class ConnectedWifiDraftTest {
         mockk<SettingsRepository> {
             every { settingsUpdates } returns settings
             every { localNetworkStatus } returns status
+            coEvery { observeLocalNetworkForEditor() } coAnswers
+                {
+                    kotlinx.coroutines.awaitCancellation()
+                }
         }
     private lateinit var vm: LocalNetworkSharingViewModel
 

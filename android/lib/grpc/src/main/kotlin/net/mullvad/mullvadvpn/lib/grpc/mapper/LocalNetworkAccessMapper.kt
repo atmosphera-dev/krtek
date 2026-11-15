@@ -10,24 +10,12 @@ import net.mullvad.mullvadvpn.lib.model.SsidIdentity
 import okio.ByteString.Companion.toByteString
 
 internal fun LocalNetworkAccess.toDomain(): ModelLocalNetworkAccess {
-    require(rules.size <= ModelLocalNetworkAccess.MAX_RULES) { "Too many local rules" }
-    val policy = ModelLocalNetworkAccess(enabled, rules.map { it.toDomain() })
-    require(policy.validationError() == null) { "Invalid local network policy" }
-    return policy.copy(
-        rules =
-            policy.rules.map {
-                it.copy(cidrs = it.cidrs.distinct(), ssidIds = it.ssidIds.distinct())
-            }
-    )
+    // Reads preserve stored values, including semantic errors, for the editor.
+    // Only mutation serialization validates and normalizes policy.
+    return ModelLocalNetworkAccess(enabled, rules.map { it.toDomain() })
 }
 
 private fun LocalBypassRule.toDomain(): ModelLocalBypassRule {
-    require(
-        cidrs.size <= ModelLocalNetworkAccess.MAX_CIDRS_PER_RULE &&
-            ssid_ids.size <= ModelLocalNetworkAccess.MAX_SSIDS_PER_RULE
-    ) {
-        "Local rule exceeds input limits"
-    }
     return ModelLocalBypassRule(
         id = localRuleId(id),
         name = name,

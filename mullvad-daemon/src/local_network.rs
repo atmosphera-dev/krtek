@@ -195,6 +195,9 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
             excluded_packages: None,
         };
         runtime.observation = runtime.observation();
+        if let Some(feed) = &runtime.feed {
+            feed.set_policy_demand(!policy.announced_routes().is_empty());
+        }
         // Startup reconciles before exposing real delivery availability. Do not
         // project a failed/not-yet-started owner from the constructor.
         runtime.status = LocalNetworkStatus::from_observation(policy, runtime.observation.as_ref());
@@ -279,6 +282,18 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
         self.delivery
             .authority
             .update(policy, self.observation.clone());
+        if let Some(feed) = &self.feed {
+            feed.set_policy_demand(!self.shutting_down && !policy.announced_routes().is_empty());
+        }
+        // The platform may synchronously withdraw its observation on the last
+        // demand. Do not publish an old physical identity after that withdrawal.
+        let observed = self.observation();
+        if observed != self.observation {
+            self.observation = observed;
+            self.delivery
+                .authority
+                .update(policy, self.observation.clone());
+        }
         let routes = policy
             .announced_routes()
             .iter()
@@ -553,6 +568,9 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
         self.suspended = true;
         self.delivery.defer_release();
         self.delivery.authority.revoke();
+        if let Some(feed) = &self.feed {
+            feed.set_policy_demand(false);
+        }
         // Preserve provider selection through joined TSM close, including Native.
         self.broker.pause_transport();
     }

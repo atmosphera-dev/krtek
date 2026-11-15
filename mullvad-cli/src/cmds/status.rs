@@ -13,6 +13,8 @@ use crate::format;
 pub enum Status {
     /// Listen for tunnel state changes
     Listen,
+    /// Display Local network rule status, even without a configured policy
+    Local,
 }
 
 #[derive(Args, Debug)]
@@ -35,6 +37,7 @@ impl Status {
         mut rpc: MullvadProxyClient,
         args: StatusArgs,
         mut previous_tunnel_state: TunnelState,
+        mut local_configured: bool,
     ) -> Result<()> {
         let mut event_stream = rpc.events_listen().await?;
         while let Some(event) = event_stream.next().await {
@@ -46,7 +49,8 @@ impl Status {
                     }
                 }
                 DaemonEvent::Settings(settings) => {
-                    print_debug_or_json(&args, "New settings", &settings)?;
+                    local_configured = local_policy_configured(&settings.local_network_access);
+                    print_debug_or_json(&args, "New settings", &SettingsStatus(&settings))?;
                 }
                 DaemonEvent::RelayList(relay_list) => {
                     print_debug_or_json(&args, "New relay list", &relay_list)?;
@@ -64,10 +68,11 @@ impl Status {
                     print_debug_or_json(&args, "New access method", &access_method)?;
                 }
                 DaemonEvent::LocalNetworkStatus(status) => {
-                    if local_network_summary_visible(&args, &status) {
+                    if local_network_summary_visible(&args, local_configured, false) {
                         print_local_network_summary(&status);
                     }
                 }
+                DaemonEvent::LocalNetworkStatusUnavailable => {}
                 DaemonEvent::LeakDetected(leak) => {
                     #[derive(Debug, Serialize)]
                     struct Leak {
@@ -97,12 +102,28 @@ pub async fn handle(cmd: Option<Status>, args: StatusArgs) -> Result<()> {
         format::print_state(&state, None, args.verbose);
     }
 
-    if let Some(status) = local_network_snapshot(&args, rpc.get_local_network_status()).await {
+    let explicit_local = cmd == Some(Status::Local);
+    let local_configured = if args.json || args.debug {
+        false
+    } else {
+        rpc.get_settings()
+            .await
+            .ok()
+            .is_some_and(|settings| local_policy_configured(&settings.local_network_access))
+    };
+    if let Some(status) = local_network_snapshot(
+        &args,
+        local_configured,
+        explicit_local,
+        rpc.get_local_network_status(),
+    )
+    .await
+    {
         print_local_network_summary(&status);
     }
 
     if cmd == Some(Status::Listen) {
-        Status::listen(rpc, args, state).await?;
+        Status::listen(rpc, args, state, local_configured).await?;
     }
     Ok(())
 }
@@ -122,19 +143,75 @@ fn print_account_logged_out(state: &TunnelState, device: &DeviceState) {
     }
 }
 
-fn local_network_summary_visible(args: &StatusArgs, status: &LocalNetworkStatus) -> bool {
-    !args.json && !args.debug && (status.observer_available || !status.rules.is_empty())
+fn local_policy_configured(policy: &mullvad_management_interface::types::LocalPolicyRead) -> bool {
+    policy.policy.as_ref().map_or_else(
+        || {
+            policy
+                .raw()
+                .is_some_and(|raw| raw.enabled || !raw.rules.is_empty())
+        },
+        |policy| policy.enabled || !policy.rules.is_empty(),
+    )
+}
+
+/// Formatting belongs to this consumer, not to the fallible RPC read boundary.
+/// Valid settings keep the existing JSON/debug shape; unreadable Local is null,
+/// never an apparently valid OFF policy. Raw Local protobufs are not formatted.
+struct SettingsStatus<'a>(&'a mullvad_management_interface::types::SettingsRead);
+
+impl Debug for SettingsStatus<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(self.0, f)
+    }
+}
+
+impl Serialize for SettingsStatus<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let settings = self.0;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("relay_settings", &settings.relay_settings)?;
+        map.serialize_entry("obfuscation_settings", &settings.obfuscation_settings)?;
+        map.serialize_entry("custom_lists", &settings.custom_lists)?;
+        map.serialize_entry("api_access_methods", &settings.api_access_methods)?;
+        map.serialize_entry("update_default_location", &settings.update_default_location)?;
+        map.serialize_entry("allow_lan", &settings.allow_lan)?;
+        map.serialize_entry(
+            "local_network_access",
+            &settings.local_network_access.policy,
+        )?;
+        map.serialize_entry("lockdown_mode", &settings.lockdown_mode)?;
+        map.serialize_entry("auto_connect", &settings.auto_connect)?;
+        map.serialize_entry("tunnel_options", &settings.tunnel_options)?;
+        map.serialize_entry("relay_overrides", &settings.relay_overrides)?;
+        map.serialize_entry("show_beta_releases", &settings.show_beta_releases)?;
+        #[cfg(any(windows, target_os = "macos"))]
+        map.serialize_entry("split_tunnel", &settings.split_tunnel)?;
+        map.serialize_entry("settings_version", &settings.settings_version)?;
+        map.serialize_entry("recents", &settings.recents)?;
+        map.serialize_entry("rollout_threshold_seed", &settings.rollout_threshold_seed)?;
+        map.end()
+    }
+}
+
+fn local_network_summary_visible(args: &StatusArgs, configured: bool, explicit: bool) -> bool {
+    !args.json && !args.debug && (configured || explicit)
 }
 
 async fn local_network_snapshot(
     args: &StatusArgs,
+    configured: bool,
+    explicit: bool,
     fetch: impl Future<Output = mullvad_management_interface::client::Result<LocalNetworkStatus>>,
 ) -> Option<LocalNetworkStatus> {
-    if args.json || args.debug {
+    if !local_network_summary_visible(args, configured, explicit) {
         return None;
     }
     match fetch.await {
-        Ok(status) => local_network_summary_visible(args, &status).then_some(status),
+        Ok(status) => Some(status),
         Err(error) => {
             eprintln!("Warning: Failed to fetch local network status: {error}");
             None
@@ -223,8 +300,8 @@ mod tests {
                             });
                         }
                         assert_eq!(
-                            local_network_summary_visible(&args, &status),
-                            !json && !debug && (observer || rules)
+                            local_network_summary_visible(&args, rules, false),
+                            !json && !debug && rules
                         );
                     }
                 }
@@ -239,7 +316,7 @@ mod tests {
             debug: false,
             json: false,
         };
-        let result = local_network_snapshot(&args, async {
+        let result = local_network_snapshot(&args, true, false, async {
             Err(mullvad_management_interface::Error::MissingDaemonEvent)
         })
         .await;
@@ -255,12 +332,66 @@ mod tests {
                 json,
             };
             assert!(
-                local_network_snapshot(&args, async {
+                local_network_snapshot(&args, true, true, async {
                     panic!("structured output must not fetch a text-only summary")
                 })
                 .await
                 .is_none()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn local_status_visibility_requires_configuration_or_explicit_request() {
+        let original = mullvad_types::settings::Settings::default();
+        let original = mullvad_types::settings::Settings::try_from(
+            mullvad_management_interface::types::Settings::from(&original),
+        )
+        .unwrap();
+        let read = mullvad_management_interface::types::SettingsRead::try_from(
+            mullvad_management_interface::types::Settings::from(&original),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&SettingsStatus(&read)).unwrap(),
+            serde_json::to_string(&original).unwrap()
+        );
+        assert_eq!(format!("{read:#?}"), format!("{original:#?}"));
+        for json in [false, true] {
+            for debug in [false, true] {
+                for configured in [false, true] {
+                    for explicit in [false, true] {
+                        let args = StatusArgs {
+                            verbose: false,
+                            debug,
+                            json,
+                        };
+                        let called = std::cell::Cell::new(false);
+                        let visible = !json && !debug && (configured || explicit);
+                        let status = local_network_snapshot(&args, configured, explicit, async {
+                            called.set(true);
+                            Ok(LocalNetworkStatus::from_observation(
+                                &LocalNetworkAccess::default(),
+                                None,
+                            ))
+                        })
+                        .await;
+                        assert_eq!(called.get(), visible);
+                        assert_eq!(status.is_some(), visible);
+                    }
+                }
+            }
+        }
+        let mut wire = mullvad_management_interface::types::Settings::from(
+            &mullvad_types::settings::Settings::default(),
+        );
+        wire.local_network_access = Some(mullvad_management_interface::types::LocalNetworkAccess {
+            enabled: false,
+            rules: vec![Default::default()],
+        });
+        let read = mullvad_management_interface::types::SettingsRead::try_from(wire).unwrap();
+        assert!(local_policy_configured(&read.local_network_access));
+        let output = serde_json::to_value(SettingsStatus(&read)).unwrap();
+        assert!(output["local_network_access"].is_null());
     }
 }
