@@ -394,8 +394,8 @@ class LocalNetworkDeliveryInstrumentedTest {
                             "Healthy system Connect retains the exact capture",
                         )
                         assertTrue(
-                            events.since(duplicateStart).isEmpty(),
-                            "Acknowledged healthy system Connect must publish no transition",
+                            events.lifecycleSince(duplicateStart).isEmpty(),
+                            "Acknowledged healthy system Connect must publish no lifecycle transition",
                         )
                         report(
                             "system_connect_ack",
@@ -483,7 +483,10 @@ class LocalNetworkDeliveryInstrumentedTest {
     }
 
     private fun transitionsUntil(events: OrderedTunnelEvents, start: Int, last: String) =
-        events.since(start).map { it.javaClass.simpleName }.let { it.take(it.indexOf(last) + 1) }
+        events
+            .lifecycleSince(start)
+            .map { it.javaClass.simpleName }
+            .let { it.take(it.indexOf(last) + 1) }
 
     /**
      * Rules-off parity with upstream 8fcbcd553e on the preserved device settings (no MTU override,
@@ -596,8 +599,8 @@ class LocalNetworkDeliveryInstrumentedTest {
             apply(change, settled)
             SystemClock.sleep(3_000)
             assertTrue(
-                events.since(start).isEmpty(),
-                "$label: an equivalent setting publishes no transition",
+                events.lifecycleSince(start).isEmpty(),
+                "$label: an equivalent setting publishes no lifecycle transition",
             )
             assertEquals(
                 current,
@@ -860,9 +863,13 @@ class LocalNetworkDeliveryInstrumentedTest {
     }
 
     private fun awaitOrderedConnected(events: OrderedTunnelEvents, start: Int) = run {
-        awaitOrderedEvent(events, start, 90_000) { it is RpcTunnelState.State.Connected }
+        runBlocking {
+            withTimeout(90_000) {
+                events.awaitLifecycle(start) { it is RpcTunnelState.State.Connected }
+            }
+        }
         assertTrue(
-            events.since(start).any { it is RpcTunnelState.State.Connecting },
+            events.lifecycleSince(start).any { it is RpcTunnelState.State.Connecting },
             "Command must reach Connecting",
         )
     }
@@ -893,6 +900,12 @@ class LocalNetworkDeliveryInstrumentedTest {
             return records.drop(start)
         }
 
+        @Synchronized
+        fun lifecycleSince(start: Int): List<RpcTunnelState.State> {
+            failure?.let { throw it }
+            return TunnelLifecycleTransitions.since(records, start) { it.javaClass }
+        }
+
         fun append(state: RpcTunnelState.State): Int {
             val index =
                 synchronized(this) {
@@ -910,6 +923,10 @@ class LocalNetworkDeliveryInstrumentedTest {
 
         suspend fun await(start: Int, matches: (RpcTunnelState.State) -> Boolean) {
             while (since(start).none(matches)) changed.receive()
+        }
+
+        suspend fun awaitLifecycle(start: Int, matches: (RpcTunnelState.State) -> Boolean) {
+            while (lifecycleSince(start).none(matches)) changed.receive()
         }
     }
 
