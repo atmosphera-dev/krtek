@@ -7,6 +7,7 @@ import android.content.ClipboardManager
 import android.content.Intent
 import android.graphics.Rect
 import android.os.Bundle
+import android.os.Looper
 import android.view.accessibility.AccessibilityNodeInfo
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
@@ -26,6 +27,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.runner.lifecycle.ActivityLifecycleCallback
 import androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry
 import androidx.test.runner.lifecycle.Stage
+import java.security.MessageDigest
 import java.util.ArrayDeque
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
@@ -47,6 +49,7 @@ import net.mullvad.mullvadvpn.lib.repository.ProblemReportRepository
 import net.mullvad.mullvadvpn.lib.repository.SettingsRepository
 import net.mullvad.mullvadvpn.lib.ui.resource.R as CommonR
 import net.mullvad.mullvadvpn.lib.usecase.SupportIssueUseCase
+import org.json.JSONObject
 import org.junit.jupiter.api.Test
 import org.koin.android.ext.android.getKoin
 
@@ -142,7 +145,7 @@ class LocalNetworkEditorInstrumentedTest {
             node?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true,
             "Rendered editor action was not clickable",
         )
-        instrumentation.waitForIdleSync()
+        ExternalUiActionCompletion.settle(instrumentation::waitForIdleSync, compose::waitForIdle)
     }
 
     private fun field(tag: String): AccessibilityNodeInfo {
@@ -331,9 +334,25 @@ class LocalNetworkEditorInstrumentedTest {
         val repository = koin.get<ProblemReportRepository>()
         val support = koin.get<SupportIssueUseCase>()
         val original = repository.problemReport.value.description
-        val clipboard = target.getSystemService(ClipboardManager::class.java)
+        lateinit var clipboard: ClipboardManager
         var savedClip: ClipData? = null
-        instrumentation.runOnMainSync { savedClip = clipboard.primaryClip?.let { ClipData(it) } }
+        fun requireFocusedApp() {
+            check(Looper.myLooper() == Looper.getMainLooper())
+            val activity =
+                ActivityLifecycleMonitorRegistry.getInstance()
+                    .getActivitiesInStage(Stage.RESUMED)
+                    .filterIsInstance<MainActivity>()
+                    .single()
+            check(activity.hasWindowFocus()) { "Owned app window must have clipboard input focus" }
+        }
+        instrumentation.runOnMainSync {
+            requireFocusedApp()
+            clipboard =
+                checkNotNull(
+                    target.applicationContext.getSystemService(ClipboardManager::class.java)
+                )
+            savedClip = clipboard.primaryClip?.let { ClipData(it) }
+        }
         val outgoing = LinkedBlockingQueue<Intent>()
         val monitor =
             object : Instrumentation.ActivityMonitor() {
@@ -356,6 +375,7 @@ class LocalNetworkEditorInstrumentedTest {
         fun copiedText(): String? {
             var text: String? = null
             instrumentation.runOnMainSync {
+                requireFocusedApp()
                 text = clipboard.primaryClip?.getItemAt(0)?.text?.toString()
             }
             return text
@@ -402,20 +422,48 @@ class LocalNetworkEditorInstrumentedTest {
                     requireRenderedText(expected.issuePageUrl)
                 }
                 val clipboardChanged = CountDownLatch(1)
+                var notificationOnMain = false
                 val listener = ClipboardManager.OnPrimaryClipChangedListener {
+                    notificationOnMain = Looper.myLooper() == Looper.getMainLooper()
                     clipboardChanged.countDown()
                 }
-                instrumentation.runOnMainSync { clipboard.addPrimaryClipChangedListener(listener) }
+                instrumentation.runOnMainSync {
+                    requireFocusedApp()
+                    clipboard.addPrimaryClipChangedListener(listener)
+                }
                 try {
                     click(copy(CommonR.string.problem_report_copy))
                     assertTrue(
                         clipboardChanged.await(10, TimeUnit.SECONDS),
                         "Actual clipboard change did not arrive",
                     )
+                    assertTrue(notificationOnMain, "Native clipboard notification must reach main")
+                    val observed = checkNotNull(copiedText())
                     assertEquals(
                         expected.body,
-                        copiedText(),
+                        observed,
                         "Actual clipboard equals the complete review",
+                    )
+                    fun digest(text: String) =
+                        MessageDigest.getInstance("SHA-256")
+                            .digest(text.toByteArray(Charsets.UTF_8))
+                            .joinToString("") { "%02x".format(it) }
+                    instrumentation.sendStatus(
+                        0,
+                        Bundle().apply {
+                            putString(
+                                "krtek_clipboard_observation",
+                                JSONObject()
+                                    .put("callback", true)
+                                    .put("listener_main", notificationOnMain)
+                                    .put("focused", true)
+                                    .put("expected_chars", expected.body.length)
+                                    .put("observed_chars", observed.length)
+                                    .put("expected_sha256", digest(expected.body))
+                                    .put("observed_sha256", digest(observed))
+                                    .toString(),
+                            )
+                        },
                     )
                 } finally {
                     instrumentation.runOnMainSync {
