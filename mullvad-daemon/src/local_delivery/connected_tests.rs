@@ -1328,6 +1328,7 @@ async fn applied_successor_acknowledges_retained_predecessor_before_stop() {
 
 struct Handover {
     runtime: LocalNetworkRuntime<PacketFactory>,
+    physical_feed: Arc<LocalNetworkFeed>,
     platform: Arc<PacketPlatform>,
     continuation: ConnectContinuation,
     policy: LocalNetworkAccess,
@@ -2365,12 +2366,13 @@ impl Handover {
         assert!(feed.publish(33, physical_snapshot()));
         let runtime = LocalNetworkRuntime::with_factory(
             &policy,
-            Some(feed),
+            Some(feed.clone()),
             PacketFactory(platform.clone()),
             Arc::new(|_, _| Ok(())),
         );
         Self {
             runtime,
+            physical_feed: feed,
             platform,
             continuation: ConnectContinuation::default(),
             policy,
@@ -2573,6 +2575,256 @@ impl Handover {
         self.acknowledge_transport_close();
         self.runtime.shutdown().await.unwrap();
     }
+}
+
+// B7a: reproduce configuration restoration using the real daemon/front-end owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connected_policy_toggle_and_app_restore_deliver_fresh_local_tcp_udp() {
+    for mtu in [1280, 1380] {
+        for settings_first in [false, true] {
+            policy_toggle_and_app_restore_case(mtu, settings_first).await;
+        }
+    }
+}
+
+async fn policy_toggle_and_app_restore_case(mtu: u16, settings_first: bool) {
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let physical = (tcp.local_addr().unwrap(), udp.local_addr().unwrap());
+    let tcp_hits = Arc::new(AtomicUsize::new(0));
+    let udp_hits = Arc::new(AtomicUsize::new(0));
+    let hits = tcp_hits.clone();
+    let tcp_task = tokio::spawn(async move {
+        for index in 0..8 {
+            let (mut stream, _) = tcp.accept().await.unwrap();
+            let mut bytes = [0; 8];
+            stream.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(bytes.as_slice(), format!("{index:08}").as_bytes());
+            hits.fetch_add(1, SeqCst);
+            stream.write_all(&bytes).await.unwrap();
+        }
+    });
+    let hits = udp_hits.clone();
+    let udp_task = tokio::spawn(async move {
+        for index in 0..8 {
+            let mut bytes = [0; 128];
+            let (count, source) = udp.recv_from(&mut bytes).await.unwrap();
+            assert_eq!(&bytes[..count], format!("{index:08}").as_bytes());
+            hits.fetch_add(1, SeqCst);
+            udp.send_to(&bytes[..count], source).await.unwrap();
+        }
+    });
+    let mut h = Handover::unstarted_with_physical(policy(), physical);
+    h.observe(TunnelPhase::Disconnected);
+    h.advance().await.unwrap();
+    h.settle_capture().await;
+    let mut target = assigned_config();
+    target.mtu = mtu;
+    h.connect_endpoint_with(target.clone()).await;
+    let broker = h.runtime.broker();
+    let session = broker.snapshot().session_generation;
+    let first_capture = broker.snapshot().capture_generation;
+    let authority = h.platform.authority.lock().unwrap().clone().unwrap();
+    for index in 0..8u16 {
+        // The device toggles legacy LAN, runs a Local off/on ordinary control,
+        // restores legacy LAN, changes app coverage, repeats the off/on control,
+        // then restores coverage. Every positive probe is a fresh socket/tuple.
+        if [1, 3, 4, 7].contains(&index) {
+            h.observe(TunnelPhase::Disconnecting);
+            let old = h.transport.take();
+            let old_request = h.request.take();
+            match index {
+                1 => target.allow_lan = true,
+                3 => target.allow_lan = false,
+                4 => target.excluded_packages = vec!["com.android.deskclock".into()],
+                7 => target.excluded_packages.clear(),
+                _ => unreachable!(),
+            }
+            if settings_first {
+                h.runtime
+                    .set_excluded_packages(target.excluded_packages.clone());
+                h.runtime.update(&h.policy, h.target, h.phase).await;
+                // A second settings acknowledgement can arrive before the
+                // predecessor transport has joined, as in the device restore.
+                if index == 7 {
+                    h.runtime.update(&h.policy, h.target, h.phase).await;
+                }
+            }
+            drop(old);
+            if let Some(request) = old_request {
+                request.transport_joined();
+            }
+            if index == 7 {
+                // Make the new fd exist while the native observation remains
+                // pending; coalesce policy demand before admitting its epoch.
+                let (opened, opening) = oneshot::channel();
+                *h.platform.delayed_completion.lock().unwrap() = Some(opened);
+                h.observe(TunnelPhase::Connecting);
+                let projected = talpid_tunnel::tun_provider::transport::router_config(
+                    &target,
+                    broker.local_routes(),
+                );
+                let mut request = broker
+                    .request_target_capture(target.clone(), projected)
+                    .unwrap();
+                h.runtime.update(&h.policy, h.target, h.phase).await;
+                let (generation, observation) = bounded(opening).await.unwrap();
+                assert!(!broker.snapshot().capture_ready);
+                h.policy.enabled = false;
+                h.runtime.update(&h.policy, h.target, h.phase).await;
+                h.policy.enabled = true;
+                h.runtime.update(&h.policy, h.target, h.phase).await;
+                assert!(h.platform.feed.publish(43, generation, observation));
+                let receipt = h.wait_for_capture_configuration(&mut request).await;
+                let pair = broker.acquire(&receipt).unwrap();
+                pair.control.activate().unwrap();
+                h.request = Some(request);
+                h.transport = Some(pair);
+                h.observe(TunnelPhase::Connected);
+                h.runtime.update(&h.policy, h.target, h.phase).await;
+            } else {
+                h.connect_endpoint_with(target.clone()).await;
+            }
+            if !settings_first {
+                h.runtime
+                    .set_excluded_packages(target.excluded_packages.clone());
+                h.runtime.update(&h.policy, h.target, h.phase).await;
+            }
+        }
+        if [2, 5, 6].contains(&index) {
+            h.policy.enabled = false;
+            let mut stopped = physical_snapshot();
+            stopped.sequence = 20 + i64::from(index) * 2;
+            stopped.observer_running = false;
+            assert!(h.physical_feed.publish(33, stopped));
+            h.runtime.update(&h.policy, h.target, h.phase).await;
+            h.settle_capture().await;
+            assert_eq!(h.runtime.status().forwarding, ForwardingAvailability::Off);
+            assert!(
+                authority
+                    .authorize(flow(Transport::Tcp, 47000 + index))
+                    .is_err()
+            );
+            // Ordinary readiness must remain independent of Local demand.
+            assert!(broker.snapshot().ordinary_ready);
+            let ordinary = UnixDatagram::from_std(
+                h.platform
+                    .peer
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .try_clone()
+                    .unwrap(),
+            )
+            .unwrap();
+            for bytes in [
+                tcp_packet(flow(Transport::Tcp, 49000 + index), 100, 0, 2, &[]),
+                udp_packet(flow(Transport::Udp, 49000 + index), b"Local-off-control"),
+            ] {
+                ordinary.send(&bytes).await.unwrap();
+                bounded(h.transport.as_mut().unwrap().receive.recv())
+                    .await
+                    .unwrap()
+                    .handoff(|actual| assert_eq!(actual, bytes))
+                    .unwrap();
+            }
+            assert_eq!(tcp_hits.load(SeqCst), usize::from(index));
+            assert_eq!(udp_hits.load(SeqCst), usize::from(index));
+            h.policy.enabled = true;
+            let mut resumed = physical_snapshot();
+            resumed.sequence = 21 + i64::from(index) * 2;
+            assert!(h.physical_feed.publish(33, resumed));
+            h.runtime.update(&h.policy, h.target, h.phase).await;
+        }
+        h.settle_capture().await;
+        assert!(broker.snapshot().capture_ready);
+        assert!(broker.snapshot().ordinary_ready);
+        assert_eq!(broker.snapshot().session_generation, session);
+        assert_eq!(
+            h.runtime.status().forwarding,
+            ForwardingAvailability::Active
+        );
+        let generation = broker.snapshot().capture_generation;
+        if index == 7 {
+            assert_ne!(
+                generation, first_capture,
+                "restored app coverage uses the new capture"
+            );
+            assert_eq!(h.platform.starts.load(SeqCst), 8);
+        }
+        let local = flow(Transport::Tcp, 47000 + index);
+        assert_eq!(
+            authority.disposition(local.destination.ip()),
+            Disposition::Local
+        );
+        let grant = authority.authorize(local).unwrap();
+        assert!(authority.current(&grant));
+        let capture = UnixDatagram::from_std(
+            h.platform
+                .peer
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .try_clone()
+                .unwrap(),
+        )
+        .unwrap();
+        capture
+            .send(&tcp_packet(local, 100, 0, 2, &[]))
+            .await
+            .unwrap();
+        let syn = capture_reply(&capture).await;
+        assert_eq!(syn[33] & 0x12, 0x12, "stage {index}: SYN-ACK");
+        let mut ack = u32::from_be_bytes(syn[24..28].try_into().unwrap()).wrapping_add(1);
+        let nonce = format!("{index:08}");
+        capture
+            .send(&tcp_packet(local, 101, ack, 0x18, nonce.as_bytes()))
+            .await
+            .unwrap();
+        let mut received = Vec::new();
+        while received.len() < 8 {
+            let bytes = capture_reply(&capture).await;
+            let packet = packet::parse(&bytes).unwrap();
+            assert_eq!(packet.flow.destination, local.source);
+            received.extend_from_slice(packet.payload);
+            ack = ack.wrapping_add(packet.payload.len() as u32);
+        }
+        assert_eq!(received, nonce.as_bytes(), "stage {index}: TCP consumer");
+        capture
+            .send(&tcp_packet(local, 109, ack, 0x14, &[]))
+            .await
+            .unwrap();
+        let udp_flow = flow(Transport::Udp, 48000 + index);
+        capture
+            .send(&udp_packet(udp_flow, nonce.as_bytes()))
+            .await
+            .unwrap();
+        loop {
+            let bytes = capture_reply(&capture).await;
+            let packet = packet::parse(&bytes).unwrap();
+            if packet.flow.transport == Transport::Udp {
+                assert_eq!(packet.flow.destination, udp_flow.source);
+                assert_eq!(
+                    packet.payload,
+                    nonce.as_bytes(),
+                    "stage {index}: UDP consumer"
+                );
+                break;
+            }
+            assert!(packet.payload.is_empty());
+        }
+        assert_eq!(tcp_hits.load(SeqCst), usize::from(index + 1));
+        assert_eq!(udp_hits.load(SeqCst), usize::from(index + 1));
+        assert_eq!(broker.snapshot().capture_generation, generation);
+        eprintln!(
+            "B7a mtu={mtu} settings_first={settings_first} stage={index} generation={generation:?} TCP/UDP peer+consumer delivered"
+        );
+    }
+    bounded(tcp_task).await.unwrap();
+    bounded(udp_task).await.unwrap();
+    h.close().await;
 }
 
 #[tokio::test]
