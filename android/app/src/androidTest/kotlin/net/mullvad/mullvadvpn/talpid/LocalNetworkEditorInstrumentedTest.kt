@@ -13,14 +13,9 @@ import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.ComposeUiTest
 import androidx.compose.ui.test.ExperimentalTestApi
-import androidx.compose.ui.test.assertIsDisplayed
-import androidx.compose.ui.test.hasScrollToIndexAction
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.hasTestTag
-import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.performScrollTo
-import androidx.compose.ui.test.performScrollToIndex
-import androidx.compose.ui.test.performTextReplacement
 import androidx.compose.ui.test.v2.AndroidComposeUiTestEnvironment
 import androidx.compose.ui.test.v2.runEmptyComposeUiTest
 import androidx.test.platform.app.InstrumentationRegistry
@@ -330,6 +325,29 @@ class LocalNetworkEditorInstrumentedTest {
 
     /** B7 only: real shipped UI and intercepted Android intents, never a public request. */
     internal fun verifySupportAndGuide() {
+        var stepIndex = 0
+        fun supportStep(phase: String, event: String) {
+            instrumentation.sendStatus(
+                0,
+                Bundle().apply {
+                    putString(
+                        "krtek_support_step",
+                        JSONObject()
+                            .put("index", stepIndex++)
+                            .put("phase", phase)
+                            .put("event", event)
+                            .toString(),
+                    )
+                },
+            )
+        }
+        val ui = SupportUiDriver.Actions(compose, instrumentation::waitForIdleSync, ::supportStep)
+        val settingsTitle = copy(CommonR.string.settings)
+        val vpnTitle = copy(CommonR.string.settings_vpn)
+        val reportTitle = copy(CommonR.string.report_a_problem)
+        val backLabel = copy(CommonR.string.back)
+        val disclosure =
+            copy(CommonR.string.problem_report_github_description, copy(CommonR.string.app_name))
         val koin = (target.applicationContext as MullvadApplication).getKoin()
         val repository = koin.get<ProblemReportRepository>()
         val support = koin.get<SupportIssueUseCase>()
@@ -363,15 +381,6 @@ class LocalNetworkEditorInstrumentedTest {
                 }
             }
         instrumentation.addMonitor(monitor)
-        fun messageField() = compose.onNode(hasSetTextAction(), useUnmergedTree = true)
-        fun replaceMessage(text: String) {
-            messageField().performScrollTo().performTextReplacement(text)
-            compose.waitForIdle()
-            assertEquals(
-                text,
-                messageField().fetchSemanticsNode().config[SemanticsProperties.EditableText].text,
-            )
-        }
         fun copiedText(): String? {
             var text: String? = null
             instrumentation.runOnMainSync {
@@ -382,44 +391,37 @@ class LocalNetworkEditorInstrumentedTest {
         }
         try {
             // Local screen -> VPN settings -> Settings. No settings are changed.
-            back()
-            back()
-            click(copy(CommonR.string.report_a_problem))
-            requireRenderedText(
-                copy(
-                    CommonR.string.problem_report_github_description,
-                    copy(CommonR.string.app_name),
-                )
-            )
-            compose.onNode(hasText(copy(CommonR.string.open_github_issue))).assertDoesNotExist()
-            replaceMessage(" \n\t ")
-            click(copy(CommonR.string.problem_report_review))
-            requireRenderedText(copy(CommonR.string.report_problem_message_is_empty))
-            for (message in
+            ui.localPage("initial-local")
+            ui.toolbarBack(backLabel, "local-back")
+            ui.listPage(SupportUiListOwner.Vpn, vpnTitle, "initial-vpn")
+            ui.toolbarBack(backLabel, "vpn-back")
+            ui.listPage(SupportUiListOwner.Settings, settingsTitle, "initial-settings")
+            ui.listAction(SupportUiListOwner.Settings, settingsTitle, reportTitle, "open-report")
+            ui.reportPage(disclosure, "initial-report")
+            ui.noText(copy(CommonR.string.open_github_issue), "initial-unreviewed")
+            ui.replaceMessage(" \n\t ", "blank-message")
+            ui.reportAction(copy(CommonR.string.problem_report_review), "blank-review")
+            ui.contentText(copy(CommonR.string.report_problem_message_is_empty), "blank-error")
+            for ((caseIndex, message) in
                 listOf(
-                    "  B7 🦔 & 中文 1234 5678 9012 3456\nUnsent original  ",
-                    "B7 中文🦔& ".repeat(500),
-                )) {
-                replaceMessage(message)
-                compose
-                    .onNode(hasText(copy(CommonR.string.report_problem_message_is_empty)))
-                    .assertDoesNotExist()
-                compose.onNode(hasText(copy(CommonR.string.open_github_issue))).assertDoesNotExist()
-                click(copy(CommonR.string.problem_report_review))
+                        "  B7 🦔 & 中文 1234 5678 9012 3456\nUnsent original  ",
+                        "B7 中文🦔& ".repeat(500),
+                    )
+                    .withIndex()) {
+                val caseId = if (caseIndex == 0) "short" else "oversized"
+                ui.replaceMessage(message, "$caseId-message")
+                ui.noText(copy(CommonR.string.report_problem_message_is_empty), "$caseId-no-error")
+                ui.noText(copy(CommonR.string.open_github_issue), "$caseId-unreviewed")
+                ui.reportAction(copy(CommonR.string.problem_report_review), "$caseId-review")
                 val expected = support(message, copy(CommonR.string.report_a_problem))
                 assertTrue(expected.body.startsWith(message + "\n\n"))
-                assertEquals(
-                    expected.body,
-                    compose
-                        .onNode(hasText(expected.body), useUnmergedTree = true)
-                        .fetchSemanticsNode()
-                        .config[SemanticsProperties.Text]
-                        .single()
-                        .text,
-                )
+                ui.reviewBody(expected.body, "$caseId-review-body")
                 if (expected.prefilledUrl == null) {
-                    requireRenderedText(copy(CommonR.string.problem_report_copy_fallback))
-                    requireRenderedText(expected.issuePageUrl)
+                    ui.contentText(
+                        copy(CommonR.string.problem_report_copy_fallback),
+                        "$caseId-copy-fallback",
+                    )
+                    ui.contentText(expected.issuePageUrl, "$caseId-issue-link")
                 }
                 val clipboardChanged = CountDownLatch(1)
                 var notificationOnMain = false
@@ -432,7 +434,7 @@ class LocalNetworkEditorInstrumentedTest {
                     clipboard.addPrimaryClipChangedListener(listener)
                 }
                 try {
-                    click(copy(CommonR.string.problem_report_copy))
+                    ui.reportAction(copy(CommonR.string.problem_report_copy), "$caseId-copy")
                     assertTrue(
                         clipboardChanged.await(10, TimeUnit.SECONDS),
                         "Actual clipboard change did not arrive",
@@ -470,7 +472,7 @@ class LocalNetworkEditorInstrumentedTest {
                         clipboard.removePrimaryClipChangedListener(listener)
                     }
                 }
-                click(copy(CommonR.string.open_github_issue))
+                ui.reportAction(copy(CommonR.string.open_github_issue), "$caseId-open-browser")
                 val intent =
                     checkNotNull(outgoing.poll(10, TimeUnit.SECONDS)) {
                         "Reviewed action did not reach Android"
@@ -490,40 +492,41 @@ class LocalNetworkEditorInstrumentedTest {
                     "Browser launch is not issue submission",
                 )
                 // Leave and recreate the screen; the repository still owns the full original.
-                click(copy(CommonR.string.back), scroll = false)
-                click(copy(CommonR.string.report_a_problem))
-                assertEquals(
-                    message,
-                    messageField()
-                        .fetchSemanticsNode()
-                        .config[SemanticsProperties.EditableText]
-                        .text,
+                ui.toolbarBack(backLabel, "$caseId-leave-report")
+                ui.listPage(SupportUiListOwner.Settings, settingsTitle, "$caseId-settings-returned")
+                ui.listAction(
+                    SupportUiListOwner.Settings,
+                    settingsTitle,
+                    reportTitle,
+                    "$caseId-reenter-report",
                 )
-                compose.onNode(hasText(copy(CommonR.string.open_github_issue))).assertDoesNotExist()
+                ui.reportPage(disclosure, "$caseId-report-returned")
+                ui.requireMessage(message, "$caseId-draft-retained")
+                ui.noText(copy(CommonR.string.open_github_issue), "$caseId-review-invalidated")
             }
-            click(copy(CommonR.string.back), scroll = false)
-            click(copy(CommonR.string.settings_vpn))
-            click(copy(CommonR.string.auto_connect_and_lockdown_mode))
-            compose.onNode(hasScrollToIndexAction()).performScrollToIndex(2)
-            val warning =
-                copy(CommonR.string.auto_connect_carousel_third_slide_bottom_text)
-                    .substringAfter("<b>")
-                    .substringBefore("</b>")
-            compose
-                .onNode(hasText(warning, substring = true), useUnmergedTree = true)
-                .assertIsDisplayed()
-            back()
-            click(copy(CommonR.string.local_network_sharing))
-            instrumentation.sendStatus(
-                0,
-                Bundle().apply {
-                    putString(
-                        "krtek_support_review",
-                        "PASS: complete short/oversized review, clipboard and blocked ACTION_VIEW, retained draft, localized lockdown guide",
-                    )
-                },
+            ui.toolbarBack(backLabel, "final-report-back")
+            ui.listPage(SupportUiListOwner.Settings, settingsTitle, "guide-settings")
+            ui.listAction(SupportUiListOwner.Settings, settingsTitle, vpnTitle, "guide-vpn-entry")
+            ui.listPage(SupportUiListOwner.Vpn, vpnTitle, "guide-vpn-page")
+            val guideTitle = copy(CommonR.string.auto_connect_and_lockdown_mode)
+            ui.listAction(SupportUiListOwner.Vpn, vpnTitle, guideTitle, "guide-entry")
+            ui.guideWarning(
+                guideTitle,
+                copy(CommonR.string.auto_connect_carousel_third_slide_bottom_text),
+                "guide-warning",
             )
+            ui.toolbarBack(backLabel, "guide-back")
+            ui.listPage(SupportUiListOwner.Vpn, vpnTitle, "guide-vpn-returned")
+            ui.listAction(
+                SupportUiListOwner.Vpn,
+                vpnTitle,
+                copy(CommonR.string.local_network_sharing),
+                "guide-local-entry",
+            )
+            ui.localPage("guide-local-returned")
+            instrumentation.runOnMainSync { requireFocusedApp() }
         } finally {
+            supportStep("restore", "before")
             instrumentation.removeMonitor(monitor)
             instrumentation.runOnMainSync {
                 repository.setDescription(original)
@@ -551,7 +554,17 @@ class LocalNetworkEditorInstrumentedTest {
             check(repository.problemReport.value.description == original) {
                 "Support draft restoration failed; private text withheld"
             }
+            supportStep("restore", "after")
         }
+        instrumentation.sendStatus(
+            0,
+            Bundle().apply {
+                putString(
+                    "krtek_support_review",
+                    "PASS: complete short/oversized review, clipboard and blocked ACTION_VIEW, retained draft, localized lockdown guide",
+                )
+            },
+        )
     }
 
     internal fun requireConnectedDraft(ssid: SsidIdentity) {
