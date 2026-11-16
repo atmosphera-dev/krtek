@@ -466,7 +466,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         allowLan: Boolean,
     ) {
         fun covered(address: String) =
-            capture.routes.any {
+            capture.forwardingRoutes.any {
                 CaptureReadiness.covers(it, if (':' in address) "$address/128" else "$address/32")
             }
         (parityTunnelled4 + if (ipv6) parityTunnelled6 else emptyList()).forEach {
@@ -478,7 +478,14 @@ class LocalNetworkDeliveryInstrumentedTest {
         if (ipv6) assertTrue(capture.addresses.any { ':' in it }, "$label: IPv6 address")
         else {
             assertTrue(capture.addresses.none { ':' in it }, "$label: no IPv6 address")
-            assertTrue(capture.routes.none { ':' in it }, "$label: upstream routes no IPv6")
+            assertTrue(
+                capture.forwardingRoutes.none { ':' in it },
+                "$label: upstream forwards no IPv6",
+            )
+            assertTrue(
+                capture.unreachableRoutes.any { CaptureReadiness.covers(it, "::/0") },
+                "$label: Android blocks the unconfigured IPv6 family",
+            )
         }
     }
 
@@ -530,7 +537,12 @@ class LocalNetworkDeliveryInstrumentedTest {
                     .put("mtu", capture.mtu)
                     .put("dns", dnsSet(capture.dns).sorted().joinToString(","))
                     .put("addresses", capture.addresses.sorted().joinToString(","))
-                    .put("routes", capture.routes.sorted().joinToString(",")),
+                    .put("routes", capture.routes.sorted().joinToString(","))
+                    .put("forwarding_routes", capture.forwardingRoutes.sorted().joinToString(","))
+                    .put(
+                        "unreachable_routes",
+                        capture.unreachableRoutes.sorted().joinToString(","),
+                    ),
             )
         fun apply(
             change: suspend () -> Either<Any?, Any?>,
@@ -655,7 +667,10 @@ class LocalNetworkDeliveryInstrumentedTest {
                         checkNotNull(blocked.generation).toULong(),
                         "$label: blocking is exactly one establishment",
                     )
-                    assertTrue("0.0.0.0/0" in blocked.routes && "::/0" in blocked.routes)
+                    assertTrue(
+                        "0.0.0.0/0" in blocked.forwardingRoutes &&
+                            "::/0" in blocked.forwardingRoutes
+                    )
                     record("$label-error", blocked, transitions)
                     current = blocked
                     recoveryStart = events.cursor()
@@ -2985,7 +3000,7 @@ class LocalNetworkDeliveryInstrumentedTest {
 
     private data class AppliedCapture(
         val addresses: Set<String>,
-        val routes: Set<String>,
+        val routeTypes: Set<CaptureReadiness.Route>,
         val dns: String,
         val mtu: Int,
         val uids: String,
@@ -2993,7 +3008,24 @@ class LocalNetworkDeliveryInstrumentedTest {
         val handle: String?,
         val interfaceName: String,
         val netId: String,
-    )
+    ) {
+        val routes: Set<String>
+            get() = routeTypes.map { it.prefix }.toSet()
+
+        val forwardingRoutes: Set<String>
+            get() =
+                routeTypes
+                    .filter { it.type == CaptureReadiness.RouteType.Forwarding }
+                    .map { it.prefix }
+                    .toSet()
+
+        val unreachableRoutes: Set<String>
+            get() =
+                routeTypes
+                    .filter { it.type == CaptureReadiness.RouteType.Unreachable }
+                    .map { it.prefix }
+                    .toSet()
+    }
 
     private fun uidIncluded(ranges: String, uid: Int): Boolean =
         ranges.split(',').any { range ->
@@ -3248,12 +3280,17 @@ class LocalNetworkDeliveryInstrumentedTest {
                     val frontend = addresses == connectedFamilies
                     val routeText = checkNotNull(delimitedField(agent, "Routes: [", ']'))
                     val dns = checkNotNull(delimitedField(agent, "DnsAddresses: [", ']')).trim()
-                    val allRoutes =
+                    val routeTypes =
                         routeText
                             .split(',')
                             .filter { it.isNotBlank() }
-                            .map { canonicalPrefix(CaptureReadiness.routePrefix(it)) }
+                            .map {
+                                CaptureReadiness.route(it).let { route ->
+                                    route.copy(prefix = canonicalPrefix(route.prefix))
+                                }
+                            }
                             .toSet()
+                    val allRoutes = routeTypes.map { it.prefix }.toSet()
                     val routes = allRoutes - bookkeeping
                     val iface = tokenField(agent, "InterfaceName: ")
                     val netId =
@@ -3309,7 +3346,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                         report("frontend_uids", uids)
                         return@withTimeout AppliedCapture(
                             addresses,
-                            allRoutes,
+                            routeTypes,
                             dns,
                             mtu,
                             uids,
@@ -3350,7 +3387,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                         report("frontend_uids", uids)
                         return@withTimeout AppliedCapture(
                             addresses,
-                            routes,
+                            routeTypes.filter { it.prefix !in bookkeeping }.toSet(),
                             "[]",
                             1280,
                             uids,

@@ -4,16 +4,31 @@ import java.net.InetAddress
 
 /** Samples from Android and the daemon log converge independently within the caller's deadline. */
 internal object CaptureReadiness {
-    fun routePrefix(text: String): String =
-        checkNotNull(
+    enum class RouteType {
+        Forwarding,
+        Unreachable,
+    }
+
+    data class Route(val prefix: String, val type: RouteType)
+
+    /** Android adds an unreachable default for a family absent from the VPN's Builder config. */
+    fun route(text: String): Route {
+        val match =
+            checkNotNull(
                 Regex(
-                        "^\\s*([0-9a-fA-F:.]+/\\d+)(?:\\s+->.*|\\s+unreachable(?:\\s+mtu\\s+\\d+)?)?$"
+                        "^\\s*([0-9a-fA-F:.]+/\\d+)(?:\\s+->.*|\\s+(unreachable)(?:\\s+mtu\\s+\\d+)?)?$"
                     )
                     .matchEntire(text)
             ) {
                 "Malformed Android route"
             }
-            .groupValues[1]
+        return Route(
+            match.groupValues[1],
+            if (match.groupValues[2].isEmpty()) RouteType.Forwarding else RouteType.Unreachable,
+        )
+    }
+
+    fun routePrefix(text: String): String = route(text).prefix
 
     data class Receipt(val generation: String, val handle: String, val text: String)
 

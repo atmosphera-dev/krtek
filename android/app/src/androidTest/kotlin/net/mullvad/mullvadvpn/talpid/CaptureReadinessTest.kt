@@ -4,6 +4,7 @@ import java.net.InetAddress
 import kotlin.test.assertEquals
 import kotlin.test.assertFails
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -199,6 +200,36 @@ class CaptureReadinessTest {
     fun realCaptureRouteReceiptIsAcceptedExactly() {
         assertEquals("::/0", CaptureReadiness.routePrefix("::/0 unreachable mtu 0"))
         assertEquals("0.0.0.0/0", CaptureReadiness.routePrefix("0.0.0.0/0 -> 0.0.0.0 tun1 mtu 0"))
+        val guarded =
+            listOf(
+                    "0.0.0.0/0 -> 0.0.0.0 tun1 mtu 0",
+                    "172.27.1.1/32 -> 0.0.0.0 tun1 mtu 0",
+                    "::/0 unreachable mtu 0",
+                )
+                .map(CaptureReadiness::route)
+                .toSet()
+        assertTrue(
+            guarded.none { it.type == CaptureReadiness.RouteType.Forwarding && ':' in it.prefix }
+        )
+        assertTrue(
+            guarded.any { it.type == CaptureReadiness.RouteType.Unreachable && it.prefix == "::/0" }
+        )
+        for (mtu in listOf("", " mtu 0", " mtu 1380")) {
+            val guard = CaptureReadiness.route("::/0 unreachable$mtu")
+            val forwarded = CaptureReadiness.route("::/0 -> :: tun1 mtu 0")
+            assertEquals(CaptureReadiness.RouteType.Unreachable, guard.type)
+            assertEquals(CaptureReadiness.RouteType.Forwarding, forwarded.type)
+            assertEquals(guard.prefix, forwarded.prefix)
+            assertNotEquals(guard, forwarded)
+        }
+        assertEquals(
+            CaptureReadiness.RouteType.Forwarding,
+            CaptureReadiness.route("10.64.0.1/32 -> 0.0.0.0 tun1 mtu 1380").type,
+        )
+        for (bad in
+            listOf("::/0 unknown mtu 0", "::/0 unreachable suffix", "::/0 unreachable mtu bad")) {
+            assertFails { CaptureReadiness.route(bad) }
+        }
         assertFails { CaptureReadiness.routePrefix("::/0 unknown mtu 0") }
         val receipt = assertNotNull(actual())
         assertEquals("3", receipt.generation)
