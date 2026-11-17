@@ -34,12 +34,13 @@ pub struct StatusArgs {
 
 impl Status {
     pub async fn listen(
-        mut rpc: MullvadProxyClient,
+        mut event_stream: impl futures::Stream<
+            Item = mullvad_management_interface::client::Result<DaemonEvent>,
+        > + Unpin,
         args: StatusArgs,
         mut previous_tunnel_state: TunnelState,
         mut local_configured: bool,
     ) -> Result<()> {
-        let mut event_stream = rpc.events_listen().await?;
         while let Some(event) = event_stream.next().await {
             match event? {
                 DaemonEvent::TunnelState(new_state) => {
@@ -103,14 +104,27 @@ pub async fn handle(cmd: Option<Status>, args: StatusArgs) -> Result<()> {
     }
 
     let explicit_local = cmd == Some(Status::Local);
-    let local_configured = if args.json || args.debug {
-        false
-    } else {
-        rpc.get_settings()
-            .await
-            .ok()
-            .is_some_and(|settings| local_policy_configured(&settings.local_network_access))
-    };
+    let mut event_rpc = rpc.clone();
+    let (event_stream, local_configured) = subscribe_then_snapshot(
+        async {
+            if cmd == Some(Status::Listen) {
+                Ok(Some(event_rpc.events_listen().await?))
+            } else {
+                Ok(None)
+            }
+        },
+        async {
+            if args.json || args.debug {
+                false
+            } else {
+                rpc.get_settings()
+                    .await
+                    .ok()
+                    .is_some_and(|settings| local_policy_configured(&settings.local_network_access))
+            }
+        },
+    )
+    .await?;
     if let Some(status) = local_network_snapshot(
         &args,
         local_configured,
@@ -122,10 +136,20 @@ pub async fn handle(cmd: Option<Status>, args: StatusArgs) -> Result<()> {
         print_local_network_summary(&status);
     }
 
-    if cmd == Some(Status::Listen) {
-        Status::listen(rpc, args, state, local_configured).await?;
+    if let Some(events) = event_stream {
+        Status::listen(events, args, state, local_configured).await?;
     }
     Ok(())
+}
+
+/// Keep the event owner alive before sampling the state that its events update.
+async fn subscribe_then_snapshot<S, T>(
+    subscription: impl Future<Output = Result<S>>,
+    snapshot: impl Future<Output = T>,
+) -> Result<(S, T)> {
+    let events = subscription.await?;
+    let state = snapshot.await;
+    Ok((events, state))
 }
 
 fn print_account_logged_out(state: &TunnelState, device: &DeviceState) {
@@ -273,6 +297,28 @@ fn print_debug_or_json<T: Debug + Serialize>(
 mod tests {
     use super::*;
     use mullvad_types::settings::local_network_access::LocalNetworkAccess;
+
+    #[tokio::test]
+    async fn local_snapshot_subscribes_first_and_retains_changes_during_the_read() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let subscribed = AtomicBool::new(false);
+        let (sender, receiver) = futures::channel::mpsc::unbounded();
+        let (mut stream, configured) = subscribe_then_snapshot(
+            async {
+                subscribed.store(true, Ordering::SeqCst);
+                Ok(receiver)
+            },
+            async {
+                assert!(subscribed.load(Ordering::SeqCst));
+                sender.unbounded_send(true).unwrap();
+                false
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!configured);
+        assert_eq!(stream.next().await, Some(true));
+    }
 
     #[test]
     fn snapshot_and_events_share_text_mode_and_availability_visibility() {
