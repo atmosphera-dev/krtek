@@ -351,8 +351,11 @@ initial result cannot replace a newer event; the next valid sample can recover L
 Policy reads retain exact representable values and their validation result.
 Unrepresentable Local protobufs stay at the management conversion boundary and
 are exposed as a Local read error, never as an OFF/empty replacement. Local
-mutations still require valid input and a valid read. Upstream disk loading,
-defaults and malformed-file recovery are unchanged.
+replacements still require valid input and a representable read. The expected
+snapshot is an exact comparison token, including representable invalid policy,
+so a valid replacement can repair it without changing unrelated settings.
+Unrepresentable reads remain unavailable. Upstream disk loading, defaults and
+malformed-file recovery are unchanged.
 
 The daemon owns policy observation demand through the Local registration, not
 through cached management settings. The editor contributes a separate demand
