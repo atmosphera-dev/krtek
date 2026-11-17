@@ -879,6 +879,91 @@ async fn provider_pause_retires_only_mullvad_while_local_and_another_target_stay
 }
 
 #[tokio::test]
+async fn pause_retires_full_pre_carrier_ingress_without_retiring_local() {
+    use futures::FutureExt;
+    let f = Fixture::new();
+    let (mut request, pending_request) = f.request();
+    let (lease, receipt) = f.bind(&pending_request);
+    f.broker.acknowledge(&pending_request, &receipt).unwrap();
+    request.configured().await.unwrap();
+    for _ in 0..PACKET_CAPACITY {
+        lease.try_send(b"before-carrier").unwrap();
+    }
+    let mut pending = lease
+        .ingress(RelayTargetId::MULLVAD, b"retained-full")
+        .unwrap();
+    assert!(pending.send().now_or_never().is_none());
+    f.broker.pause_transport();
+    assert!(matches!(
+        pending.send().now_or_never(),
+        Some(Err(AttachmentError::Stale))
+    ));
+    assert!(matches!(
+        lease.ingress(RelayTargetId::MULLVAD, b"paused"),
+        Err(AttachmentError::OrdinaryUnready)
+    ));
+    let local = lease.capability().unwrap();
+    let sink = local.sink().unwrap();
+    let (writer, consumer) = UnixDatagram::pair().unwrap();
+    local
+        .with_sink(&sink, || writer.send(b"local-after-pause"))
+        .unwrap()
+        .unwrap();
+    let mut bytes = [0; 64];
+    let count = consumer.recv(&mut bytes).unwrap();
+    assert_eq!(&bytes[..count], b"local-after-pause");
+    drop((
+        pending,
+        local,
+        sink,
+        receipt,
+        lease,
+        pending_request,
+        request,
+    ));
+    assert_eq!(f.application.used(), 0);
+}
+
+#[tokio::test]
+async fn dequeue_and_packet_creation_are_ordered_before_sink_handover() {
+    let f = Fixture::new();
+    let (_request, lease, mut pair) = f.active().await;
+    let lease = Arc::new(lease);
+    lease.try_send(b"exact-owned-packet").unwrap();
+    let changes = Arc::new(Mutex::new(None));
+    let during_select = changes.clone();
+    let handover_lease = lease.clone();
+    let inner = f.broker.inner.clone();
+    *pair.control.attempt.bridge.wait_hook.lock().unwrap() = Some(Box::new(move || {
+        // Old recv releases readiness locks before dequeue. Force the exact
+        // real handover in that gap; the corrected broker lock excludes it.
+        let unlocked = inner.state.try_lock().is_ok();
+        if unlocked {
+            *during_select.lock().unwrap() = Some(
+                handover_lease
+                    .begin_handover(None, sources(), 1420)
+                    .unwrap(),
+            );
+        }
+    }));
+    let packet = pair.receive.recv().await;
+    assert!(
+        packet.is_ok(),
+        "temporary handover suspension lost the dequeued packet"
+    );
+    assert!(
+        changes.lock().unwrap().is_none(),
+        "handover entered the atomic selection"
+    );
+    let mut change = lease.begin_handover(None, sources(), 1420).unwrap();
+    change.rollback().unwrap();
+    packet
+        .unwrap()
+        .handoff(|bytes| assert_eq!(bytes, b"exact-owned-packet"))
+        .unwrap();
+}
+
+#[tokio::test]
 async fn channel_metadata_remains_charged_through_halves_and_blocked_reply_lifetime() {
     let f = Fixture::new();
     let (request, lease, pair) = f.active().await;

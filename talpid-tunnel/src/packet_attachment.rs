@@ -1061,10 +1061,12 @@ impl AttachmentBroker {
             .and_then(|capture| capture.config.as_ref())
         {
             config.update_release(|release| release.handover_joined = false);
+            state.retire_unattached_bridge(config);
         }
         if let Some(request) = state.request.take() {
             request.update_release(|release| release.handover_joined = false);
             request.status.send_replace(RequestStatus::Cancelled);
+            state.retire_unattached_bridge(&request);
         }
         state.detach_target(RelayTargetId::MULLVAD);
         self.inner.publish(&state);
@@ -1960,22 +1962,40 @@ impl TransportReceive {
     pub async fn recv(&mut self) -> Result<RelayPacket, AttachmentError> {
         loop {
             let wake = self.control.attempt.bridge.outbound.notified();
-            if *self.control.attempt.cancelled.borrow() {
-                return Err(AttachmentError::Stale);
-            }
-            if self.control.current()
-                && let Some(packet) = self
-                    .control
-                    .attempt
-                    .bridge
-                    .queues
-                    .lock()
-                    .expect("attachment queues")
-                    .outbound
-                    .pop_front()
             {
-                self.control.attempt.bridge.wake();
-                return self.control.capability().packet(packet).map_err(Into::into);
+                let inner = self
+                    .control
+                    .inner
+                    .upgrade()
+                    .ok_or(AttachmentError::Closed)?;
+                // Handover/retirement use this same owner lock. A temporary
+                // sink suspension cannot split readiness, dequeue and creation
+                // into a lost buffer or a fatal transport receive error.
+                let state = inner.state.lock().expect("attachment state");
+                if !state
+                    .attempt(self.control.attempt.target)
+                    .is_some_and(|attempt| Arc::ptr_eq(attempt, &self.control.attempt))
+                    || *self.control.attempt.cancelled.borrow()
+                {
+                    return Err(AttachmentError::Stale);
+                }
+                if self.control.current() {
+                    #[cfg(test)]
+                    self.control.attempt.bridge.before_wait();
+                    if let Some(packet) = self
+                        .control
+                        .attempt
+                        .bridge
+                        .queues
+                        .lock()
+                        .expect("attachment queues")
+                        .outbound
+                        .pop_front()
+                    {
+                        self.control.attempt.bridge.wake();
+                        return self.control.capability().packet(packet).map_err(Into::into);
+                    }
+                }
             }
             wake.await;
         }
