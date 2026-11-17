@@ -37,7 +37,10 @@ class ReportProblemViewModelTest {
     private val context =
         mockk<Context> {
             every { filesDir } returns
-                File(requireNotNull(System.getenv("TMPDIR")), "support-viewmodel-test")
+                File(
+                    System.getenv("TMPDIR") ?: System.getProperty("java.io.tmpdir"),
+                    "support-viewmodel-test",
+                )
         }
     private val repository = spyk(ProblemReportRepository(context, "logs", mockk()))
     private val issuesUrl = "https://example.test/issues"

@@ -821,12 +821,19 @@ mod test {
         );
     }
 
+    // A fixture never needs a particular shell environment. When no scratch
+    // root is supplied, its owned checkout is also a portable disk-backed root.
+    fn local_fixture_directory(label: &str) -> std::path::PathBuf {
+        std::env::var_os("TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap())
+            .join(format!("{label}-{}", rand::random::<u64>()))
+    }
+
     #[tokio::test]
     async fn invalid_local_read_never_rewrites_stored_policy_or_blocks_other_settings() {
         use mullvad_types::settings::local_network_access::LocalBypassRule;
-        let directory =
-            std::path::PathBuf::from(std::env::var_os("TMPDIR").expect("disk-backed TMPDIR"))
-                .join(format!("local-read-{}", rand::random::<u64>()));
+        let directory = local_fixture_directory("local-read");
         std::fs::create_dir(&directory).unwrap();
         let mut original = Settings::default();
         original.allow_lan = true;
@@ -978,8 +985,7 @@ mod test {
     async fn exact_invalid_local_snapshot_can_be_repaired_without_changing_other_settings() {
         use mullvad_management_interface::types::{self, LocalNetworkAccess as WirePolicy};
         use mullvad_types::settings::local_network_access::LocalBypassRule;
-        let directory =
-            std::env::temp_dir().join(format!("local-repair-{}", rand::random::<u64>()));
+        let directory = local_fixture_directory("local-repair");
         std::fs::create_dir(&directory).unwrap();
         let mut stored = Settings::default();
         stored.allow_lan = true;

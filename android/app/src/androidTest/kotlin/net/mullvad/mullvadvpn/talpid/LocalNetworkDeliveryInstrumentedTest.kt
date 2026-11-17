@@ -2873,6 +2873,22 @@ class LocalNetworkDeliveryInstrumentedTest {
                     appliedConfiguration(withoutPeer, ForwardingAvailability.Active, "Connected"),
                 )
                 listOf("tcp", "udp").forEach { probeSocket(consumer, it, "blocked") }
+                val editedExisting =
+                    withoutPeer.copy(
+                        rules =
+                            withoutPeer.rules.map { it.copy(cidrs = policy.rules.single().cidrs) }
+                    )
+                assertEquals(withoutPeer.rules.map { it.id }, editedExisting.rules.map { it.id })
+                setPolicy(repository, editedExisting)
+                assertEquals(
+                    before,
+                    connectedProof(consumer, repository, connection),
+                    "Editing the same rule ID newly authorizes TCP/UDP without a new capture",
+                )
+                report("edited_rule_destination_delivered", peer)
+                setPolicy(repository, withoutPeer)
+                appliedConfiguration(withoutPeer, ForwardingAvailability.Active, "Connected")
+                listOf("tcp", "udp").forEach { probeSocket(consumer, it, "blocked") }
                 val previousRevision = checkNotNull(repository.localNetworkStatus.value).revision
                 val peerRule = policy.rules.single().copy(id = UUID.randomUUID())
                 val newRule = withoutPeer.copy(rules = withoutPeer.rules + peerRule)
@@ -3306,7 +3322,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                                     frontend == fixedCapture && addresses.isNotEmpty(),
                                     dns,
                                     mtu,
-                                    allRoutes,
+                                    CaptureReadiness.forwardingPrefixes(routeTypes),
                                     expected,
                                     requiredMtu
                                         ?: if (expectedTunnel == "Connected") options?.mtu?.value

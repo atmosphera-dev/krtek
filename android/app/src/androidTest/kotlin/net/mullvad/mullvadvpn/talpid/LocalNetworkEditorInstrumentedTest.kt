@@ -370,6 +370,18 @@ class LocalNetworkEditorInstrumentedTest {
                     target.applicationContext.getSystemService(ClipboardManager::class.java)
                 )
             savedClip = clipboard.primaryClip?.let { ClipData(it) }
+            check(
+                ClipboardRestoreContract.restorable(
+                    savedClip?.let { clip ->
+                        (0 until clip.itemCount).map { index ->
+                            val item = clip.getItemAt(index)
+                            item.uri?.scheme to item.intent?.data?.scheme
+                        }
+                    } ?: emptyList()
+                )
+            ) {
+                "Clipboard has URI authority this test cannot restore; no state was changed"
+            }
         }
         val outgoing = LinkedBlockingQueue<Intent>()
         val monitor =

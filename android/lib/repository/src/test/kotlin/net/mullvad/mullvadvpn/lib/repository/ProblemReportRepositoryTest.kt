@@ -15,7 +15,10 @@ class ProblemReportRepositoryTest {
     fun `should retain the complete support draft for repository lifetime`() = runTest {
         val context = mockk<Context>()
         every { context.filesDir } returns
-            File(requireNotNull(System.getenv("TMPDIR")), "support-draft-test")
+            File(
+                System.getenv("TMPDIR") ?: System.getProperty("java.io.tmpdir"),
+                "support-draft-test",
+            )
         val repository = ProblemReportRepository(context, "logs", mockk())
         val original = "  1234 5678 9012 3456\r\n" + "中文🦔&".repeat(8000) + "  "
         repository.problemReport.test {

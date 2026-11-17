@@ -141,6 +141,7 @@ fn assigned_config() -> talpid_tunnel::tun_provider::TunConfig {
     config
 }
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
 #[test]
 fn local_route_union_preserves_upstream_exceptions_and_family_scope() {
     use talpid_tunnel::tun_provider::{

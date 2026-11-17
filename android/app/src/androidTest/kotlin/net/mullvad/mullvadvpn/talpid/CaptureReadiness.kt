@@ -30,6 +30,9 @@ internal object CaptureReadiness {
 
     fun routePrefix(text: String): String = route(text).prefix
 
+    fun forwardingPrefixes(routes: Set<Route>): Set<String> =
+        routes.filter { it.type == RouteType.Forwarding }.map { it.prefix }.toSet()
+
     data class Receipt(val generation: String, val handle: String, val text: String)
 
     data class PartialReceipt(val generation: String, val session: String, val format: String)

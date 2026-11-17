@@ -95,6 +95,32 @@ class CaptureReadinessTest {
         )
     }
 
+    @Test
+    fun unreachableDefaultsNeverProvideForwardingCoverage() {
+        val guarded = setOf(CaptureReadiness.route("::/0 unreachable mtu 0"))
+        val expected = setOf("fd42::/64")
+        assertFalse(
+            CaptureReadiness.configurationReady(
+                true,
+                "1.1.1.1",
+                1380,
+                CaptureReadiness.forwardingPrefixes(guarded),
+                expected,
+            )
+        )
+        val forwarding = guarded + CaptureReadiness.route("fd42::/64 -> :: tun1 mtu 0")
+        assertEquals(2, forwarding.size, "Keep the guard for receipt matching")
+        assertTrue(
+            CaptureReadiness.configurationReady(
+                true,
+                "1.1.1.1",
+                1380,
+                CaptureReadiness.forwardingPrefixes(forwarding),
+                expected,
+            )
+        )
+    }
+
     private fun partial(generation: String = "12"): String =
         "router-authority current=Capture { capture_ready: true, ordinary_ready: false, capture_generation: Some($generation), session_generation: Some(1) }\n" +
             "capture-format generation=$generation representation=plain-ip flags=0x1001"
