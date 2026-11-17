@@ -527,6 +527,49 @@ class ManagementService(
     private suspend fun getCurrentApiAccessMethod(): ApiAccessMethodSetting =
         grpc.GetCurrentApiAccessMethod().execute(Unit).toDomain()
 
+    private suspend fun CoroutineScope.getInitialLocalNetworkStatus(subscription: Long) {
+        while (isActive) {
+            val observationGeneration =
+                synchronized(localStatusLock) {
+                    if (subscription != localSubscriptionGeneration) return
+                    localObservationGeneration
+                }
+            try {
+                acceptLocalNetworkStatus(
+                    grpc.GetLocalNetworkStatus().execute(Unit),
+                    subscription,
+                    observationGeneration,
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // An auxiliary RPC cannot cancel upstream's shared initial fetches/listener.
+                // Do not erase a newer event that arrived while this request was pending.
+                Logger.w("Initial Local network status unavailable")
+                synchronized(localStatusLock) {
+                    if (
+                        subscription == localSubscriptionGeneration &&
+                            observationGeneration == localObservationGeneration &&
+                            localStatusRevision == null
+                    ) {
+                        latestLocalSample = unavailableLocalStatus(0uL)
+                        projectLocalSample()
+                    }
+                }
+            }
+            // Acceptance can reject an obsolete editor generation even on a
+            // successful RPC. Its owner must obtain a current read rather than
+            // wait for an event that may never arrive. A newer event revision
+            // remains authoritative and does not itself require another RPC.
+            val finished =
+                synchronized(localStatusLock) {
+                    subscription != localSubscriptionGeneration ||
+                        observationGeneration == localObservationGeneration
+                }
+            if (finished) return
+        }
+    }
+
     suspend fun logoutAccount(): Either<LogoutAccountError, Unit> =
         Either.catch { grpc.LogoutAccount().execute("android-ui".toStringValue()) }
             .onLeft { Logger.e("Logout account error") }
@@ -589,33 +632,7 @@ class ManagementService(
             async { _mutableTunnelState.update { getTunnelState() } },
             async { _mutableDeviceState.update { getDeviceState() } },
             async { _mutableSettings.update { getSettings() } },
-            async {
-                val observationGeneration =
-                    synchronized(localStatusLock) { localObservationGeneration }
-                try {
-                    acceptLocalNetworkStatus(
-                        grpc.GetLocalNetworkStatus().execute(Unit),
-                        subscription,
-                        observationGeneration,
-                    )
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
-                    // An auxiliary RPC cannot cancel upstream's shared initial fetches/listener.
-                    // Do not erase a newer event that arrived while this request was pending.
-                    Logger.w("Initial Local network status unavailable")
-                    synchronized(localStatusLock) {
-                        if (
-                            subscription == localSubscriptionGeneration &&
-                                observationGeneration == localObservationGeneration &&
-                                localStatusRevision == null
-                        ) {
-                            latestLocalSample = unavailableLocalStatus(0uL)
-                            projectLocalSample()
-                        }
-                    }
-                }
-            },
+            async { getInitialLocalNetworkStatus(subscription) },
             async { _mutableVersionInfo.update { getVersionInfo().getOrNull() } },
             async { _mutableRelayList.update { getRelayList() } },
             async { _mutableCurrentAccessMethod.update { getCurrentApiAccessMethod() } },

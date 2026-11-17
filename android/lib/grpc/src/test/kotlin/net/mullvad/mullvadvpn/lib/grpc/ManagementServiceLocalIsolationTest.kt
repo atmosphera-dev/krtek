@@ -69,6 +69,138 @@ class ManagementServiceLocalIsolationTest {
             )
 
     @Test
+    fun `should refetch initial Local status until the editor generation stays current`() =
+        runTest {
+            val rpc = mockk<ManagementServiceClient>(relaxed = true)
+            val events = Channel<DaemonEvent>(Channel.UNLIMITED)
+            val replies = List(4) { CompletableDeferred<LocalNetworkStatus>() }
+            var requests = 0
+            coEvery { rpc.GetLocalNetworkStatus().execute(Unit) } coAnswers
+                {
+                    replies[requests++].await()
+                }
+            val service = service(rpc, events)
+            val ordinarySettings = mutableListOf<ModelSettings>()
+            backgroundScope.launch { service.settings.collect { ordinarySettings += it } }
+            service.start()
+            runCurrent()
+            assertEquals(
+                1,
+                ordinarySettings.size,
+                "Local convergence must not hold ordinary startup",
+            )
+            var previous: Long? = null
+            repeat(3) { index ->
+                previous?.let { service.endLocalNetworkEditor(it) }
+                val generation = service.beginLocalNetworkEditor().merge()
+                service.acknowledgeLocalNetworkEditor(generation, 101L + index)
+                previous = generation
+                replies[index].complete(known(99, 1))
+                runCurrent()
+                assertNull(service.localNetworkStatus.value, "An obsolete reply must not publish")
+                assertEquals(index + 2, requests, "Every moved generation needs a current read")
+            }
+            replies.last().complete(known(2, 104))
+            runCurrent()
+            assertEquals(2uL, service.localNetworkStatus.value?.revision)
+            assertEquals(104uL, service.localNetworkStatus.value?.observationSequence)
+            assertIs<net.mullvad.mullvadvpn.lib.model.ConnectedWifi.Known>(
+                service.localNetworkStatus.value?.currentWifi
+            )
+            coVerify(exactly = 4) { rpc.GetLocalNetworkStatus().execute(Unit) }
+            coVerify(exactly = 1) { rpc.EventsListen().executeIn(any(), Unit) }
+            service.stop()
+        }
+
+    @Test
+    fun `should refetch a failed initial Local read after its editor generation moves`() = runTest {
+        val rpc = mockk<ManagementServiceClient>(relaxed = true)
+        val events = Channel<DaemonEvent>(Channel.UNLIMITED)
+        val oldReply = CompletableDeferred<LocalNetworkStatus>()
+        val freshReply = CompletableDeferred<LocalNetworkStatus>()
+        var requests = 0
+        coEvery { rpc.GetLocalNetworkStatus().execute(Unit) } coAnswers
+            {
+                if (requests++ == 0) oldReply.await() else freshReply.await()
+            }
+        val service = service(rpc, events)
+        service.start()
+        runCurrent()
+        val generation = service.beginLocalNetworkEditor().merge()
+        service.acknowledgeLocalNetworkEditor(generation, 50)
+        oldReply.completeExceptionally(IOException("obsolete read"))
+        runCurrent()
+        assertNull(service.localNetworkStatus.value)
+        assertEquals(2, requests)
+        freshReply.complete(known(3, 50))
+        runCurrent()
+        assertEquals(3uL, service.localNetworkStatus.value?.revision)
+        assertIs<net.mullvad.mullvadvpn.lib.model.ConnectedWifi.Known>(
+            service.localNetworkStatus.value?.currentWifi
+        )
+        coVerify(exactly = 1) { rpc.EventsListen().executeIn(any(), Unit) }
+        service.stop()
+    }
+
+    @Test
+    fun `should keep newer Local events while converging an initial read`() = runTest {
+        val rpc = mockk<ManagementServiceClient>(relaxed = true)
+        val events = Channel<DaemonEvent>(Channel.UNLIMITED)
+        val oldReply = CompletableDeferred<LocalNetworkStatus>()
+        val freshReply = CompletableDeferred<LocalNetworkStatus>()
+        var requests = 0
+        coEvery { rpc.GetLocalNetworkStatus().execute(Unit) } coAnswers
+            {
+                if (requests++ == 0) oldReply.await() else freshReply.await()
+            }
+        val service = service(rpc, events)
+        service.start()
+        runCurrent()
+        val generation = service.beginLocalNetworkEditor().merge()
+        service.acknowledgeLocalNetworkEditor(generation, 100)
+        events.send(DaemonEvent(event = DaemonEvent.Event.LocalNetworkStatus(known(10, 100))))
+        runCurrent()
+        oldReply.complete(known(99, 1))
+        runCurrent()
+        assertEquals(2, requests)
+        events.send(DaemonEvent(event = DaemonEvent.Event.LocalNetworkStatus(known(11, 101))))
+        runCurrent()
+        freshReply.complete(known(9, 100))
+        runCurrent()
+        assertEquals(11uL, service.localNetworkStatus.value?.revision)
+        assertEquals(101uL, service.localNetworkStatus.value?.observationSequence)
+        coVerify(exactly = 2) { rpc.GetLocalNetworkStatus().execute(Unit) }
+        service.stop()
+    }
+
+    @Test
+    fun `should not refetch an obsolete subscription after editor demand moves`() = runTest {
+        val rpc = mockk<ManagementServiceClient>(relaxed = true)
+        val events = Channel<DaemonEvent>(Channel.UNLIMITED)
+        var oldReply: Continuation<LocalNetworkStatus>? = null
+        coEvery { rpc.GetLocalNetworkStatus().execute(Unit) } coAnswers
+            {
+                suspendCoroutine { oldReply = it }
+            }
+        val service = service(rpc, events)
+        service.start()
+        runCurrent()
+        val generation = service.beginLocalNetworkEditor().merge()
+        service.endLocalNetworkEditor(generation)
+        service.stop()
+        runCurrent()
+        coEvery { rpc.GetLocalNetworkStatus().execute(Unit) } returns known(1, 20)
+        service.start()
+        runCurrent()
+        checkNotNull(oldReply).resume(known(99, 1))
+        runCurrent()
+        assertEquals(1uL, service.localNetworkStatus.value?.revision)
+        coVerify(exactly = 2) { rpc.GetLocalNetworkStatus().execute(Unit) }
+        coVerify(exactly = 2) { rpc.EventsListen().executeIn(any(), Unit) }
+        service.stop()
+    }
+
+    @Test
     fun `should fence pre stop Known and accept fresh same SSID for a reopened editor`() = runTest {
         val rpc = mockk<ManagementServiceClient>(relaxed = true)
         val events = Channel<DaemonEvent>(Channel.UNLIMITED)
@@ -139,9 +271,10 @@ class ManagementServiceLocalIsolationTest {
             val rpc = mockk<ManagementServiceClient>(relaxed = true)
             val events = Channel<DaemonEvent>(Channel.UNLIMITED)
             var oldReply: Continuation<LocalNetworkStatus>? = null
+            val freshReply = CompletableDeferred<LocalNetworkStatus>()
             coEvery { rpc.GetLocalNetworkStatus().execute(Unit) } coAnswers
                 {
-                    suspendCoroutine { oldReply = it }
+                    if (oldReply == null) suspendCoroutine { oldReply = it } else freshReply.await()
                 }
             val service = service(rpc, events)
             service.start()

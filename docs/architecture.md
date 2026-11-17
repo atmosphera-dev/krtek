@@ -348,6 +348,11 @@ tunnel, account, relay or ordinary settings updates. A subscription-scoped
 revision watermark also covers malformed samples. Samples retain their exact
 subscription generation, including a reply completing after stop/start, so a late
 initial result cannot replace a newer event; the next valid sample can recover Local status.
+The initial Local fetch owns convergence when editor generations move during an
+RPC: obsolete success and failure results trigger a read for the new generation,
+not a fixed retry count or a wait for a later event. Cancellation or a replaced
+subscription ends that fetch owner. A stable read retains normal revision
+ordering, including a newer event already accepted while the RPC was pending.
 Editor demand has its own generation. Its service owner acknowledges the minimum
 usable watcher snapshot sequence after applying demand, and Local status carries
 that existing source sequence (zero means no identity). Shared management projects
