@@ -312,18 +312,8 @@ class ManagementService(
         requestGeneration: Long? = null,
     ) {
         val revision = status.revision.toULong()
-        synchronized(localStatusLock) {
-            if (
-                subscription != localSubscriptionGeneration ||
-                    (requestGeneration != null &&
-                        requestGeneration != localObservationGeneration) ||
-                    localStatusRevision?.let { revision < it } == true
-            )
-                return
-            localStatusRevision = revision
-        }
-        // Conversion cannot hold up stop/reset. Commit only to the same live
-        // subscription and revision after decoding, including malformed samples.
+        // Decode without holding up stop/reset. Admission and every accepted
+        // state change happen together below; a rejected decode leaves no revision.
         val sample =
             try {
                 status.toDomain()
@@ -339,6 +329,7 @@ class ManagementService(
                     localStatusRevision?.let { revision < it } == true
             )
                 return
+            localStatusRevision = revision
             latestLocalSample = sample
             projectLocalSample()
         }
@@ -550,7 +541,7 @@ class ManagementService(
                     if (
                         subscription == localSubscriptionGeneration &&
                             observationGeneration == localObservationGeneration &&
-                            localStatusRevision == null
+                            latestLocalSample == null
                     ) {
                         latestLocalSample = unavailableLocalStatus(0uL)
                         projectLocalSample()

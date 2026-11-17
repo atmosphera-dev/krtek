@@ -348,6 +348,10 @@ tunnel, account, relay or ordinary settings updates. A subscription-scoped
 revision watermark also covers malformed samples. Samples retain their exact
 subscription generation, including a reply completing after stop/start, so a late
 initial result cannot replace a newer event; the next valid sample can recover Local status.
+Status decoding runs outside the acceptance lock. Subscription/generation/revision
+admission and revision/sample commit then form one atomic step, so a rejected
+response cannot leave a watermark or suppress a failed current read's fallback.
+The fallback checks for a committed sample, not a partially admitted revision.
 The initial Local fetch owns convergence when editor generations move during an
 RPC: obsolete success and failure results trigger a read for the new generation,
 not a fixed retry count or a wait for a later event. Cancellation or a replaced

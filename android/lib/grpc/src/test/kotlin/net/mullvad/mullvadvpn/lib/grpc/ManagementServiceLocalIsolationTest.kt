@@ -6,7 +6,9 @@ import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
+import io.mockk.mockkStatic
 import io.mockk.spyk
+import io.mockk.unmockkStatic
 import java.io.File
 import java.io.IOException
 import kotlin.coroutines.Continuation
@@ -14,6 +16,7 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CancellationException
@@ -55,10 +58,70 @@ import net.mullvad.mullvadvpn.lib.model.RelayList
 import net.mullvad.mullvadvpn.lib.model.Settings as ModelSettings
 import net.mullvad.mullvadvpn.lib.model.TunnelState as ModelTunnelState
 import okio.ByteString.Companion.encodeUtf8
+import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ManagementServiceLocalIsolationTest {
+    @Nested
+    inner class AtomicAcceptanceTest {
+        @Test
+        fun `should commit no trace of a rejected conversion before its current retry completes`() =
+            runTest {
+                for (retryFails in listOf(true, false)) {
+                    val rpc = mockk<ManagementServiceClient>(relaxed = true)
+                    val events = Channel<DaemonEvent>(Channel.UNLIMITED)
+                    val initial = CompletableDeferred<LocalNetworkStatus>()
+                    val obsolete = known(99, 1)
+                    val fresh = known(2, 50)
+                    val obsoleteDomain = obsolete.toDomain()
+                    val freshDomain = fresh.toDomain()
+                    var requests = 0
+                    coEvery { rpc.GetLocalNetworkStatus().execute(Unit) } coAnswers
+                        {
+                            if (requests++ == 0) initial.await()
+                            else if (retryFails) throw IOException("current retry failed")
+                            else fresh
+                        }
+                    val service = service(rpc, events)
+                    val mapper = "net.mullvad.mullvadvpn.lib.grpc.mapper.LocalNetworkStatusMapperKt"
+                    mockkStatic(mapper)
+                    try {
+                        every { obsolete.toDomain() } answers
+                            {
+                                // On c488fce this runs after the first locked block
+                                // committed 99, but before the second can commit a sample.
+                                val generation = service.beginLocalNetworkEditor().merge()
+                                service.acknowledgeLocalNetworkEditor(generation, 50)
+                                obsoleteDomain
+                            }
+                        every { fresh.toDomain() } returns freshDomain
+                        service.start()
+                        runCurrent()
+                        initial.complete(obsolete)
+                        runCurrent()
+                        assertEquals(2, requests)
+                        val committed = assertNotNull(service.localNetworkStatus.value)
+                        if (retryFails) {
+                            assertEquals(0uL, committed.revision)
+                            assertEquals(
+                                net.mullvad.mullvadvpn.lib.model.ForwardingAvailability
+                                    .NotAvailable,
+                                committed.forwarding,
+                            )
+                        } else {
+                            assertEquals(freshDomain, committed)
+                        }
+                        coVerify(exactly = 1) { rpc.EventsListen().executeIn(any(), Unit) }
+                    } finally {
+                        service.stop()
+                        runCurrent()
+                        unmockkStatic(mapper)
+                    }
+                }
+            }
+    }
+
     private fun known(revision: Long, sequence: Long) =
         status(revision)
             .copy(
