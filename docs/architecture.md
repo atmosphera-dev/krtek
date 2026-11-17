@@ -396,8 +396,9 @@ Managed daemon shutdown closes admission and joins the TSM through its own
 completion signal, not public tunnel events or physical-network updates. Local
 socket preparations and sole-fd cleanup then join before platform release. A
 failed release returns a failure that retains the daemon and exact recovery
-record. JNI keeps the runtime and registrations reachable and refuses replacement
-initialization until an explicit shutdown retry succeeds; successful cleanup
+record. JNI keeps the runtime and registrations reachable. Initialization retries
+only retained failed cleanup before replacement and refuses a live daemon or a
+failed retry; successful cleanup
 continues through upstream finalization order.
 
 Capture admission and classification select Local, a tunnel target or Drop.

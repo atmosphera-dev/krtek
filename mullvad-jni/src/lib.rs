@@ -3,6 +3,7 @@
 mod api;
 mod capture_network;
 mod classes;
+mod initialization;
 mod local_network;
 mod problem_report;
 
@@ -100,12 +101,29 @@ pub extern "system" fn Java_net_mullvad_mullvadvpn_app_service_MullvadDaemon_ini
 ) {
     let mut ctx = DAEMON_CONTEXT.lock().unwrap();
     let env = JnixEnv::from(env);
-    if ctx.is_some() {
-        ok_or_throw!(
-            &env,
-            Err::<(), _>("Mullvad daemon still owns its runtime or pending cleanup")
-        );
-    }
+    ok_or_throw!(
+        &env,
+        initialization::prepare(
+            &mut ctx,
+            |context| context.running_daemon.is_none()
+                && context.task_failure.is_none()
+                && context.shutdown_failure.is_some(),
+            |context| {
+                let failure = context
+                    .shutdown_failure
+                    .take()
+                    .expect("checked shutdown failure");
+                match context.runtime.block_on(failure.retry()) {
+                    Ok(()) => Ok(()),
+                    Err(failure) => {
+                        let message = failure.to_string();
+                        context.shutdown_failure = Some(failure);
+                        Err(message)
+                    }
+                }
+            },
+        )
+    );
     let files_dir = pathbuf_from_java(&env, files_directory);
 
     // In some cases, this function may be called multiple times for the same daemon process.
