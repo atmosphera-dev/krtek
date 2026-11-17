@@ -6,7 +6,7 @@ import unittest
 from android_parity_retry import initial_retry_contract
 
 
-def fixture(retries):
+def fixture(retries, reuse_endpoint=False):
     events, lines = [], []
 
     def event(state, relay=None):
@@ -17,7 +17,7 @@ def fixture(retries):
         lines.append("01-01 00:00:00.000 42 43 D mullvad-daemon: " + message)
 
     for i in range(retries + 1):
-        relay = "192.0.2.1:" + str(10000 + i)
+        relay = "192.0.2.1:" + str(10000 if reuse_endpoint else 10000 + i)
         event("Connecting", relay)
         log("mullvad_daemon: New tunnel state: Connecting { endpoint: Endpoint { address: " + relay + ", } }")
         if i == retries:
@@ -54,6 +54,23 @@ class InitialRetriesTest(unittest.TestCase):
         bad = "\n".join(line for line in native.splitlines() if "No handshake" not in line)
         with self.assertRaisesRegex(ValueError, "missing-handshake"):
             self.check(events, bad)
+
+    def test_reused_endpoint_is_matched_by_ordered_attempts(self):
+        for count in (1, 2, 20):
+            with self.subTest(count=count):
+                events, native = fixture(count, reuse_endpoint=True)
+                proofs = self.check(events, native)["retries"]
+                self.assertEqual([p["attempt"] for p in proofs], list(range(count)))
+                self.assertEqual({p["relay"] for p in proofs}, {"192.0.2.1:10000"})
+                starts = [p["connecting_line"] for p in proofs]
+                self.assertEqual(starts, sorted(set(starts)))
+
+    def test_reused_endpoint_still_requires_each_cause(self):
+        events, native = fixture(2, reuse_endpoint=True)
+        unexplained = native.replace("No handshake with the relay within 4s", "unexplained first cycle")
+        for bad in (unexplained, unexplained + "\n" + native):
+            with self.subTest(native=bad), self.assertRaises(ValueError):
+                self.check(events, bad)
 
     def test_each_cycle_needs_its_own_cause(self):
         events, native = fixture(2)

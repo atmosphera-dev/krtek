@@ -66,9 +66,25 @@ def initial_retry_contract(events, native, expected_lifecycle):
         if match:
             rows.append({"line": number, "time": match[1], "pid": int(match[2]), "tid": int(match[3]), "message": match[4]})
     first_endpoint = _endpoint(transitions[0][1]["state"])
-    starts = [(i, row) for i, row in enumerate(rows) if "mullvad_daemon: New tunnel state: Connecting {" in row["message"] and _endpoint(row["message"], True) == first_endpoint]
-    _require(len(starts) == 1, "Ambiguous initial native attempt")
-    start, first = starts[0]
+    starts = [i for i, row in enumerate(rows) if "mullvad_daemon: New tunnel state: Connecting {" in row["message"] and _endpoint(row["message"], True) == first_endpoint]
+    matches, errors = [], []
+    for start in starts:
+        try:
+            matches.append(_initial_lifecycle(rows, start, transitions, connected))
+        except ValueError as error:
+            errors.append(error)
+    if not matches:
+        if errors:
+            raise errors[0]
+        raise ValueError("Missing initial native lifecycle/cause sequence")
+    _require(len(matches) == 1, "Ambiguous initial native lifecycle sequence")
+    owned, native_states = matches[0]
+    return {"lifecycle": names, "retries": _retry_causes(owned, native_states, retries)}
+
+
+def _initial_lifecycle(rows, start, transitions, connected):
+    """Identify attempts by ordered state/cause intervals, not destinations."""
+    first = rows[start]
     pid = first["pid"]
     owned = [row for row in rows[start:] if row["pid"] == pid]
     native_states = []
@@ -78,13 +94,18 @@ def initial_retry_contract(events, native, expected_lifecycle):
             native_states.append((match[1], i, row))
             if match[1] == "Connected":
                 break
-    _require([state for state, _, _ in native_states] == names[:connected + 1], "Native/management initial states differ")
+    _require([state for state, _, _ in native_states] == [state for state, _ in transitions[:connected + 1]], "Native/management initial states differ")
     for (state, _, row), (_, event) in zip(native_states, transitions):
         if state in ("Connecting", "Connected"):
             _require(_endpoint(row["message"], True) == _endpoint(event["state"]), "Native/management relay differs")
         else:
             _require(row["message"].endswith("Disconnecting(Reconnect)") and "after_disconnect=RECONNECT" in event["state"], "Not a reconnect action")
+    return owned, native_states
 
+
+def _retry_causes(owned, native_states, retries):
+    """Validate only the identified window; never borrow a later window's cause."""
+    pid = owned[0]["pid"]
     proofs = []
     for attempt in range(retries):
         _, begin, begin_row = native_states[2 * attempt]
@@ -113,4 +134,4 @@ def initial_retry_contract(events, native, expected_lifecycle):
         _require(negotiation[0] < absent[0] < timeout[0] < closed[0] < reason[0] < tsm[0], "Reordered cause chain")
         _require(reason[0] < channel[0] and reason[0] < block[0], "Reconnect precedes its cause")
         proofs.append({"attempt": attempt, "pid": pid, "relay": relay, "cause": "upstream-ephemeral-handshake-timeout", "handshake_seconds": handshake, "exchange_seconds": exchange, "connecting_line": begin_row["line"], "disconnecting_line": end_row["line"], "cause_lines": [item[1]["line"] for item in (negotiation, absent, timeout, closed, reason, tsm, channel, block)]})
-    return {"lifecycle": names, "retries": proofs}
+    return proofs
