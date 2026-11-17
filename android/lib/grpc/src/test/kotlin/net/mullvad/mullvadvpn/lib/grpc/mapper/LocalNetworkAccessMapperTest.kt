@@ -116,10 +116,26 @@ class LocalNetworkAccessMapperTest {
             assertEquals(raw.rules.map { it.name }, read.rules.map { it.name })
             kotlin.test.assertTrue(read.validationError() != null)
             assertFailsWith<IllegalArgumentException> { read.fromDomain() }
-            assertFailsWith<IllegalArgumentException> {
-                LocalNetworkPolicyUpdate(expected = read.fromDomain())
-            }
+            assertEquals(raw, LocalNetworkPolicyUpdate(expected = read.asExpected()).expected)
         }
         assertEquals(policy(), policy().toDomain().fromDomain())
+    }
+
+    @Test
+    fun `should round trip an invalid read as an exact expected token`() {
+        val rule = policy().rules.single().copy(name = "x".repeat(65), cidrs = emptyList())
+        val raw = policy().copy(rules = listOf(rule, rule))
+        val read = raw.toDomain()
+        assertEquals(raw, read.asExpected())
+        assertEquals(read, read.asExpected().toDomain())
+        assertFailsWith<IllegalArgumentException> { read.fromDomain() }
+        val replacement = LocalNetworkAccess()
+        val update = LocalNetworkPolicyUpdate(policy = replacement, expected = read.asExpected())
+        assertEquals(
+            update,
+            LocalNetworkPolicyUpdate.ADAPTER.decode(
+                LocalNetworkPolicyUpdate.ADAPTER.encode(update)
+            ),
+        )
     }
 }

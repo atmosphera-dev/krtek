@@ -230,6 +230,7 @@ class ManagementServiceLocalIsolationTest {
     @Test
     fun `should expose unrelated settings when Local policy is unreadable`() = runTest {
         val rpc = mockk<ManagementServiceClient>(relaxed = true)
+        val setter = rpc.SetLocalNetworkAccess()
         coEvery { rpc.GetLocalNetworkStatus().execute(Unit) } returns status(1)
         val events = Channel<DaemonEvent>(Channel.UNLIMITED)
         val service = service(rpc, events)
@@ -259,13 +260,32 @@ class ManagementServiceLocalIsolationTest {
                 assertEquals(policy.rules.map { it.name }, typed.rules.map { it.name })
                 assertTrue(typed.validationError() != null)
             }
-            assertTrue(
-                service
-                    .setLocalNetworkAccess(net.mullvad.mullvadvpn.lib.model.LocalNetworkAccess())
-                    .isLeft()
-            )
+            if (policy.rules.first().id == "not-a-uuid") {
+                assertTrue(
+                    service
+                        .setLocalNetworkAccess(
+                            net.mullvad.mullvadvpn.lib.model.LocalNetworkAccess()
+                        )
+                        .isLeft()
+                )
+            } else {
+                val expected = checkNotNull(read.localNetworkAccess)
+                assertTrue(
+                    service
+                        .setLocalNetworkAccess(
+                            net.mullvad.mullvadvpn.lib.model.LocalNetworkAccess(),
+                            expected,
+                        )
+                        .isRight()
+                )
+                coVerify(exactly = 1) {
+                    setter.execute(
+                        match { it.expected == policy && it.policy == LocalNetworkAccess() }
+                    )
+                }
+            }
         }
-        coVerify(exactly = 0) { rpc.SetLocalNetworkAccess().execute(any()) }
+        coVerify(exactly = 3) { setter.execute(any()) }
         val raw =
             ManagementService::class
                 .java

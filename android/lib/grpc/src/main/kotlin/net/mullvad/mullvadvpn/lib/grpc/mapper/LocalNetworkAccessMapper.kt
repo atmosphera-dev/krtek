@@ -47,6 +47,11 @@ internal fun localRuleId(text: String): UUID {
 
 internal fun ModelLocalNetworkAccess.fromDomain(): LocalNetworkAccess {
     require(validationError() == null) { "Invalid local network policy" }
+    return asExpected()
+}
+
+/** A read snapshot is an exact comparison token, never replacement input. */
+internal fun ModelLocalNetworkAccess.asExpected(): LocalNetworkAccess {
     return LocalNetworkAccess(
         enabled = enabled,
         rules =

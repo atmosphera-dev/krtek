@@ -37,14 +37,20 @@ impl TryFrom<proto::LocalNetworkAccess> for LocalNetworkAccess {
     type Error = FromProtobufTypeError;
 
     fn try_from(policy: proto::LocalNetworkAccess) -> Result<Self, Self::Error> {
-        let mut policy = local_policy_for_compare_set(policy)?;
+        let mut policy = local_policy_for_update(policy)?;
         policy.deduplicate();
         Ok(policy)
     }
 }
 
-/// Strict validation without changing the caller's exact expected snapshot.
+/// Expected values are lossless compare tokens, including invalid stored policy.
 pub fn local_policy_for_compare_set(
+    policy: proto::LocalNetworkAccess,
+) -> Result<LocalNetworkAccess, FromProtobufTypeError> {
+    read_local_policy(policy)
+}
+
+fn local_policy_for_update(
     policy: proto::LocalNetworkAccess,
 ) -> Result<LocalNetworkAccess, FromProtobufTypeError> {
     // Refuse oversized repeated fields before allocating a second policy.
@@ -225,7 +231,11 @@ mod tests {
                 .expected
                 .map(local_policy_for_compare_set)
                 .transpose();
-            assert!(new.is_err() || expected.is_err());
+            if new.is_err() {
+                assert!(expected.is_ok());
+            } else {
+                assert_eq!(expected.unwrap().unwrap().rules[0].cidrs, vec![]);
+            }
         }
         let mut repeated = original.clone();
         let prefix = repeated.rules[0].cidrs[0];
@@ -249,6 +259,20 @@ mod tests {
         }
         .encode_to_vec();
         assert_eq!(encoded, vec![0x7a, 0]); // Settings field 15, length-delimited.
+    }
+
+    #[test]
+    fn expected_policy_preserves_invalid_read_snapshots_without_normalizing() {
+        let mut stored = policy();
+        stored.rules[0].name = "x".repeat(65);
+        stored.rules[0].cidrs.clear();
+        let read = read_local_policy((&stored).into()).unwrap();
+        assert_eq!(read, stored);
+        assert_eq!(
+            local_policy_for_compare_set((&read).into()).unwrap(),
+            stored
+        );
+        assert!(LocalNetworkAccess::try_from(proto::LocalNetworkAccess::from(&read)).is_err());
     }
 
     #[test]

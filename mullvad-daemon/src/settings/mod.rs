@@ -974,6 +974,65 @@ mod test {
         std::fs::remove_dir(directory).unwrap();
     }
 
+    #[tokio::test]
+    async fn exact_invalid_local_snapshot_can_be_repaired_without_changing_other_settings() {
+        use mullvad_management_interface::types::{self, LocalNetworkAccess as WirePolicy};
+        use mullvad_types::settings::local_network_access::LocalBypassRule;
+        let directory =
+            std::env::temp_dir().join(format!("local-repair-{}", rand::random::<u64>()));
+        std::fs::create_dir(&directory).unwrap();
+        let mut stored = Settings::default();
+        stored.allow_lan = true;
+        stored.local_network_access = LocalNetworkAccess {
+            enabled: false,
+            rules: vec![LocalBypassRule {
+                id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+                name: "x".repeat(65),
+                enabled: true,
+                cidrs: vec![],
+                ssid_ids: vec![],
+            }],
+        };
+        let path = directory.join(SETTINGS_FILE);
+        let original = serde_json::to_vec_pretty(&stored).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let mut loaded = SettingsPersister::load(&directory).await;
+        let read = types::SettingsRead::try_from(types::Settings::from(&loaded.settings)).unwrap();
+        let expected = types::local_policy_for_compare_set(WirePolicy::from(
+            read.local_network_access.policy.as_ref().unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(expected, stored.local_network_access);
+        assert!(
+            loaded
+                .set_local_network_access(expected.clone(), Some(expected.clone()))
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let mut stale = expected.clone();
+        stale.rules[0].name.push('y');
+        assert!(
+            loaded
+                .set_local_network_access(LocalNetworkAccess::default(), Some(stale))
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let valid = LocalNetworkAccess::default();
+        assert!(
+            loaded
+                .set_local_network_access(valid.clone(), Some(expected))
+                .await
+                .unwrap()
+        );
+        stored.local_network_access = valid;
+        assert_eq!(loaded.settings, stored);
+        assert_eq!(SettingsPersister::read_only(&directory).await, stored);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
     /// The [`SettingsPersister`] should always succeed when deserializing a
     /// [`Settings`] object from disk. However, there is a distinction between
     /// different error cases.

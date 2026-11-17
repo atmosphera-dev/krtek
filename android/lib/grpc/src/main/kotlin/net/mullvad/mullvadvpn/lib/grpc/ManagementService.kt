@@ -51,6 +51,7 @@ import mullvad_daemon.management_interface.LocalNetworkPolicyUpdate
 import mullvad_daemon.management_interface.ManagementServiceClient
 import mullvad_daemon.management_interface.NewCustomList
 import mullvad_daemon.relay_selector.RelaySelectorServiceClient
+import net.mullvad.mullvadvpn.lib.grpc.mapper.asExpected
 import net.mullvad.mullvadvpn.lib.grpc.mapper.fromDomain
 import net.mullvad.mullvadvpn.lib.grpc.mapper.toDomain
 import net.mullvad.mullvadvpn.lib.grpc.mapper.toSetLocalNetworkAccessError
@@ -738,15 +739,15 @@ class ManagementService(
     ): Either<SetLocalNetworkAccessError, Unit> =
         Either.catch {
                 val current = _mutableSettings.value?.localNetworkAccess
-                require(current != null && current.validationError() == null) {
-                    "Local policy read unavailable or invalid"
+                require(current != null) {
+                    "Local policy read unavailable"
                 }
                 grpc
                     .SetLocalNetworkAccess()
                     .execute(
                         LocalNetworkPolicyUpdate(
                             policy = policy.fromDomain(),
-                            expected = expected?.fromDomain(),
+                            expected = expected?.asExpected(),
                         )
                     )
             }
