@@ -20,6 +20,74 @@ fn test_forwarder(authority: Arc<Authority>) -> Forwarder<Authority> {
     .unwrap()
 }
 
+#[tokio::test]
+async fn udp_receive_readiness_waits_for_reply_byte_credit_and_resumes_after_output() {
+    for ipv6 in [false, true] {
+        let peer = UdpSocket::bind(loopback(ipv6)).await.unwrap();
+        let flow = target(peer.local_addr().unwrap(), Transport::Udp);
+        let budget = talpid_netstack::buffer_budget::BufferBudget::new(128 * 1024 * 1024);
+        let mut forwarder = Forwarder::with_mtu(
+            Arc::new(Authority::default()),
+            Arc::new(budget.clone()),
+            MAX_SUPPORTED_MTU,
+        )
+        .unwrap();
+        forwarder.ingest(&udp_packet(flow, b"open"));
+        until(&mut forwarder, settled).await;
+        let mut scratch = [0; 16];
+        let (count, client) =
+            tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut scratch))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&scratch[..count], b"open");
+        let payload = vec![0x39; MAX_SUPPORTED_MTU - if ipv6 { 48 } else { 28 }];
+        for index in 0..13 {
+            peer.send_to(&payload, client).await.unwrap();
+            until(&mut forwarder, |f| f.output.len() == index + 1).await;
+        }
+        assert!(forwarder.output.len() < OUTPUT_PACKETS);
+        assert!(
+            forwarder
+                .replies
+                .try_reserve(MAX_SUPPORTED_MTU + BUFFER_OVERHEAD)
+                .is_err()
+        );
+        peer.send_to(b"after-credit-release", client).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            forwarder.udp.values().next().unwrap().physical.readable(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), forwarder.wait())
+                .await
+                .is_err(),
+            "readable UDP without producer credit must not spin"
+        );
+        let first = forwarder.next_output().unwrap();
+        assert_eq!(packet::parse(&first).unwrap().payload, payload);
+        tokio::time::timeout(Duration::from_secs(2), forwarder.wait())
+            .await
+            .unwrap();
+        for _ in 1..13 {
+            let bytes = forwarder.next_output().unwrap();
+            assert_eq!(packet::parse(&bytes).unwrap().payload, payload);
+        }
+        let bytes = forwarder.next_output().unwrap();
+        assert_eq!(
+            packet::parse(&bytes).unwrap().payload,
+            b"after-credit-release"
+        );
+        assert!(!forwarder.has_output());
+        forwarder.close_all().await;
+        drop(forwarder);
+        assert_eq!(budget.used(), 0);
+    }
+}
+
 // Test-only convenience consumer. Production can only write through the checked
 // callback, keeping the grant inside the forwarder even across WouldBlock.
 impl Forwarder<Authority> {

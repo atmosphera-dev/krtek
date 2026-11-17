@@ -1260,8 +1260,13 @@ impl<A: LocalAuthority> Forwarder<A> {
                 ready |= entry.physical.poll_write_ready(cx).is_ready();
             }
         }
+        // Readability is actionable only when pump_udp can reserve its producer
+        // peak. Retained replies can exhaust bytes long before the slot ceiling;
+        // a blocked sink must not turn that readable socket into a busy wake.
+        let udp_receive_capacity = self.output.len() < OUTPUT_PACKETS
+            && self.replies.try_reserve(self.mtu + BUFFER_OVERHEAD).is_ok();
         for entry in self.udp.values() {
-            if self.output.len() < OUTPUT_PACKETS {
+            if udp_receive_capacity {
                 ready |= entry.physical.poll_recv_ready(cx).is_ready();
             }
             if !entry.held.is_empty() {
