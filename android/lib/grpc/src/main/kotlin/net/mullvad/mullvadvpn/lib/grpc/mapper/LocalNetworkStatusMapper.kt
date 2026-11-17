@@ -16,6 +16,7 @@ import net.mullvad.mullvadvpn.lib.model.WifiUnknownReason
 internal fun LocalNetworkStatus.toDomain(): ModelLocalNetworkStatus =
     ModelLocalNetworkStatus(
         revision = revision.toULong(),
+        observationSequence = observation_sequence.toULong(),
         observerAvailable = observer_available,
         forwarding =
             when (forwarding) {

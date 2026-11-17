@@ -93,7 +93,11 @@ class MullvadVpnService : MullvadVpnServiceLifecycle() {
         managementService.start()
 
         lifecycleScope.launch {
-            settingsRepository.localNetworkEditorDemand.collect(::setLocalNetworkEditorDemand)
+            settingsRepository.localNetworkEditorRequests.collect { request ->
+                val minimum = setLocalNetworkEditorDemand(request.wanted)
+                if (request.wanted)
+                    settingsRepository.acknowledgeLocalNetworkEditor(request.generation, minimum)
+            }
         }
 
         observeNonblockingErrors(managementService.tunnelState)

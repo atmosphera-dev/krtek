@@ -8,6 +8,7 @@ data class LocalNetworkStatus(
     val forwarding: ForwardingAvailability,
     val currentWifi: ConnectedWifi,
     val rules: List<LocalRuleStatus>,
+    val observationSequence: ULong = 0uL,
 )
 
 enum class ForwardingAvailability {

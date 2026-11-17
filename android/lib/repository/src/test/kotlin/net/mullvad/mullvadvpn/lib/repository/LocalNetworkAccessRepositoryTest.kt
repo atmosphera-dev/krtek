@@ -1,6 +1,7 @@
 package net.mullvad.mullvadvpn.lib.repository
 
 import arrow.core.left
+import arrow.core.right
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
@@ -30,6 +31,8 @@ class LocalNetworkAccessRepositoryTest {
             mockk<ManagementService> {
                 every { settings } returns emptyFlow()
                 every { localNetworkStatus } returns status
+                every { beginLocalNetworkEditor() } returns 1L.right()
+                every { endLocalNetworkEditor(any()) } returns Unit.right()
                 coEvery { setLocalNetworkAccess(policy, expected) } returns
                     SetLocalNetworkAccessError.Conflict.left()
             }
@@ -55,5 +58,40 @@ class LocalNetworkAccessRepositoryTest {
         editorTwo.cancel()
         runCurrent()
         assertEquals(listOf(false, true, false), demands)
+        io.mockk.verify(exactly = 1) { service.beginLocalNetworkEditor() }
+        io.mockk.verify(exactly = 1) { service.endLocalNetworkEditor(1L) }
+    }
+
+    @Test
+    fun `should keep a new editor generation through conflated close and reopen`() = runTest {
+        val service =
+            mockk<ManagementService> {
+                every { settings } returns emptyFlow()
+                every { beginLocalNetworkEditor() } returnsMany listOf(1L.right(), 3L.right())
+                every { endLocalNetworkEditor(any()) } returns Unit.right()
+                every { acknowledgeLocalNetworkEditor(any(), any()) } returns Unit.right()
+            }
+        val repository = SettingsRepository(service, StandardTestDispatcher(testScheduler))
+        val first = backgroundScope.launch { repository.observeLocalNetworkForEditor() }
+        runCurrent()
+        assertEquals(
+            LocalNetworkEditorRequest(1L, true),
+            repository.localNetworkEditorRequests.value,
+        )
+        first.cancel()
+        val second = backgroundScope.launch { repository.observeLocalNetworkForEditor() }
+        runCurrent()
+        assertEquals(
+            LocalNetworkEditorRequest(3L, true),
+            repository.localNetworkEditorRequests.value,
+        )
+        repository.acknowledgeLocalNetworkEditor(3L, 41L)
+        io.mockk.verify(exactly = 1) { service.acknowledgeLocalNetworkEditor(3L, 41L) }
+        second.cancel()
+        runCurrent()
+        assertEquals(
+            LocalNetworkEditorRequest(3L, false),
+            repository.localNetworkEditorRequests.value,
+        )
     }
 }

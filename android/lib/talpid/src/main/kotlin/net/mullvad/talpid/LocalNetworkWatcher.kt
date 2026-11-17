@@ -34,6 +34,15 @@ internal class LocalNetworkWatcher(
 
     fun registered(value: Long): Boolean = synchronized(lock) { value > 0 && registration == value }
 
+    /** The service acknowledges this fence only after applying editor demand. */
+    val minimumUsableSequence: Long
+        get() =
+            synchronized(lock) {
+                if (running && !pending && published?.observerRunning == true)
+                    checkNotNull(published).sequence
+                else Math.addExact(sequence, 1L)
+            }
+
     fun start(): Unit =
         synchronized(lock) {
             if (running) return

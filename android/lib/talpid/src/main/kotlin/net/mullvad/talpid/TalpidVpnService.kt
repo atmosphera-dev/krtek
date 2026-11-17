@@ -100,7 +100,10 @@ open class TalpidVpnService : LifecycleVpnService() {
             }
         }
 
-    fun setLocalNetworkEditorDemand(demanded: Boolean) = localNetworkDemand.editor(demanded)
+    fun setLocalNetworkEditorDemand(demanded: Boolean): Long {
+        localNetworkDemand.editor(demanded)
+        return localNetworkWatcher.minimumUsableSequence
+    }
 
     // Used by JNI. Policy demand comes from the daemon, never a cached UI read.
     @Suppress("Unused")

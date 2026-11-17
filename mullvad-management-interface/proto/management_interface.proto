@@ -857,6 +857,8 @@ message LocalNetworkStatus {
   ForwardingAvailability forwarding = 3;
   ConnectedWifi current_wifi = 4;
   repeated LocalRuleStatus rules = 5;
+  // Ephemeral source identity, not a forwarding grant. Zero means unavailable.
+  uint64 observation_sequence = 6;
 }
 
 message ConnectedWifi {

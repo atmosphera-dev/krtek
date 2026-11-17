@@ -819,13 +819,18 @@ mod tests {
             },
         );
         runtime.notifications().0.await;
-        assert!(
-            runtime
-                .update(&policy, TargetState::Unsecured, true)
-                .await
-                .is_none()
+        let fresh = runtime
+            .update(&policy, TargetState::Unsecured, true)
+            .await
+            .unwrap();
+        let mut expected = changed.clone();
+        expected.observation_sequence = 2;
+        expected.revision = first + 2;
+        assert_eq!(
+            fresh, expected,
+            "Only fresh source identity and its publication revision change"
         );
-        assert_eq!(runtime.status(), &changed);
+        assert_eq!(runtime.status(), &fresh);
         policy.enabled = false;
         assert_eq!(
             runtime
@@ -833,7 +838,7 @@ mod tests {
                 .await
                 .unwrap()
                 .revision,
-            first + 2
+            first + 3
         );
         assert!(
             runtime

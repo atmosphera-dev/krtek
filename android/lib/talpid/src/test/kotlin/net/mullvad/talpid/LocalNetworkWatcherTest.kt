@@ -22,6 +22,37 @@ import org.junit.jupiter.api.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class LocalNetworkWatcherTest {
     @Test
+    fun `should acknowledge only usable source sequences across stop and resume`() = runTest {
+        val source = FakeSource()
+        val pushes = mutableListOf<LocalNetworkSnapshot>()
+        val watcher =
+            LocalNetworkWatcher(source, backgroundScope, StandardTestDispatcher(testScheduler)) {
+                _,
+                value ->
+                pushes += value
+            }
+        watcher.attach(7)
+        watcher.start()
+        val first = watcher.minimumUsableSequence
+        runCurrent()
+        assertTrue(pushes.last().observerRunning)
+        assertEquals(first, pushes.last().sequence)
+        assertEquals(
+            first,
+            watcher.minimumUsableSequence,
+            "Continuous observation needs no new sample",
+        )
+        watcher.stop()
+        watcher.start()
+        val resumed = watcher.minimumUsableSequence
+        assertTrue(resumed > first)
+        assertTrue(pushes.last().sequence < resumed)
+        runCurrent()
+        assertEquals(resumed, pushes.last().sequence)
+        watcher.stop()
+    }
+
+    @Test
     fun `should build complete physical records and coalesce fake callbacks`() = runTest {
         val source = FakeSource()
         val pushes = mutableListOf<LocalNetworkSnapshot>()

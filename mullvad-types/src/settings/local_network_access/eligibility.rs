@@ -627,12 +627,20 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_sequence_is_retained_without_becoming_a_status_input() {
+    fn snapshot_sequence_is_retained_for_observation_freshness() {
         let snapshot = LocalNetworkSnapshot {
             sequence: 97,
             ..Default::default()
         };
         assert_eq!(NetworkObservation::from(&snapshot).sequence, 97);
+        assert_eq!(
+            super::super::status::LocalNetworkStatus::from_observation(
+                &LocalNetworkAccess::default(),
+                Some(&NetworkObservation::from(&snapshot))
+            )
+            .observation_sequence,
+            97
+        );
     }
 
     #[test]

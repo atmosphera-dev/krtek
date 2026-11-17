@@ -1402,6 +1402,32 @@ async fn status_revisions_follow_rule_status_not_covered_route_edits() {
 }
 
 #[tokio::test]
+async fn fresh_observation_identity_is_published_without_rebuilding_capture() {
+    let mut h = Handover::new(policy());
+    h.continuation.connect();
+    assert_eq!(h.admit().await, Some("Connect"));
+    h.connect_endpoint().await;
+    let before = h.runtime.status().clone();
+    let capture = h.runtime.broker().snapshot().capture_generation;
+    let starts = h.platform.starts.load(SeqCst);
+    let mut fresh = physical_snapshot();
+    fresh.sequence = i64::try_from(before.observation_sequence + 1).unwrap();
+    assert!(h.physical_feed.publish(33, fresh));
+    let after = h
+        .runtime
+        .update(&h.policy, h.target, h.phase)
+        .await
+        .expect("Fresh identity must be observable even for unchanged Wi-Fi");
+    assert_eq!(after.observation_sequence, before.observation_sequence + 1);
+    assert_eq!(after.revision, before.revision + 1);
+    assert_eq!(after.current_wifi, before.current_wifi);
+    assert_eq!(after.rules, before.rules);
+    assert_eq!(h.platform.starts.load(SeqCst), starts);
+    assert_eq!(h.runtime.broker().snapshot().capture_generation, capture);
+    h.close().await;
+}
+
+#[tokio::test]
 async fn second_settings_reconnect_cannot_close_queued_target_admission() {
     use talpid_tunnel::tun_provider::transport::ManagedTun;
 

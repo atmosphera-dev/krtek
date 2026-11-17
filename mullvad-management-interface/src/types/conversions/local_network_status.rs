@@ -5,6 +5,7 @@ impl From<&LocalNetworkStatus> for proto::LocalNetworkStatus {
     fn from(status: &LocalNetworkStatus) -> Self {
         Self {
             revision: status.revision,
+            observation_sequence: status.observation_sequence,
             observer_available: status.observer_available,
             forwarding: proto::local_network_status::ForwardingAvailability::from(status.forwarding)
                 as i32,
@@ -91,6 +92,7 @@ impl TryFrom<proto::LocalNetworkStatus> for LocalNetworkStatus {
             .collect::<Result<_, FromProtobufTypeError>>()?;
         Ok(Self {
             revision: status.revision,
+            observation_sequence: status.observation_sequence,
             observer_available: status.observer_available,
             forwarding,
             current_wifi,
@@ -175,6 +177,7 @@ mod tests {
         wifi.into_iter()
             .map(|current_wifi| LocalNetworkStatus {
                 revision: u64::MAX,
+                observation_sequence: 0,
                 observer_available: true,
                 forwarding: ForwardingAvailability::NotAvailable,
                 current_wifi,
@@ -215,6 +218,22 @@ mod tests {
                 matches!(crate::client::DaemonEvent::try_from(event.event.unwrap()).unwrap(), crate::client::DaemonEvent::LocalNetworkStatus(status) if status == sample)
             );
         }
+    }
+
+    #[test]
+    fn source_observation_identity_is_additive_and_lossless() {
+        let mut sample = samples().remove(0);
+        assert_eq!(sample.observation_sequence, 0);
+        sample.observation_sequence = 97;
+        let encoded = proto::LocalNetworkStatus::from(&sample).encode_to_vec();
+        assert!(encoded.ends_with(&[0x30, 97])); // Additive field 6.
+        assert_eq!(
+            LocalNetworkStatus::try_from(
+                proto::LocalNetworkStatus::decode(encoded.as_slice()).unwrap()
+            )
+            .unwrap(),
+            sample
+        );
     }
 
     #[test]

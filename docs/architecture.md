@@ -348,6 +348,14 @@ tunnel, account, relay or ordinary settings updates. A subscription-scoped
 revision watermark also covers malformed samples. Samples retain their exact
 subscription generation, including a reply completing after stop/start, so a late
 initial result cannot replace a newer event; the next valid sample can recover Local status.
+Editor demand has its own generation. Its service owner acknowledges the minimum
+usable watcher snapshot sequence after applying demand, and Local status carries
+that existing source sequence (zero means no identity). Shared management projects
+Wi-Fi as Pending until the acknowledged fence is met. A late pre-stop sample
+cannot fill a reopened draft just because its publication revision is newer.
+Continuous policy observation can acknowledge the already-live sample without
+waiting for a new event; fresh same-SSID observations remain observable. The
+editor's five-second explanation deadline does not cancel its pending request.
 Policy reads retain exact representable values and their validation result.
 Unrepresentable Local protobufs stay at the management conversion boundary and
 are exposed as a Local read error, never as an OFF/empty replacement. Local

@@ -62,6 +62,7 @@ pub enum ConnectedWifi {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalNetworkStatus {
     pub revision: u64,
+    pub observation_sequence: u64,
     pub observer_available: bool,
     pub forwarding: ForwardingAvailability,
     pub current_wifi: ConnectedWifi,
@@ -165,6 +166,8 @@ impl LocalNetworkStatus {
     ) -> Self {
         Self {
             revision: 0,
+            observation_sequence: observation
+                .map_or(0, |sample| sample.sequence.try_into().unwrap_or(0)),
             observer_available: observation.is_some(),
             forwarding: ForwardingAvailability::NotAvailable,
             current_wifi: current_wifi(observation),

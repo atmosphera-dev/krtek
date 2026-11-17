@@ -1,5 +1,6 @@
 package net.mullvad.mullvadvpn.lib.repository
 
+import arrow.core.merge
 import java.net.InetAddress
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -9,10 +10,10 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
-import kotlinx.coroutines.flow.update
 import net.mullvad.mullvadvpn.lib.grpc.ManagementService
 import net.mullvad.mullvadvpn.lib.model.Constraint
 import net.mullvad.mullvadvpn.lib.model.CustomDnsOptions
@@ -34,15 +35,37 @@ class SettingsRepository(
     val localNetworkStatus
         get() = managementService.localNetworkStatus
 
-    private val localEditors = MutableStateFlow(0)
-    val localNetworkEditorDemand: Flow<Boolean> = localEditors.map { it > 0 }.distinctUntilChanged()
+    private val localEditorLock = Any()
+    private var localEditors = 0
+    private val editorRequests = MutableStateFlow(LocalNetworkEditorRequest(0L, false))
+    val localNetworkEditorRequests: StateFlow<LocalNetworkEditorRequest> =
+        editorRequests.asStateFlow()
+    val localNetworkEditorDemand: Flow<Boolean> =
+        editorRequests.map { it.wanted }.distinctUntilChanged()
+
+    fun acknowledgeLocalNetworkEditor(generation: Long, minimumSequence: Long) =
+        managementService.acknowledgeLocalNetworkEditor(generation, minimumSequence)
 
     suspend fun observeLocalNetworkForEditor(): Nothing {
-        localEditors.update { it + 1 }
+        val generation =
+            synchronized(localEditorLock) {
+                if (localEditors == 0) {
+                    val next = managementService.beginLocalNetworkEditor().merge()
+                    editorRequests.value = LocalNetworkEditorRequest(next, true)
+                }
+                localEditors++
+                editorRequests.value.generation
+            }
         try {
             awaitCancellation()
         } finally {
-            localEditors.update { it - 1 }
+            synchronized(localEditorLock) {
+                localEditors--
+                if (localEditors == 0) {
+                    managementService.endLocalNetworkEditor(generation)
+                    editorRequests.value = LocalNetworkEditorRequest(generation, false)
+                }
+            }
         }
     }
 
@@ -113,3 +136,5 @@ class SettingsRepository(
 
     suspend fun setRecentsEnabled(enabled: Boolean) = managementService.setRecentsEnabled(enabled)
 }
+
+data class LocalNetworkEditorRequest(val generation: Long, val wanted: Boolean)

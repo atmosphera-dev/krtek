@@ -249,15 +249,74 @@ class ManagementService(
     private val localStatusLock = Any()
     private var localStatusRevision: ULong? = null
     private var localSubscriptionGeneration = 0L
+    private var localObservationGeneration = 0L
+    private var activeLocalEditor: Long? = null
+    private var minimumEditorSequence: ULong? = null
+    private var latestLocalSample: LocalNetworkStatus? = null
+
+    fun beginLocalNetworkEditor(): Either<Nothing, Long> =
+        synchronized(localStatusLock) {
+            localObservationGeneration = Math.addExact(localObservationGeneration, 1L)
+            activeLocalEditor = localObservationGeneration
+            minimumEditorSequence = null
+            projectLocalSample()
+            Either.Right(localObservationGeneration)
+        }
+
+    fun acknowledgeLocalNetworkEditor(
+        generation: Long,
+        minimumSequence: Long,
+    ): Either<Nothing, Unit> =
+        synchronized(localStatusLock) {
+            if (activeLocalEditor == generation && minimumSequence > 0L) {
+                minimumEditorSequence = minimumSequence.toULong()
+                projectLocalSample()
+            }
+            Either.Right(Unit)
+        }
+
+    fun endLocalNetworkEditor(generation: Long): Either<Nothing, Unit> =
+        synchronized(localStatusLock) {
+            if (activeLocalEditor == generation) {
+                activeLocalEditor = null
+                minimumEditorSequence = null
+                localObservationGeneration = Math.addExact(localObservationGeneration, 1L)
+                projectLocalSample()
+            }
+            Either.Right(Unit)
+        }
+
+    /** One projection owns freshness for every consumer of the shared status. */
+    private fun projectLocalSample() {
+        _localNetworkStatus.value = latestLocalSample?.let { sample ->
+            val minimum = minimumEditorSequence
+            if (
+                activeLocalEditor != null &&
+                    (minimum == null ||
+                        sample.observationSequence == 0uL ||
+                        sample.observationSequence < minimum)
+            )
+                sample.copy(
+                    currentWifi =
+                        net.mullvad.mullvadvpn.lib.model.ConnectedWifi.Unknown(
+                            net.mullvad.mullvadvpn.lib.model.WifiUnknownReason.Pending
+                        )
+                )
+            else sample
+        }
+    }
 
     private fun acceptLocalNetworkStatus(
         status: mullvad_daemon.management_interface.LocalNetworkStatus,
         subscription: Long,
+        requestGeneration: Long? = null,
     ) {
         val revision = status.revision.toULong()
         synchronized(localStatusLock) {
             if (
                 subscription != localSubscriptionGeneration ||
+                    (requestGeneration != null &&
+                        requestGeneration != localObservationGeneration) ||
                     localStatusRevision?.let { revision < it } == true
             )
                 return
@@ -275,10 +334,13 @@ class ManagementService(
         synchronized(localStatusLock) {
             if (
                 subscription != localSubscriptionGeneration ||
+                    (requestGeneration != null &&
+                        requestGeneration != localObservationGeneration) ||
                     localStatusRevision?.let { revision < it } == true
             )
                 return
-            _localNetworkStatus.value = sample
+            latestLocalSample = sample
+            projectLocalSample()
         }
     }
 
@@ -322,7 +384,12 @@ class ManagementService(
 
     fun stop() {
         val active = job ?: error("ManagementService already stopped")
-        synchronized(localStatusLock) { localSubscriptionGeneration++ }
+        synchronized(localStatusLock) {
+            localSubscriptionGeneration++
+            latestLocalSample = null
+            _localNetworkStatus.value = null
+            minimumEditorSequence = null
+        }
         active.cancel(message = "ManagementService stopped")
         job = null
     }
@@ -337,6 +404,7 @@ class ManagementService(
                         if (!isActive) return@withContext
                         localSubscriptionGeneration++
                         localStatusRevision = null
+                        latestLocalSample = null
                         _localNetworkStatus.value = null
                         localSubscriptionGeneration
                     }
@@ -522,10 +590,13 @@ class ManagementService(
             async { _mutableDeviceState.update { getDeviceState() } },
             async { _mutableSettings.update { getSettings() } },
             async {
+                val observationGeneration =
+                    synchronized(localStatusLock) { localObservationGeneration }
                 try {
                     acceptLocalNetworkStatus(
                         grpc.GetLocalNetworkStatus().execute(Unit),
                         subscription,
+                        observationGeneration,
                     )
                 } catch (cancelled: CancellationException) {
                     throw cancelled
@@ -536,9 +607,12 @@ class ManagementService(
                     synchronized(localStatusLock) {
                         if (
                             subscription == localSubscriptionGeneration &&
+                                observationGeneration == localObservationGeneration &&
                                 localStatusRevision == null
-                        )
-                            _localNetworkStatus.value = unavailableLocalStatus(0uL)
+                        ) {
+                            latestLocalSample = unavailableLocalStatus(0uL)
+                            projectLocalSample()
+                        }
                     }
                 }
             },
@@ -738,8 +812,7 @@ class ManagementService(
         expected: LocalNetworkAccess? = null,
     ): Either<SetLocalNetworkAccessError, Unit> =
         Either.catch {
-                val current = _mutableSettings.value?.localNetworkAccess
-                require(current != null) {
+                requireNotNull(_mutableSettings.value?.localNetworkAccess) {
                     "Local policy read unavailable"
                 }
                 grpc

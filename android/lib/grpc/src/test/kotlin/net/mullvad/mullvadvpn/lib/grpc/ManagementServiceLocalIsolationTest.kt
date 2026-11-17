@@ -1,6 +1,7 @@
 package net.mullvad.mullvadvpn.lib.grpc
 
 import arrow.core.Either
+import arrow.core.merge
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
@@ -53,10 +54,115 @@ import net.mullvad.mullvadvpn.lib.model.DeviceState
 import net.mullvad.mullvadvpn.lib.model.RelayList
 import net.mullvad.mullvadvpn.lib.model.Settings as ModelSettings
 import net.mullvad.mullvadvpn.lib.model.TunnelState as ModelTunnelState
+import okio.ByteString.Companion.encodeUtf8
 import org.junit.jupiter.api.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ManagementServiceLocalIsolationTest {
+    private fun known(revision: Long, sequence: Long) =
+        status(revision)
+            .copy(
+                observer_available = true,
+                observation_sequence = sequence,
+                current_wifi =
+                    ConnectedWifi(identity = ConnectedWifi.Identity.Ssid("A".encodeUtf8())),
+            )
+
+    @Test
+    fun `should fence pre stop Known and accept fresh same SSID for a reopened editor`() = runTest {
+        val rpc = mockk<ManagementServiceClient>(relaxed = true)
+        val events = Channel<DaemonEvent>(Channel.UNLIMITED)
+        coEvery { rpc.GetLocalNetworkStatus().execute(Unit) } returns known(20, 100)
+        val service = service(rpc, events)
+        service.start()
+        runCurrent()
+        val first = service.beginLocalNetworkEditor().merge()
+        service.acknowledgeLocalNetworkEditor(first, 100)
+        assertIs<net.mullvad.mullvadvpn.lib.model.ConnectedWifi.Known>(
+            service.localNetworkStatus.value?.currentWifi
+        )
+        service.endLocalNetworkEditor(first)
+        val reopened = service.beginLocalNetworkEditor().merge()
+        service.acknowledgeLocalNetworkEditor(first, 1)
+        service.acknowledgeLocalNetworkEditor(reopened, 103)
+        // R+1 is newer client metadata but still belongs to the pre-stop source.
+        events.send(DaemonEvent(event = DaemonEvent.Event.LocalNetworkStatus(known(21, 101))))
+        runCurrent()
+        assertEquals(
+            net.mullvad.mullvadvpn.lib.model.ConnectedWifi.Unknown(
+                net.mullvad.mullvadvpn.lib.model.WifiUnknownReason.Pending
+            ),
+            service.localNetworkStatus.value?.currentWifi,
+        )
+        events.send(DaemonEvent(event = DaemonEvent.Event.LocalNetworkStatus(known(22, 103))))
+        runCurrent()
+        assertIs<net.mullvad.mullvadvpn.lib.model.ConnectedWifi.Known>(
+            service.localNetworkStatus.value?.currentWifi
+        )
+        assertEquals(103uL, service.localNetworkStatus.value?.observationSequence)
+        service.stop()
+    }
+
+    @Test
+    fun `should use continuously observed policy without a new status and reject zero identity`() =
+        runTest {
+            val rpc = mockk<ManagementServiceClient>(relaxed = true)
+            val events = Channel<DaemonEvent>(Channel.UNLIMITED)
+            coEvery { rpc.GetLocalNetworkStatus().execute(Unit) } returns known(7, 50)
+            val service = service(rpc, events)
+            service.start()
+            runCurrent()
+            val generation = service.beginLocalNetworkEditor().merge()
+            assertIs<net.mullvad.mullvadvpn.lib.model.ConnectedWifi.Unknown>(
+                service.localNetworkStatus.value?.currentWifi
+            )
+            service.acknowledgeLocalNetworkEditor(generation, 50)
+            assertIs<net.mullvad.mullvadvpn.lib.model.ConnectedWifi.Known>(
+                service.localNetworkStatus.value?.currentWifi
+            )
+            assertEquals(7uL, service.localNetworkStatus.value?.revision)
+            events.send(DaemonEvent(event = DaemonEvent.Event.LocalNetworkStatus(known(8, 0))))
+            runCurrent()
+            assertIs<net.mullvad.mullvadvpn.lib.model.ConnectedWifi.Unknown>(
+                service.localNetworkStatus.value?.currentWifi
+            )
+            service.stop()
+            assertNull(
+                service.localNetworkStatus.value,
+                "A stopped daemon cannot lend a source identity to its successor",
+            )
+        }
+
+    @Test
+    fun `should reject a late RPC from an old editor generation without poisoning revisions`() =
+        runTest {
+            val rpc = mockk<ManagementServiceClient>(relaxed = true)
+            val events = Channel<DaemonEvent>(Channel.UNLIMITED)
+            var oldReply: Continuation<LocalNetworkStatus>? = null
+            coEvery { rpc.GetLocalNetworkStatus().execute(Unit) } coAnswers
+                {
+                    suspendCoroutine { oldReply = it }
+                }
+            val service = service(rpc, events)
+            service.start()
+            runCurrent()
+            val first = service.beginLocalNetworkEditor().merge()
+            service.acknowledgeLocalNetworkEditor(first, 10)
+            service.endLocalNetworkEditor(first)
+            val second = service.beginLocalNetworkEditor().merge()
+            service.acknowledgeLocalNetworkEditor(second, 20)
+            checkNotNull(oldReply).resume(known(99, 9))
+            runCurrent()
+            assertNull(service.localNetworkStatus.value)
+            events.send(DaemonEvent(event = DaemonEvent.Event.LocalNetworkStatus(known(2, 20))))
+            runCurrent()
+            assertEquals(2uL, service.localNetworkStatus.value?.revision)
+            assertIs<net.mullvad.mullvadvpn.lib.model.ConnectedWifi.Known>(
+                service.localNetworkStatus.value?.currentWifi
+            )
+            service.stop()
+        }
+
     private fun status(revision: Long) =
         LocalNetworkStatus(
             revision = revision,
