@@ -210,7 +210,21 @@ pub(crate) fn inspect(
             }
             break;
         }
-        let quoted = &bytes[start..parent.end];
+        // RFC 4884's original-datagram length excludes the appended extension
+        // structure. It is type-specific: PTB MTUs and parameter pointers must
+        // never be mistaken for lengths. Zero retains the legacy full quote.
+        let transport = parent.header.transport;
+        let length = match (parent.header.ipv4, view[transport]) {
+            (true, 3 | 11 | 12) => usize::from(view[transport + 5]) * 4,
+            (false, 1 | 3) => usize::from(view[transport + 4]) * 8,
+            _ => 0,
+        };
+        let end = if length == 0 {
+            parent.end
+        } else {
+            parent.end.min(start + length)
+        };
+        let quoted = &bytes[start..end];
         if quoted.len()
             < if quoted.first().is_some_and(|byte| byte >> 4 == 6) {
                 40

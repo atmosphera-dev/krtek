@@ -93,6 +93,71 @@ fn check_quote(
     );
 }
 
+#[test]
+fn rfc4884_extensions_are_not_part_of_truncated_quotations() {
+    let (mut mapper, _capture, _attempt, _) = mapper();
+    for v4 in [true, false] {
+        for direction in [Direction::Inbound, Direction::Outbound] {
+            let (src, dst, new_src, new_dst) = endpoints(v4, direction);
+            let quotation = |src, dst| {
+                let mut quoted = packet(src, dst, 6, &segment(6));
+                if v4 {
+                    quoted.resize(200, 0x5a);
+                    quoted[2..4].copy_from_slice(&200u16.to_be_bytes());
+                    fix_checksums(&mut quoted, 20, 6);
+                    quoted.truncate(128);
+                } else {
+                    let mut hop = vec![0; 1160];
+                    hop[0] = 6;
+                    hop[1] = 144;
+                    quoted.splice(40..40, hop);
+                    quoted[6] = 0;
+                    let length = (quoted.len() - 40) as u16;
+                    quoted[4..6].copy_from_slice(&length.to_be_bytes());
+                    fix_checksums(&mut quoted, 1200, 6);
+                    // The absent checksum would start at offset 1216, exactly
+                    // where the independent ICMP extension structure begins.
+                    quoted.truncate(1216);
+                }
+                quoted
+            };
+            let original = quotation(src, dst);
+            let expected = quotation(new_src, new_dst);
+            let mut extension = [
+                0x20, 0, 0, 0, 0, 12, 1, 1, 0x5a, 0x5b, 0x5c, 0x5d, 1, 2, 3, 4,
+            ];
+            let sum = oracle(&extension);
+            extension[2..4].copy_from_slice(&sum.to_be_bytes());
+            for kind in if v4 { vec![3, 11, 12] } else { vec![1, 3] } {
+                let ip = if v4 { 20 } else { 40 };
+                let protocol = if v4 { 1 } else { 58 };
+                let mut input = error(&original, v4, direction);
+                input[ip] = kind;
+                input[ip + 1] = 0;
+                input[ip + if v4 { 5 } else { 4 }] =
+                    (original.len() / if v4 { 4 } else { 8 }) as u8;
+                input.extend_from_slice(&extension);
+                if v4 {
+                    let length = input.len() as u16;
+                    input[2..4].copy_from_slice(&length.to_be_bytes());
+                } else {
+                    let length = (input.len() - 40) as u16;
+                    input[4..6].copy_from_slice(&length.to_be_bytes());
+                }
+                fix_checksums(&mut input, ip, protocol);
+                let translated = mapper.translate(&input, direction).unwrap();
+                let view = translated.view();
+                let output = view.bytes();
+                assert_eq!(&output[ip + 8..ip + 8 + original.len()], expected);
+                assert_eq!(&output[ip + 8 + original.len()..], extension);
+                assert_eq!(oracle(&output[ip + 8 + original.len()..]), 0);
+                assert_eq!(wire_checksum(output, ip, protocol), 0);
+                assert_eq!(&output[ip + 4..ip + 8], &input[ip + 4..ip + 8]);
+            }
+        }
+    }
+}
+
 fn first_fragment(mut bytes: Vec<u8>, v4: bool) -> Vec<u8> {
     if v4 {
         bytes.truncate(28);
