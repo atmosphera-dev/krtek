@@ -1473,6 +1473,7 @@ async fn mixed_backpressure_rotates_both_consumers_and_revokes_only_blocked_loca
     let mut classes = Vec::new();
     let mut raw_received = Vec::new();
     let mut revoked = false;
+    let mut blocked_local: Option<Vec<u8>> = None;
     bounded(async {
         while raw_received.len() < total {
             // Match the real owner's processing cycle: successful emission
@@ -1495,6 +1496,10 @@ async fn mixed_backpressure_rotates_both_consumers_and_revokes_only_blocked_loca
                 } else {
                     classes.push("local");
                     assert_ne!(packet::parse(&bytes).unwrap().payload, b"local-revoked-while-blocked");
+                    if let Some(blocked) = &blocked_local {
+                        assert_ne!(packet::parse(&bytes).unwrap().payload, blocked.as_slice(),
+                            "the exact batch blocked at revocation escaped");
+                    }
                 }
                 if classes.len() == 4 {
                     assert!(classes.contains(&"local") && classes.contains(&"raw"), "one class monopolized the first four output slots: {classes:?}");
@@ -1503,6 +1508,12 @@ async fn mixed_backpressure_rotates_both_consumers_and_revokes_only_blocked_loca
             if !revoked && classes.len() >= 8 {
                 forwarder.process();
                 assert!(forwarder.has_output(), "Local producer was not backlogged");
+                let error = forwarder.write_output(|bytes| {
+                    blocked_local = Some(packet::parse(bytes).unwrap().payload.to_vec());
+                    Err(io::ErrorKind::WouldBlock.into())
+                }).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                assert!(blocked_local.is_some());
                 assert!(reply.is_some() || taken < total, "raw producer was not backlogged");
                 forwarder.ingest(&udp(local, b"local-revoked-while-blocked"));
                 bounded(hits.recv()).await.unwrap();

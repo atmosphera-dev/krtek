@@ -38,6 +38,18 @@ pub(crate) struct PacketBatch {
 }
 
 impl PacketBatch {
+    /// Check and hold sibling producer credit until this batch is fully funded.
+    /// The owner serializes admissions; releasing the temporary hold does not
+    /// partition idle capacity away from TCP.
+    pub(crate) fn reserve_preserving(
+        buffers: &dyn RelayBufferAllocator,
+        mtu: usize,
+        headroom: usize,
+    ) -> Result<Self, IpError> {
+        let _headroom = buffers.try_reserve(headroom).map_err(|_| IpError::Full)?;
+        Self::reserve(buffers, mtu)
+    }
+
     /// Must succeed before consuming a physical UDP datagram.
     pub(crate) fn reserve(buffers: &dyn RelayBufferAllocator, mtu: usize) -> Result<Self, IpError> {
         let charge = buffers
@@ -124,6 +136,9 @@ impl PacketBatch {
     /// MTU shrink cancels the entire unsent remainder if any packet is obsolete.
     /// It never regenerates/replays an already partially emitted UDP datagram.
     pub(crate) fn fits(&self, mtu: usize) -> bool {
+        if mtu >= self.mtu {
+            return true;
+        }
         self.packets[self.next..]
             .iter()
             .all(|range| (range.end - range.start) as usize <= mtu)

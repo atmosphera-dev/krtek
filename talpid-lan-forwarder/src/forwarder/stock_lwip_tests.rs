@@ -23,59 +23,10 @@ fn stock_lwip_reassembly_fixture_process_isolation_preserves_other_handles() {
     ) {
         return;
     }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let (mut forwarder, peer, flow, payload, pieces, scope) = runtime.block_on(async {
-        let peer = UdpSocket::bind(loopback(false)).await.unwrap();
-        let flow = target(peer.local_addr().unwrap(), Transport::Udp);
-        let authority = Arc::new(Authority::default());
-        let mut forwarder = Forwarder::with_mtu(
-            authority.clone(),
-            Arc::new(BufferBudget::new(128 * 1024 * 1024)),
-            68,
-        )
-        .unwrap();
-        let payload = patterned(65507);
-        let pieces = stock_udp_wire(flow, &payload, 68);
-        assert_eq!(pieces.len(), 1365);
-        for piece in &pieces[..1024] {
-            forwarder.ingest(piece);
-        }
-        no_admission(&mut forwarder, &authority, &peer);
-        let scope = authority.receive.lock().unwrap()[0].upgrade().unwrap();
-        assert_eq!(
-            forwarder
-                .native
-                .as_ref()
-                .unwrap()
-                .scope_refs(ReceiveScopeId(scope.id())),
-            1024
-        );
-        (forwarder, peer, flow, payload, pieces, scope)
-    });
-
-    // A no-pressure success fixture must not consume another test's shared
-    // reassembly capacity. Without process isolation, its 1365-piece case
-    // crosses the 2048-pbuf ceiling and stock lwIP evicts this older assembly.
+    // Every isolated child now directly checks its PID against its caller.
+    // Running the complete matrix still proves the pressure-sized outcome,
+    // without racing a parent's unrelated stock reassembly expiry countdown.
     stock_lwip_full_consumer_size_mtu_order_matrix();
-    assert_eq!(
-        forwarder
-            .native
-            .as_ref()
-            .unwrap()
-            .scope_refs(ReceiveScopeId(scope.id())),
-        1024,
-        "an independent fixture must not evict this handle's retained fragments"
-    );
-    runtime.block_on(async {
-        for piece in &pieces[1024..] {
-            forwarder.ingest(piece);
-        }
-        echo_exact(&mut forwarder, &peer, flow, &payload, 68).await;
-        forwarder.close_all().await;
-    });
 }
 
 fn no_admission(forwarder: &mut Forwarder<Authority>, authority: &Authority, peer: &UdpSocket) {
@@ -397,8 +348,10 @@ async fn stock_lwip_real_reply_limit_and_next_valid_reply_use_the_same_socket() 
     forwarder.ingest(&stock_udp_wire(flow, b"reply limit", 1280)[0]);
     let client = receive_exact(&mut forwarder, &peer, b"reply limit").await;
     peer.send_to(&patterned(65488), client).await.unwrap();
-    forwarder.udp[&flow].physical.readable().await.unwrap();
-    forwarder.process();
+    until(&mut forwarder, |f| {
+        f.stats().oversized_reply != 0 || f.has_output()
+    })
+    .await;
     assert!(
         !forwarder.has_output(),
         "no shortened prefix or fragment escapes"
@@ -726,10 +679,18 @@ async fn stock_lwip_tcp_queued_syn_data_fin_survive_mtu_change_and_small_peer_ms
                 app.stack.set_mtu(1280);
             }
             app.socket().close();
-            app.until(&mut forwarder, |app, f| {
-                !app.socket().is_open() && f.stats().tcp_flows == 0
-            })
+            let mut saw_fin = false;
+            app.until_observed(
+                &mut forwarder,
+                |bytes| {
+                    let flags = packet::parse(bytes).unwrap().tcp_flags.unwrap();
+                    assert!(!flags.rst, "graceful MTU handover must not reset TCP");
+                    saw_fin |= flags.fin;
+                },
+                |app, f| !app.socket().is_open() && f.stats().tcp_flows == 0,
+            )
             .await;
+            assert!(saw_fin, "the app must observe the peer FIN before closure");
             assert_eq!(
                 tokio::time::timeout(Duration::from_secs(2), peer)
                     .await

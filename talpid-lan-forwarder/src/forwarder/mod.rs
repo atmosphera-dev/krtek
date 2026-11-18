@@ -50,6 +50,10 @@ const DEFAULT_LOCAL_MTU: usize = 1280;
 // maximum-sized producer peaks even when the root is otherwise exhausted.
 const REPLY_STORAGE_BYTES: usize = (2 * OUTPUT_PACKETS + 2) * (DEFAULT_LOCAL_MTU + BUFFER_OVERHEAD);
 const _: () = assert!(REPLY_STORAGE_BYTES >= 2 * (MAX_SUPPORTED_MTU + BUFFER_OVERHEAD));
+// UDP cannot consume the existing two maximum TCP producer peaks. TCP can still
+// use the whole shared arena when UDP is idle; the startup/root size is unchanged.
+const UDP_REPLY_HEADROOM: usize = 2 * (MAX_SUPPORTED_MTU + BUFFER_OVERHEAD);
+const _: () = assert!(REPLY_STORAGE_BYTES >= BATCH_RESERVATION + UDP_REPLY_HEADROOM);
 
 pub fn validate_mtu(mtu: usize) -> Result<(), Refused> {
     if (MIN_SUPPORTED_MTU..=MAX_SUPPORTED_MTU).contains(&mtu) {
@@ -1284,7 +1288,16 @@ impl<A: LocalAuthority> Forwarder<A> {
                 {
                     continue;
                 }
-                let Ok(batch) = PacketBatch::reserve(&*self.replies, self.mtu) else {
+                if entry
+                    .physical
+                    .poll_recv_ready(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+                {
+                    continue;
+                }
+                let Ok(batch) =
+                    PacketBatch::reserve_preserving(&*self.replies, self.mtu, UDP_REPLY_HEADROOM)
+                else {
                     continue;
                 };
                 match entry.physical.try_recv(&mut self.scratch) {
@@ -1389,10 +1402,13 @@ impl<A: LocalAuthority> Forwarder<A> {
             });
             let owns_udp = output.udp.as_ref().is_none_or(|owner| {
                 owner.scope.current()
-                    && self
-                        .udp
-                        .get(&owner.flow)
-                        .is_some_and(|entry| entry.scope.id() == owner.scope.id())
+                    && self.udp.get(&owner.flow).is_some_and(|entry| {
+                        entry.scope.id() == owner.scope.id()
+                            && output
+                                .grant
+                                .as_ref()
+                                .is_some_and(|grant| Arc::ptr_eq(grant, &entry.grant))
+                    })
             });
             if owns_output
                 && owns_udp
@@ -1489,7 +1505,10 @@ impl<A: LocalAuthority> Forwarder<A> {
         // peak. Retained replies can exhaust bytes long before the slot ceiling;
         // a blocked sink must not turn that readable socket into a busy wake.
         let udp_receive_capacity = self.output.len() < OUTPUT_PACKETS
-            && self.replies.try_reserve(BATCH_RESERVATION).is_ok();
+            && self
+                .replies
+                .try_reserve(BATCH_RESERVATION + UDP_REPLY_HEADROOM)
+                .is_ok();
         for (flow, entry) in &self.udp {
             if udp_receive_capacity
                 && !self
