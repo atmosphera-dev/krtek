@@ -45,6 +45,7 @@ import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
@@ -54,6 +55,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import mullvad_daemon.management_interface.ManagementServiceClient
 import mullvad_daemon.management_interface.TunnelState as RpcTunnelState
@@ -2461,6 +2463,17 @@ class LocalNetworkDeliveryInstrumentedTest {
     @Test fun localUdpReplySizeLimit() = localUdpCase("oversized-reply")
 
     private fun localUdpCase(expect: String) {
+        val method =
+            when (expect) {
+                "echo" -> "localLargeUdpEcho"
+                "denied" -> "localLargeUdpDenied"
+                "oversized" -> "localUdpOversized"
+                else -> "localUdpReplySizeLimit"
+            }
+        assumeTrue(
+            args.getString("class").orEmpty().split(',').contains("${javaClass.name}#$method"),
+            "Select this staged Local UDP method explicitly",
+        )
         val destination = checkNotNull(args.getString("krtek_peer"))
         check(InetAddresses.isNumericAddress(destination))
         val address = InetAddresses.parseNumericAddress(destination)
@@ -2507,20 +2520,51 @@ class LocalNetworkDeliveryInstrumentedTest {
             consumer.identity()
             captureBarrier(token, "start", capture)
             try {
-                val result =
-                    consumer.request(
-                        Bundle().apply {
-                            putString(
-                                "transport",
-                                if (expect == "oversized-reply") "local-udp-reply-limit"
-                                else "local-udp-echo",
-                            )
-                            putString("destination", destination)
-                            putInt("payload_size", size)
+                val result = runBlocking {
+                    // The capture can remain unchanged while Wi-Fi eligibility
+                    // changes. Observe the rule after the start acknowledgment
+                    // and throughout the blocking ordinary-consumer operation.
+                    val validity =
+                        launch(start = CoroutineStart.UNDISPATCHED) {
+                            repository.localNetworkStatus.collect { status ->
+                                assertTrue(
+                                    status != null &&
+                                        status.forwarding == ForwardingAvailability.Active &&
+                                        status.rules.any {
+                                            it.id == rule.id && it.state == expectedRule
+                                        },
+                                    "Local rule eligibility changed during UDP probe",
+                                )
+                            }
                         }
-                    )
+                    try {
+                        withContext(Dispatchers.IO) {
+                            consumer
+                                .request(
+                                    Bundle().apply {
+                                        putString(
+                                            "transport",
+                                            if (expect == "oversized-reply") "local-udp-reply-limit"
+                                            else "local-udp-echo",
+                                        )
+                                        putString("destination", destination)
+                                        putInt("payload_size", size)
+                                    }
+                                )
+                                .also {
+                                    // Preserve the raw even if the eligibility
+                                    // observer has cancelled this parent scope.
+                                    saveLargeProbe(
+                                        "local_udp_${expect}_${family}_$size",
+                                        checkNotNull(it.getString("local_udp_report")),
+                                    )
+                                }
+                        }
+                    } finally {
+                        validity.cancelAndJoin()
+                    }
+                }
                 val raw = checkNotNull(result.getString("local_udp_report"))
-                saveLargeProbe("local_udp_${expect}_${family}_$size", raw)
                 val decoded = JSONObject(raw)
                 assertEquals(family, decoded.getInt("family"))
                 assertEquals(result.getInt("uid"), decoded.getInt("uid"))

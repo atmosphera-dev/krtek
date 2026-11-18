@@ -131,7 +131,52 @@ def consumer_payload(report):
     return payload
 
 
-def audit_consumer(report, peer_rows, *, expect, expected_uid=None, expected_peer_source=None):
+def invocation_requests(report, peer_rows, observation, expected_peer_source):
+    """Scope by exclusive capture barriers on the peer guest's monotonic clock.
+
+    The runner records start_ack immediately before acknowledging Android's start
+    barrier, and finish_seen after observing its finish barrier. Neither Android's
+    clock nor a payload prefix can identify this interval.
+    """
+    require(isinstance(observation, dict), "missing invocation observation receipt")
+    require(observation.get("nonce") == report["nonce"] and observation.get("exclusive") is True,
+            "observation must identify this nonce and exclusive peer window")
+    require(bool(observation.get("token")), "missing capture barrier token")
+    start, finish = observation["start_ack_monotonic_ns"], observation["finish_seen_monotonic_ns"]
+    require(isinstance(start, int) and isinstance(finish, int) and 0 < start < finish,
+            "invalid capture barrier interval")
+    listening = [row for row in peer_rows if row.get("event") == "listening"]
+    stopped = [row for row in peer_rows if row.get("event") == "stopped"]
+    require(len(listening) == len(stopped) == 1, "one complete peer lifetime required")
+    opened, closed = listening[0], stopped[0]
+    require((opened["pid"], opened["boot_id"]) == (closed["pid"], closed["boot_id"]) ==
+            (observation["peer_pid"], observation["boot_id"]), "peer/clock identity mismatch")
+    require(opened["listening_monotonic_ns"] <= start < finish <= closed["stopped_monotonic_ns"],
+            "peer did not cover full invocation window")
+    require(opened["port"] == report["remote_port"] and
+            ipaddress.ip_address(report["remote_address"]) in
+            [ipaddress.ip_address(address) for address in opened["addresses"]], "observation peer endpoint")
+    requests = []
+    for row in peer_rows:
+        if row.get("event") != "request" or row.get("family") != report["family"]:
+            continue
+        require(isinstance(row.get("received_monotonic_ns"), int), "missing peer receive timestamp")
+        require(opened["listening_monotonic_ns"] <= row["received_monotonic_ns"] <= closed["stopped_monotonic_ns"],
+                "request outside peer lifetime")
+        # A receive may be serviced after Android's finish barrier. Keep queued
+        # evidence through shutdown rather than hiding it as late traffic.
+        if row["received_monotonic_ns"] < start:
+            continue
+        if expected_peer_source is not None and ipaddress.ip_address(row["source"]) != ipaddress.ip_address(expected_peer_source):
+            continue
+        if (ipaddress.ip_address(row["destination"]) == ipaddress.ip_address(report["remote_address"]) and
+                row["destination_port"] == report["remote_port"]):
+            requests.append(row)
+    return requests
+
+
+def audit_consumer(report, peer_rows, *, expect, expected_uid=None, expected_peer_source=None,
+                   observation=None):
     """Require in-process full comparison AND independent peer/wire bytes, never a digest alone."""
     payload = consumer_payload(report)
     require(report["family"] in (4, 6), "consumer family")
@@ -140,16 +185,9 @@ def audit_consumer(report, peer_rows, *, expect, expected_uid=None, expected_pee
     if expected_uid is not None:
         require(report["uid"] == expected_uid, "consumer UID")
     require(report["option_set"] and report["option_value"] == 0, "fragment-permitting socket option")
-    requests = [row for row in peer_rows if row.get("event") == "request" and
-                row.get("family") == report["family"]]
-    # A nonce-bearing prefix at the peer is a failed negative too. Matching only
-    # exact payloads would hide the very truncation this harness must detect.
-    hits = []
-    for row in requests:
-        data = bytes.fromhex(row["payload_hex"])
-        prefix = min(32, len(data), len(payload))
-        if (prefix > 0 and data[:prefix] == payload[:prefix]) or data == payload:
-            hits.append(row)
+    # ALL requests in this exclusive endpoint/window belong to the invocation,
+    # including empty and corrupted datagrams. Never identify them by payload.
+    hits = invocation_requests(report, peer_rows, observation, expected_peer_source)
     if expect == "echo":
         require(report.get("validated") is True and "error_stage" not in report, "consumer did not validate")
         require(report["sent"] == report["received"] == len(payload), "consumer datagram length")
@@ -206,6 +244,9 @@ def audit_consumer(report, peer_rows, *, expect, expected_uid=None, expected_pee
             require(terminal["event"] == "reply_sent", "IPv6 full oversized reply was not sent")
     else:
         require(expect in ("denied", "oversized"), "unknown expectation")
+        if expect == "oversized":
+            require(len(payload) == (65508 if report["family"] == 4 else 65488),
+                    "oversized request must be exact family maximum+1")
         require(not report.get("validated") and "received" not in report, "negative received a datagram")
         require(not hits, "negative reached peer")
         if expect == "oversized" and report["family"] == 4:
@@ -224,6 +265,8 @@ def main():
     parser.add_argument("--expect", choices=("echo", "denied", "oversized", "oversized-reply"), required=True)
     parser.add_argument("--uid", type=int, required=True)
     parser.add_argument("--physical-source", required=True)
+    parser.add_argument("--observation", type=Path, required=True,
+                        help="exclusive invocation barriers on the peer guest monotonic clock")
     parser.add_argument("--request-packets", type=Path,
                         help="JSON array of exact request IP packet hex strings from TUN capture")
     parser.add_argument("--reply-packets", type=Path,
@@ -232,9 +275,9 @@ def main():
     args = parser.parse_args()
     report = json.loads(args.consumer.read_text())
     rows = [json.loads(line) for line in args.peer_ledger.read_text().splitlines()]
-    require(any(row.get("event") == "stopped" for row in rows), "peer ledger is not terminal")
     result = audit_consumer(report, rows, expect=args.expect, expected_uid=args.uid,
-                            expected_peer_source=args.physical_source)
+                            expected_peer_source=args.physical_source,
+                            observation=json.loads(args.observation.read_text()))
     if args.expect in ("echo", "oversized-reply"):
         require(args.request_packets and args.reply_packets and args.mtu,
                 "echo CLI requires both TUN packet arrays and observed MTU")

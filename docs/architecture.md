@@ -473,15 +473,24 @@ One process-global native mutex, monotonic clock and 12 MiB reservation cover al
 logical handles. Retirement invalidates a handle immediately but retains scope
 guards and funding while tagged input nodes remain; stock idle timers reclaim
 them. A core-owned condition-variable worker drives timers independently of
-Tokio/runtime replacement, joins before replacement and exits on quiescence. Its
+Tokio/runtime replacement, joins before replacement and exits on quiescence. A
+late wake catches up the bounded stock reassembly horizon before advancing to
+the current clock; ingress first ticks older work before admitting a new node.
+Quiescent reopen rebases public lwIP timeouts without resetting process time or
+reviving receive state. A failed core refuses new work on every logical handle,
+while retirement and reference inspection remain available. Its
 bounded stack and bookkeeping are included in the same reservation. Native
 callbacks borrow synchronously, never authorize or wait for sockets or TUN, and
 unowned control output is suppressed. Rust copies and reply storage retain
 separate Local credit; this is not a process RSS or kernel-memory bound.
 
 Each physical UDP reply is received whole into protocol-sized scratch only after
-reserving a 192 KiB packed output batch. It occupies one existing output job,
-not a queue entry per fragment, including the 1365-packet maximum IPv4 reply at
+reserving a 192 KiB packed output batch. Admission leaves both existing maximum
+TCP producer peaks available in the
+same reply arena. Idle UDP sockets do not allocate batches. A queued batch also
+retains its exact physical-socket incarnation, not just an endpoint receive scope.
+It occupies one existing output job, not a queue entry per fragment, including
+the 1365-packet maximum IPv4 reply at
 MTU 68. Callback capture failure discards the batch before any emission, even
 when lwIP returns success. Every packet/retry retains its flow, receive scope and
 grant and passes the exact current sink/MTU check. EAGAIN retains the same packet;

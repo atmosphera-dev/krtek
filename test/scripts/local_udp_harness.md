@@ -125,6 +125,7 @@ own. For a positive full echo:
 ```sh
 python3 test/scripts/local_udp_audit.py --consumer "$WORK/consumer.json" \
   --peer-ledger "$WORK/peer.jsonl" --expect echo --uid "$CONSUMER_UID" \
+  --observation "$WORK/observation.json" \
   --physical-source "$EXPECTED_PEER_SOURCE" --mtu "$CAPTURE_MTU" \
   --request-packets "$WORK/request.json" --reply-packets "$WORK/reply.json"
 ```
@@ -144,3 +145,22 @@ the echo command. The request must independently decode as the exact short
 nonce; the reply array must be empty. One full peer request and one exact
 attempt/send-or-kernel-refusal are required. Extra attempts, changed tail bytes,
 shortened response records and any consumer receive are failures.
+
+Every audit requires an invocation observation receipt. On the peer guest's
+monotonic clock, the runner records `start_ack_monotonic_ns` immediately before
+acknowledging the Android start barrier and `finish_seen_monotonic_ns` after
+observing its finish barrier. The receipt also contains `token`, consumer `nonce`,
+`peer_pid`, guest `boot_id`, and `exclusive: true`. The runner must isolate that
+peer endpoint/source for the invocation. The peer's `listening` and `stopped`
+ledger rows must bracket the full interval with the same PID and boot identity;
+a stopped row alone proves no silence. Keep the peer running until after finish,
+including reply-limit probes. Do not compare Android and guest clocks.
+
+The auditor selects all requests to the expected peer endpoint from the expected
+physical source after start acknowledgment through peer shutdown, including
+queued requests serviced after the finish barrier. Keep the endpoint exclusive
+until shutdown. Empty,
+short or corrupted datagrams fail negatives and cannot pass an echo. Requests
+before the start interval do not count merely because a payload prefix matches.
+Old receipts without these barriers are not sufficient for this stronger audit;
+retain their original results separately rather than inventing missing timing.

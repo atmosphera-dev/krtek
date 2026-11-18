@@ -6,6 +6,7 @@ echo, then an echo row records the actual send. No ACK, truncation or retry path
 """
 
 import argparse
+import errno
 import ipaddress
 import json
 import os
@@ -41,6 +42,18 @@ def append(ledger, row):
     os.fsync(ledger.fileno())
 
 
+def bind_dual(ipv4, ipv6, port):
+    """Allocate and retain both families before publishing the selected port."""
+    while True:
+        first = bind_peer(ipv4, port)
+        try:
+            return [first, bind_peer(ipv6, first.getsockname()[1])]
+        except OSError as error:
+            first.close()
+            if port != 0 or error.errno != errno.EADDRINUSE:
+                raise
+
+
 def serve(ipv4, ipv6, port, ledger_path, ready_path, duration, max_requests=0, reply_size=None,
           tcp_port=None):
     """Bounded owner; zero max_requests means duration alone determines the end."""
@@ -49,8 +62,8 @@ def serve(ipv4, ipv6, port, ledger_path, ready_path, duration, max_requests=0, r
     sockets = []
     clients = set()
     try:
-        sockets.append(bind_peer(ipv4, port))
-        sockets.append(bind_peer(ipv6, port))
+        sockets = bind_dual(ipv4, ipv6, port)
+        port = sockets[0].getsockname()[1]
         with selectors.DefaultSelector() as selector, Path(ledger_path).open("x") as ledger:
             for sock in sockets:
                 selector.register(sock, selectors.EVENT_READ, "udp")
@@ -61,11 +74,19 @@ def serve(ipv4, ipv6, port, ledger_path, ready_path, duration, max_requests=0, r
                 tcp.listen()
                 selector.register(tcp, selectors.EVENT_READ, "listen")
             ready = {"schema": 1, "pid": os.getpid(), "port": port,
+                     "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                     "listening_monotonic_ns": time.monotonic_ns(),
                      "addresses": [str(ipaddress.ip_address(ipv4)), str(ipaddress.ip_address(ipv6))]}
-            with Path(ready_path).open("x") as output:
+            if tcp_port is not None:
+                ready["tcp_port"] = tcp.getsockname()[1]
+            append(ledger, dict(ready, event="listening"))
+            pending = Path(str(ready_path) + ".pending")
+            with pending.open("x") as output:
                 json.dump(ready, output, sort_keys=True)
                 output.flush()
                 os.fsync(output.fileno())
+            os.link(pending, ready_path)  # atomic publication without replacing an old receipt
+            pending.unlink()
             deadline = time.monotonic() + duration
             count = 0
             while time.monotonic() < deadline and (not max_requests or count < max_requests):
@@ -137,7 +158,9 @@ def serve(ipv4, ipv6, port, ledger_path, ready_path, duration, max_requests=0, r
                                     "size": sent, "sent_monotonic_ns": time.monotonic_ns()})
                     if max_requests and count >= max_requests:
                         break
-            append(ledger, {"schema": 1, "event": "stopped", "requests": count})
+            append(ledger, {"schema": 1, "event": "stopped", "requests": count,
+                            "pid": ready["pid"], "boot_id": ready["boot_id"],
+                            "stopped_monotonic_ns": time.monotonic_ns()})
     finally:
         for client in clients:
             client.close()
@@ -158,9 +181,9 @@ def main():
                         help="Reply-limit control only: receive 32-byte nonce, attempt family maximum+1")
     parser.add_argument("--tcp-port", type=int, help="Continuity fixture: explicit IPv4 TCP stream echo")
     args = parser.parse_args()
-    if not 0 < args.port <= 65535 or args.duration <= 0 or args.max_requests < 0:
+    if not 0 <= args.port <= 65535 or args.duration <= 0 or args.max_requests < 0:
         parser.error("Positive port/duration and nonnegative request count required")
-    if args.tcp_port is not None and (not 0 < args.tcp_port <= 65535 or args.reply_size is not None):
+    if args.tcp_port is not None and (not 0 <= args.tcp_port <= 65535 or args.reply_size is not None):
         parser.error("TCP requires a valid port and the exact-echo mode")
     serve(args.ipv4, args.ipv6, args.port, args.ledger, args.ready, args.duration, args.max_requests,
           args.reply_size, args.tcp_port)
