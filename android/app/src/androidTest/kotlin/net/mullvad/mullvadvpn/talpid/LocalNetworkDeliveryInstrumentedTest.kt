@@ -2451,6 +2451,135 @@ class LocalNetworkDeliveryInstrumentedTest {
             }
         }
 
+    /** Explicit selectors: the runner stages numeric peers, policy and capture observer. */
+    @Test fun localLargeUdpEcho() = localUdpCase("echo")
+
+    @Test fun localLargeUdpDenied() = localUdpCase("denied")
+
+    @Test fun localUdpOversized() = localUdpCase("oversized")
+
+    private fun localUdpCase(expect: String) {
+        val destination = checkNotNull(args.getString("krtek_peer"))
+        check(InetAddresses.isNumericAddress(destination))
+        val address = InetAddresses.parseNumericAddress(destination)
+        val family = if (address.address.size == 4) 4 else 6
+        val cidr = canonicalPrefix("$destination/${if (family == 4) 32 else 128}")
+        val maximum = if (family == 4) 65507 else 65487
+        val size =
+            args
+                .getString(
+                    "krtek_payload_size",
+                    if (expect == "oversized") "${maximum + 1}" else "4096",
+                )
+                .toInt()
+        check(if (expect == "oversized") size == maximum + 1 else size in 0..maximum)
+        val token = checkNotNull(args.getString("krtek_capture_token"))
+        check(token.matches(Regex("[a-z0-9-]{1,64}")))
+        withConsumer(ForwardingAvailability.Active, testTimeout = 3.minutes) {
+            consumer,
+            repository,
+            _ ->
+            val policy = checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
+            val rule =
+                policy.rules.single { rule ->
+                    rule.enabled && rule.cidrs.any { canonicalPrefix(it.toString()) == cidr }
+                }
+            assertTrue(policy.enabled)
+            val expectedRule =
+                if (expect == "denied")
+                    LocalRuleState.Inactive(LocalRuleInactiveReason.DifferentWifi)
+                else LocalRuleState.Forwarding
+            // The old short-probe helper intentionally retains its IPv4 /32 contract.
+            // This operation observes its own explicit family-sized rule instead.
+            runBlocking {
+                withTimeout(30_000) {
+                    repository.localNetworkStatus.filterNotNull().first { status ->
+                        status.forwarding == ForwardingAvailability.Active &&
+                            status.rules.any { it.id == rule.id && it.state == expectedRule }
+                    }
+                }
+            }
+            report("local_udp_rule", "$cidr:$expectedRule")
+            val capture = appliedConfiguration(policy, ForwardingAvailability.Active)
+            consumer.identity()
+            captureBarrier(token, "start", capture)
+            try {
+                val result =
+                    consumer.request(
+                        Bundle().apply {
+                            putString("transport", "local-udp-echo")
+                            putString("destination", destination)
+                            putInt("payload_size", size)
+                        }
+                    )
+                val raw = checkNotNull(result.getString("local_udp_report"))
+                saveLargeProbe("local_udp_${expect}_${family}_$size", raw)
+                val decoded = JSONObject(raw)
+                assertEquals(family, decoded.getInt("family"))
+                assertEquals(result.getInt("uid"), decoded.getInt("uid"))
+                assertEquals(size, decoded.getInt("payload_size"))
+                assertEquals(18081, decoded.getInt("remote_port"))
+                assertTrue(decoded.getBoolean("option_set"))
+                val expectedPayload =
+                    LocalUdpPayload.create(
+                        size,
+                        decoded
+                            .getString("nonce")
+                            .chunked(2)
+                            .map { it.toInt(16).toByte() }
+                            .toByteArray(),
+                    )
+                assertEquals(
+                    ProbePayloadSummary.sha256(expectedPayload, expectedPayload.size),
+                    decoded.getString("payload_sha256"),
+                )
+                assertFalse(decoded.has("payload_hex"))
+                assertFalse(decoded.has("reply_hex"))
+                if (expect == "echo") {
+                    assertEquals("local-udp-echo", result.getString("outcome"), raw)
+                    assertTrue(decoded.getBoolean("validated"))
+                    assertEquals(size, decoded.getInt("sent"))
+                    assertEquals(size, decoded.getInt("received"))
+                    assertTrue(decoded.getBoolean("bytes_equal"))
+                    assertTrue(decoded.getBoolean("source_matches"))
+                    assertEquals(
+                        decoded.getString("payload_sha256"),
+                        decoded.getString("reply_sha256"),
+                    )
+                    assertEquals(
+                        address,
+                        InetAddresses.parseNumericAddress(decoded.getString("reply_source")),
+                    )
+                    assertEquals(18081, decoded.getInt("reply_port"))
+                } else {
+                    assertEquals("failed", result.getString("outcome"), raw)
+                    assertFalse(decoded.optBoolean("validated"))
+                    if (expect == "oversized" && family == 4) {
+                        // IPv4's protocol maximum is also the kernel send limit.
+                        // This is EMSGSIZE, not proof of the Local typed boundary.
+                        assertEquals("send", decoded.getString("error_stage"))
+                        assertEquals(android.system.OsConstants.EMSGSIZE, decoded.getInt("errno"))
+                    } else {
+                        assertEquals(size, decoded.getInt("sent"))
+                        assertEquals("receive", decoded.getString("error_stage"))
+                        assertTrue(
+                            decoded.getInt("errno") in
+                                setOf(
+                                    android.system.OsConstants.EAGAIN,
+                                    android.system.OsConstants.ETIMEDOUT,
+                                )
+                        )
+                    }
+                    report("local_udp_requires_peer_silence_audit", true)
+                }
+            } finally {
+                val finalCapture = appliedConfiguration(policy, ForwardingAvailability.Active)
+                assertEquals(capture, finalCapture, "Capture epoch changed during Local UDP probe")
+                captureBarrier(token, "finish", finalCapture)
+            }
+        }
+    }
+
     private fun saveLargeProbe(name: String, raw: String) {
         val folder =
             File(target.filesDir, "krtek-probes").apply {

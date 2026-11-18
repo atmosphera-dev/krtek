@@ -12,7 +12,6 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.security.SecureRandom;
-import java.util.Arrays;
 import org.json.JSONObject;
 
 /** Ordinary test-APK UID sockets only. Root capture is a separate external observer. */
@@ -89,7 +88,8 @@ final class FragmentedUdpProbe {
       report.put("reply_source", source.getAddress().getHostAddress());
       report.put("reply_port", source.getPort());
       report.put("received", count);
-      report.put("reply_hex", hex(Arrays.copyOf(reply, count)));
+      // The DNS reply can be protocol-sized. Do not carry it through Binder.
+      report.put("reply_sha256", ProbePayloadSummary.sha256(reply, count));
       stage = "validate";
       if (!source.getAddress().equals(destination) || source.getPort() != 53) {
         throw new IOException("Unexpected DNS response source");
@@ -109,7 +109,8 @@ final class FragmentedUdpProbe {
     try {
       report.put("error_stage", stage);
       report.put("error_class", error.getClass().getName());
-      report.put("error_reason", String.valueOf(error.getMessage()));
+      String reason = String.valueOf(error.getMessage());
+      report.put("error_reason", reason.substring(0, Math.min(reason.length(), 512)));
       if (error instanceof ErrnoException) report.put("errno", ((ErrnoException) error).errno);
     } catch (org.json.JSONException impossible) {
       throw new IllegalStateException(impossible);

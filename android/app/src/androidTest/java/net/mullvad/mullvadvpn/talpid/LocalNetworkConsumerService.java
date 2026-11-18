@@ -212,6 +212,24 @@ public final class LocalNetworkConsumerService extends Service {
         activeProbe = null;
       }
     }
+    if ("local-udp-echo".equals(transport)) {
+      String destination = command.getString("destination");
+      int size = command.getInt("payload_size");
+      if (command.size() != 4 || !command.containsKey("request_id")
+          || !command.containsKey("payload_size") || destination == null
+          || !InetAddresses.isNumericAddress(destination) || size < 0 || size > 65508)
+        return outcome("invalid");
+      ProbeResources resources = new ProbeResources();
+      ownedResources.set(resources);
+      activeProbe = resources;
+      try {
+        if (Thread.currentThread().isInterrupted()) return outcome("deadline");
+        return LocalUdpProbe.run(destination, size, resources::icmpSocket);
+      } finally {
+        resources.close();
+        activeProbe = null;
+      }
+    }
     if ("fragmented-udp".equals(transport)) {
       int family = command.getInt("family");
       if (command.size() != 3 || !command.containsKey("request_id")
