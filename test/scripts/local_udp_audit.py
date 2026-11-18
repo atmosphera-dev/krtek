@@ -170,6 +170,40 @@ def audit_consumer(report, peer_rows, *, expect, expected_uid=None, expected_pee
                     "protected physical source")
         echoes = [row for row in peer_rows if row.get("event") == "echo" and row.get("index") == hit["index"]]
         require(len(echoes) == 1 and echoes[0]["size"] == len(payload), "peer exact echo send")
+    elif expect == "oversized-reply":
+        maximum = 65507 if report["family"] == 4 else 65487
+        nonce = bytes.fromhex(report["nonce"])
+        require(report.get("requested_reply_size") == maximum + 1 and payload == nonce,
+                "reply limit must use one short nonce request")
+        require(report.get("sent") == 32 and not report.get("validated") and "received" not in report,
+                "reply limit received a shortened or unexpected datagram")
+        require(report.get("error_stage") == "receive" and report.get("errno") in (11, 110),
+                "reply limit is not a receive timeout")
+        require(len(hits) == 1, "reply limit needs one complete peer request")
+        hit = hits[0]
+        require(hit["payload_hex"] == nonce.hex() and hit["size"] == 32 and
+                hit["destination_port"] == 18081 and hit["ifindex"] > 0 and bool(hit["interface"]),
+                "reply limit request/physical interface")
+        require(ipaddress.ip_address(hit["destination"]) == ipaddress.ip_address(report["remote_address"]),
+                "reply limit destination")
+        if expected_peer_source is not None:
+            require(ipaddress.ip_address(hit["source"]) == ipaddress.ip_address(expected_peer_source),
+                    "reply limit protected physical source")
+        related = [row for row in peer_rows if row.get("index") == hit["index"] and
+                   row.get("event") in ("reply_attempt", "reply_sent", "reply_refused", "echo")]
+        require(len(related) == 2 and related[0]["event"] == "reply_attempt", "one reply attempt only")
+        attempted = related[0]
+        response = bytes(nonce[i] if i < 32 else nonce[i % 32] ^ ((i * 31 + i // 32) & 255)
+                         for i in range(maximum + 1))
+        require(attempted["size"] == len(response) and attempted["payload_hex"] == response.hex(),
+                "peer did not attempt the exact oversized full pattern")
+        terminal = related[1]
+        require(terminal["size"] == len(response), "peer attempted a shortened reply")
+        if report["family"] == 4:
+            require((terminal["event"], terminal.get("errno"), terminal.get("stage")) ==
+                    ("reply_refused", 90, "kernel-send"), "IPv4 peer kernel EMSGSIZE required")
+        else:
+            require(terminal["event"] == "reply_sent", "IPv6 full oversized reply was not sent")
     else:
         require(expect in ("denied", "oversized"), "unknown expectation")
         require(not report.get("validated") and "received" not in report, "negative received a datagram")
@@ -187,7 +221,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--consumer", type=Path, required=True)
     parser.add_argument("--peer-ledger", type=Path, required=True)
-    parser.add_argument("--expect", choices=("echo", "denied", "oversized"), required=True)
+    parser.add_argument("--expect", choices=("echo", "denied", "oversized", "oversized-reply"), required=True)
     parser.add_argument("--uid", type=int, required=True)
     parser.add_argument("--physical-source", required=True)
     parser.add_argument("--request-packets", type=Path,
@@ -201,7 +235,7 @@ def main():
     require(any(row.get("event") == "stopped" for row in rows), "peer ledger is not terminal")
     result = audit_consumer(report, rows, expect=args.expect, expected_uid=args.uid,
                             expected_peer_source=args.physical_source)
-    if args.expect == "echo":
+    if args.expect in ("echo", "oversized-reply"):
         require(args.request_packets and args.reply_packets and args.mtu,
                 "echo CLI requires both TUN packet arrays and observed MTU")
         family = report["family"]
@@ -209,11 +243,16 @@ def main():
         require(ipaddress.ip_address(report["local_address"]) == ipaddress.ip_address(fixed_source),
                 "consumer fixed capture source")
         payload = consumer_payload(report)
-        for direction, path, source, destination, sport, dport in (
+        directions = (
             ("request", args.request_packets, fixed_source, report["remote_address"], report["local_port"], 18081),
             ("reply", args.reply_packets, report["remote_address"], fixed_source, 18081, report["local_port"]),
-        ):
+        )
+        for direction, path, source, destination, sport, dport in directions:
             packets = [bytes.fromhex(value) for value in json.loads(path.read_text())]
+            if args.expect == "oversized-reply" and direction == "reply":
+                require(not packets, "oversized reply emitted app-facing packets")
+                result[direction] = {"packets": 0}
+                continue
             result[direction] = audit_packets(packets, mtu=args.mtu, source=source, destination=destination,
                                               source_port=sport, destination_port=dport, payload=payload)
         if len(payload) == 4096:

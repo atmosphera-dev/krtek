@@ -43,6 +43,141 @@ class LocalUdpHarnessTest(unittest.TestCase):
             with self.assertRaises(audit.AuditError):
                 audit.audit_consumer(report, [dict(request, payload_hex=body[:32].hex()), rows[1]], expect="echo")
 
+    def test_stock_lwip_reply_limit_audit_requires_complete_attempt_and_silence(self):
+        nonce = bytes(range(32))
+        for family, address, size in ((4, "192.0.2.81", 65508), (6, "fd00::81", 65488)):
+            report = dict(family=family, uid=12345, payload_size=32, payload_sha256=hashlib.sha256(nonce).hexdigest(),
+                          nonce=nonce.hex(), remote_address=address, remote_port=18081,
+                          option_set=True, option_value=0, sent=32, error_stage="receive",
+                          errno=11, requested_reply_size=size)
+            request = dict(event="request", index=1, family=family, size=32, payload_hex=nonce.hex(),
+                           source="10.0.2.15" if family == 4 else "fd00::15", destination=address,
+                           destination_port=18081, ifindex=2, interface="eth0")
+            attempt = dict(event="reply_attempt", index=1, size=size,
+                           payload_hex=vectors.payload(size, nonce).hex())
+            terminal = (dict(event="reply_refused", index=1, size=size, errno=90, stage="kernel-send")
+                        if family == 4 else dict(event="reply_sent", index=1, size=size))
+            rows = [request, attempt, terminal]
+            self.assertEqual(1, audit.audit_consumer(report, rows, expect="oversized-reply")["peer_hits"])
+            for key, value in (("received", 32), ("sent", 65488), ("errno", 13),
+                               ("requested_reply_size", size - 1)):
+                with self.assertRaises(audit.AuditError):
+                    audit.audit_consumer(dict(report, **{key: value}), rows, expect="oversized-reply")
+            for broken in ([], rows[:-1], rows + [terminal],
+                           [request, dict(attempt, payload_hex=nonce.hex()), terminal],
+                           [request, attempt, dict(terminal, size=32)]):
+                with self.assertRaises(audit.AuditError):
+                    audit.audit_consumer(report, broken, expect="oversized-reply")
+
+    def test_stock_lwip_peer_reply_limit_real_kernel_outcomes(self):
+        # Peer construction proof only: IPv6 really sends all 65488; IPv4's
+        # kernel refuses 65508. Neither is an assertion of Local/device success.
+        for family, address, size in ((socket.AF_INET, "127.0.0.1", 65508),
+                                      (socket.AF_INET6, "::1", 65488)):
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve:
+                    reserve.bind(("127.0.0.1", 0)); port = reserve.getsockname()[1]
+                command = [sys.executable, str(Path(__file__).with_name("local_udp_peer.py")),
+                           "--ipv4", "127.0.0.1", "--ipv6", "::1", "--port", str(port),
+                           "--ledger", str(root / "ledger"), "--ready", str(root / "ready"),
+                           "--duration", "5", "--max-requests", "1", "--reply-size", str(size)]
+                with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                    try:
+                        deadline = time.monotonic() + 3
+                        while not (root / "ready").exists():
+                            self.assertIsNone(process.poll())
+                            self.assertLess(time.monotonic(), deadline)
+                            time.sleep(.01)
+                        nonce = os.urandom(32)
+                        with socket.socket(family, socket.SOCK_DGRAM) as consumer:
+                            consumer.settimeout(.2)
+                            consumer.sendto(nonce, (address, port))
+                            if family == socket.AF_INET6:
+                                data, _, flags, _ = consumer.recvmsg(65535)
+                                self.assertEqual(vectors.payload(size, nonce), data)
+                                self.assertFalse(flags & socket.MSG_TRUNC)
+                            else:
+                                with self.assertRaises(socket.timeout): consumer.recv(65535)
+                        _, error = process.communicate(timeout=3)
+                        self.assertEqual(0, process.returncode, error.decode())
+                    finally:
+                        if process.poll() is None:
+                            process.terminate(); process.communicate(timeout=2)
+                rows = [json.loads(line) for line in (root / "ledger").read_text().splitlines()]
+                self.assertEqual(["request", "reply_attempt",
+                                  "reply_sent" if family == socket.AF_INET6 else "reply_refused",
+                                  "stopped"], [r["event"] for r in rows])
+                self.assertEqual(vectors.payload(size, nonce).hex(), rows[1]["payload_hex"])
+
+    def test_stock_lwip_continuity_peer_echoes_complete_tcp_stream(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with socket.socket() as tcp, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+                tcp.bind(("127.0.0.1", 0)); tcp_port = tcp.getsockname()[1]
+                udp.bind(("127.0.0.1", 0)); udp_port = udp.getsockname()[1]
+            command = [sys.executable, str(Path(__file__).with_name("local_udp_peer.py")),
+                       "--ipv4", "127.0.0.1", "--ipv6", "::1", "--port", str(udp_port),
+                       "--tcp-port", str(tcp_port), "--ledger", str(root / "ledger"),
+                       "--ready", str(root / "ready"), "--duration", "5", "--max-requests", "1"]
+            with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                try:
+                    deadline = time.monotonic() + 3
+                    while not (root / "ready").exists():
+                        self.assertIsNone(process.poll()); self.assertLess(time.monotonic(), deadline)
+                        time.sleep(.01)
+                    body = vectors.payload(8193, os.urandom(32))
+                    with socket.create_connection(("127.0.0.1", tcp_port), timeout=2) as consumer:
+                        consumer.sendall(body); consumer.shutdown(socket.SHUT_WR)
+                        received = b""
+                        while True:
+                            chunk = consumer.recv(65535)
+                            if not chunk: break
+                            received += chunk
+                        self.assertEqual(body, received)
+                    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as consumer:
+                        consumer.settimeout(2); consumer.sendto(b"terminal", ("127.0.0.1", udp_port))
+                        self.assertEqual(b"terminal", consumer.recv(65535))
+                    _, error = process.communicate(timeout=3)
+                    self.assertEqual(0, process.returncode, error.decode())
+                finally:
+                    if process.poll() is None:
+                        process.terminate(); process.communicate(timeout=2)
+            rows = [json.loads(line) for line in (root / "ledger").read_text().splitlines()]
+            for event in ("tcp_request", "tcp_echo"):
+                self.assertEqual(body, b"".join(bytes.fromhex(row["payload_hex"]) for row in rows
+                                              if row["event"] == event))
+
+    def test_stock_lwip_reply_limit_cli_requires_request_attempt_and_empty_reply_wire(self):
+        nonce = bytes(range(32)); app, peer, size = "fdf0:ce4a:801d::172:27:1:1", "fd00::81", 65488
+        report = dict(family=6, uid=12345, payload_size=32, payload_sha256=hashlib.sha256(nonce).hexdigest(), nonce=nonce.hex(),
+                      remote_address=peer, remote_port=18081, local_address=app, local_port=30001,
+                      option_set=True, option_value=0, sent=32, error_stage="receive", errno=11,
+                      requested_reply_size=size)
+        rows = [dict(event="request", index=1, family=6, size=32, payload_hex=nonce.hex(),
+                     source="fd00::15", destination=peer, destination_port=18081, ifindex=2, interface="eth0"),
+                dict(event="reply_attempt", index=1, size=size, payload_hex=vectors.payload(size, nonce).hex()),
+                dict(event="reply_sent", index=1, size=size), dict(event="stopped", requests=1)]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "consumer").write_text(json.dumps(report))
+            (root / "ledger").write_text("".join(json.dumps(row)+"\n" for row in rows))
+            request = vectors.datagram(app, peer, 30001, 18081, nonce)
+            (root / "request").write_text(json.dumps([piece.hex() for piece in request]))
+            (root / "reply").write_text("[]")
+            command = [sys.executable, str(Path(__file__).with_name("local_udp_audit.py")),
+                       "--consumer", str(root / "consumer"), "--peer-ledger", str(root / "ledger"),
+                       "--expect", "oversized-reply", "--uid", "12345", "--physical-source", "fd00::15",
+                       "--mtu", "1280", "--request-packets", str(root / "request"),
+                       "--reply-packets", str(root / "reply")]
+            good = subprocess.run(command, capture_output=True, timeout=5)
+            self.assertEqual(0, good.returncode, good.stderr.decode())
+            self.assertEqual(0, json.loads(good.stdout)["reply"]["packets"])
+            (root / "reply").write_text(json.dumps([vectors.datagram(peer, app, 18081, 30001, nonce)[0].hex()]))
+            self.assertNotEqual(0, subprocess.run(command, capture_output=True, timeout=5).returncode)
+            (root / "reply").write_text("[]"); (root / "request").write_text("[]")
+            self.assertNotEqual(0, subprocess.run(command, capture_output=True, timeout=5).returncode)
+
     def test_stock_lwip_independent_checksum_known_answer(self):
         # RFC 1071's example, unrelated to either implementation's packet builder.
         self.assertEqual(0x220d, audit.checksum(bytes.fromhex("0001f203f4f5f6f7")))

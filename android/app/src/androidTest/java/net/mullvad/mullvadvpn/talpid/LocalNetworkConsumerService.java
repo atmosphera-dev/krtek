@@ -212,7 +212,7 @@ public final class LocalNetworkConsumerService extends Service {
         activeProbe = null;
       }
     }
-    if ("local-udp-echo".equals(transport)) {
+    if ("local-udp-echo".equals(transport) || "local-udp-reply-limit".equals(transport)) {
       String destination = command.getString("destination");
       int size = command.getInt("payload_size");
       if (command.size() != 4 || !command.containsKey("request_id")
@@ -224,6 +224,12 @@ public final class LocalNetworkConsumerService extends Service {
       activeProbe = resources;
       try {
         if (Thread.currentThread().isInterrupted()) return outcome("deadline");
+        if ("local-udp-reply-limit".equals(transport)) {
+          int maximum = InetAddresses.parseNumericAddress(destination).getAddress().length == 4
+              ? 65507 : 65487;
+          if (size != maximum + 1) return outcome("invalid");
+          return LocalUdpProbe.replyLimit(destination, size, resources::icmpSocket);
+        }
         return LocalUdpProbe.run(destination, size, resources::icmpSocket);
       } finally {
         resources.close();

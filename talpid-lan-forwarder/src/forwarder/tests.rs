@@ -10,6 +10,9 @@ use std::sync::{
 };
 use tokio::net::TcpListener;
 
+#[path = "stock_lwip_tests.rs"]
+mod stock_lwip_tests;
+
 fn test_forwarder(authority: Arc<Authority>) -> Forwarder<Authority> {
     Forwarder::new(
         authority,

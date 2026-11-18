@@ -22,6 +22,26 @@ IDs/tuples, invalid lengths/checksums, over-MTU packets and incomplete payloads.
 Its strict output acceptance is not an assertion that stock receive reassembly
 discards an entire assembly on overlap.
 
+## Deterministic coverage
+
+`stock_lwip_` Rust tests are included in the normal crate gate. Native clock
+scenarios are separate processes; never advance the real Rust singleton clock.
+
+| # | Contract | Consumer/fixture |
+|---|---|---|
+| 1 | Both-family sizes, order, exact fit and maxima | `stock_lwip_full_consumer_size_mtu_order_matrix`: 36 real peer/full reply cases, independent checksum/coverage oracle, MTU 68/1280/65535 |
+| 2 | Missing zero/middle/final and interleaved IDs | `stock_lwip_holes_and_interleaved_ids_do_not_authorize_early`: zero authorization/preparation/peer data until each completion |
+| 3 | Stock duplicate, overlap and conflicting terminals | `stock_lwip_altered_duplicates_*`, `stock_lwip_conflicting_terminal_*`, native `corners`; first accepted bytes retained, completed transport still validated |
+| 4 | First-arrival expiry, idle release and pressure | Native `clock4/clock6/pressure4/pressure6`, original expiry/wrapping driver, wrapper retirement/runtime-loss fixtures |
+| 5 | IPv4 options/protocol omission and IPv6 atomic/extensions/Next Header | Native `corners` and original boundary driver; exact inherited refusal/drop/retention outcomes, not a new RFC claim |
+| 6 | Corrupt UDP/TCP, IPv6 checksum zero, high offsets, size+1 | `stock_lwip_completed_corrupt_*`, `stock_lwip_typed_family_size_refusals_*`, native boundary and FFI driver |
+| 7 | One funded maximum job, credit exhaustion/no spin | C4 full matrix and existing `stock_lwip_scripted_physical_pump_*`, batch backing and receive-readiness regression |
+| 8 | EAGAIN at zero/tail/final and capture errors | Full matrix repeated exact retries plus existing checked-drain/fairness/capture-error fixtures |
+| 9 | Revocation, close/reopen, simultaneous owners and network replacement | `stock_lwip_scope_revoke_close_*`, native all-node provenance, daemon irreversible receive-scope/network identity fixtures |
+| 10 | Compatible MTU changes, queued UDP and TCP SYN/data/FIN/MSS | `stock_lwip_compatible_mtu_*`, `stock_lwip_tcp_queued_syn_data_fin_*`; exact real streams and current-sink packet/MSS limits |
+| 11 | Local/Drop/tunnel isolation and ordinary large traffic | Existing frontend classification, packet-attachment and stateless fragment regressions remain in the full gate; ordinary traffic never enters this Local matrix |
+| 12 | Callbacks, failed capture/free, repeated close and funding | Existing native allocation/create-close, wrapper callback panic/failed-close/combined-backing and idle-refund fixtures |
+
 ## Device peer
 
 Stage numeric IPv4 and IPv6 addresses/routes on the isolated device guest network,
@@ -49,11 +69,12 @@ pair. Select one method on `LocalNetworkDeliveryInstrumentedTest` per invocation
 | 1 | `localLargeUdpEcho` | Enabled exact numeric `/32` or `/128` rule in Forwarding; one full matching reply |
 | 2 | `localLargeUdpDenied` | Same enabled exact rule, `DifferentWifi`; full send, timeout and no nonce/prefix peer hit |
 | 3 | `localUdpOversized` | Enabled exact forwarding rule; maximum+1, no peer hit and no reply |
+| 4 | `localUdpReplySizeLimit` | Enabled exact forwarding rule; short nonce request reaches peer, peer attempts maximum+1 reply, no datagram reaches consumer |
 
 Arguments: explicit numeric `krtek_peer`, unique `krtek_capture_token`, existing
 `krtek_expect_tunnel` (`Disconnected` or `Connected`) and staged lockdown. Optional
 `krtek_payload_size` defaults to 4096, or family maximum+1 for the oversized
-selector. Run echo separately for 65507 (IPv4) and 65487 (IPv6). Zero/small sizes
+selectors. Run echo separately for 65507 (IPv4) and 65487 (IPv6). Zero/small sizes
 are supported; empty payloads cannot carry an on-wire nonce, so isolate their
 peer observation window.
 
@@ -80,6 +101,21 @@ it. That device result is not proof of the Local typed oversized boundary; nativ
 and Rust complete-size fixtures own that assertion. IPv6 maximum+1 can be sent
 by Android and must not reach the peer. Do not shorten either request.
 
+`localUdpReplySizeLimit` instead uses the separate `local-udp-reply-limit`
+operation, sending a fresh 32-byte nonce from the ordinary consumer. Start the
+peer with `--reply-size 65508` for IPv4 or `--reply-size 65488` for IPv6. The peer
+durably records the entire attempted patterned response. IPv4 requires a peer
+kernel EMSGSIZE receipt, not a claim that Local saw it. IPv6 must actually send
+all 65488 bytes, then the consumer must time out without receiving ANY datagram.
+Native/Rust typed boundary tests distinguish Local refusal from kernel refusal;
+device silence alone does not establish an internal refusal type. No prefix,
+ACK, short request substitution or whole-message replay can pass this audit.
+
+The original `localStreamSurvivesAllTunnelStates` regression may use this same
+controlled peer with `--tcp-port 18080`; its IPv4 stream echo records full chunks
+without treating TCP receive boundaries as application messages. The existing
+selector still owns its continuity/current-sink assertions and restoration.
+
 ## Independent final audit
 
 The runner extracts one invocation's exact TUN IP packets into JSON arrays of hex
@@ -102,3 +138,9 @@ and its epoch/UID/protected-network correlation separately from these byte check
 Derive `EXPECTED_PEER_SOURCE` from the staged network topology, including any
 emulator NAT; do not assume it equals Android's pre-NAT address. Peer interface
 metadata alone does not establish Android's protected network selection.
+
+For `--expect oversized-reply`, provide both wire arrays and observed MTU as in
+the echo command. The request must independently decode as the exact short
+nonce; the reply array must be empty. One full peer request and one exact
+attempt/send-or-kernel-refusal are required. Extra attempts, changed tail bytes,
+shortened response records and any consumer receive are failures.

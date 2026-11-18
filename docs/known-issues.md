@@ -55,14 +55,29 @@ Each issue in this document should provide, at least, the following:
   away. In one test run, a new local TCP connection failed once right after local
   rules were turned off and on and the app list was restored. This has not been
   reproduced since and is still being investigated.
-* Local rules currently drop fragmented IPv4 and IPv6 before their receiving
-  stack. TCP and normal-sized UDP work, but large UDP messages to local devices
-  can be silently lost. Standard receiver reassembly remains separate work.
-  Tunnel transit instead translates and forwards fragments independently; this
-  does not add fragment reception to Local or promise public-network delivery.
-  The capture uses `172.27.1.1/32` and `fdf0:ce4a:801d::172:27:1:1/128`
+* Local uses pinned stock lwIP 2.2.1 for IPv4/IPv6 reassembly and UDP reply
+  fragmentation. Minimal-header UDP payloads are limited to 65507 bytes for
+  IPv4 and 65487 for IPv6, below IPv6's 65527-byte protocol maximum because
+  lwIP's complete-packet representation includes the IP header. Accepted extra
+  headers consume their actual space. Larger replies are refused, not shortened.
+  IPv6 extension-prefixed transport and atomic Fragment input remain unsupported.
+  Tunnel transit instead forwards fragments independently without this Local
+  receiver or its size limits; this does not promise public-network delivery.
+* Local inherits stock lwIP limitations: fragmented IPv4 options are refused,
+  the IPv4 assembly key omits protocol, and duplicate/overlap refusal can retain
+  earlier pieces rather than reject the whole assembly. Conflicting tail-first
+  IPv6 Next Header values can misclassify completion; ECN is not combined and
+  sequential fragment IDs can wrap. This is not full RFC corner-case compliance.
+  Stock entry/pbuf pressure, expiry, revocation and MTU transitions can lose UDP,
+  but partial or checksum-invalid transports never authorize a physical socket
+  and replies are never shortened into a smaller application datagram. Unowned
+  asynchronous control packets are suppressed.
+* The capture uses `172.27.1.1/32` and `fdf0:ce4a:801d::172:27:1:1/128`
   independently of Mullvad's assignment. These private addresses can still
-   collide with a real private network.
+  collide with a real private network.
+* Fragmented large public DNS queries to Cloudflare have no validated response
+  in the retained emulator evidence. The path/filtering cause remains unknown;
+  successful Local echoes do not explain or resolve it.
 * Mullvad capture uses its upstream-selected MTU and families. When an IPv4-only
   target uses MTU below 1280 and a Local rule needs IPv6, Android requires a
   capture-only 1280 floor. This does not raise the target MTU or enable IPv6

@@ -20,6 +20,15 @@ final class LocalUdpProbe {
   private LocalUdpProbe() {}
 
   static Bundle run(String destination, int size, FragmentedUdpProbe.SocketOwner owner) {
+    return run(destination, size, 0, owner);
+  }
+
+  static Bundle replyLimit(String destination, int replySize, FragmentedUdpProbe.SocketOwner owner) {
+    return run(destination, 32, replySize, owner);
+  }
+
+  private static Bundle run(String destination, int size, int replySize,
+      FragmentedUdpProbe.SocketOwner owner) {
     Bundle result = new Bundle();
     JSONObject report = new JSONObject();
     String stage = "create";
@@ -30,6 +39,7 @@ final class LocalUdpProbe {
       report.put("uid", Process.myUid());
       report.put("pid", Process.myPid());
       report.put("payload_size", size);
+      if (replySize != 0) report.put("requested_reply_size", replySize);
       report.put("remote_address", remote.getHostAddress());
       report.put("remote_port", 18081);
       report.put("socket_kind", "udp-dgram");

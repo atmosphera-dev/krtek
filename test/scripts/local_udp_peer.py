@@ -15,6 +15,8 @@ import socket
 import struct
 import time
 
+from local_udp_vectors import payload
+
 
 def bind_peer(address, port):
     address = ipaddress.ip_address(address)
@@ -39,17 +41,25 @@ def append(ledger, row):
     os.fsync(ledger.fileno())
 
 
-def serve(ipv4, ipv6, port, ledger_path, ready_path, duration, max_requests=0):
+def serve(ipv4, ipv6, port, ledger_path, ready_path, duration, max_requests=0, reply_size=None,
+          tcp_port=None):
     """Bounded owner; zero max_requests means duration alone determines the end."""
     if ipaddress.ip_address(ipv4).version != 4 or ipaddress.ip_address(ipv6).version != 6:
         raise ValueError("One numeric address per family required")
     sockets = []
+    clients = set()
     try:
         sockets.append(bind_peer(ipv4, port))
         sockets.append(bind_peer(ipv6, port))
         with selectors.DefaultSelector() as selector, Path(ledger_path).open("x") as ledger:
             for sock in sockets:
-                selector.register(sock, selectors.EVENT_READ)
+                selector.register(sock, selectors.EVENT_READ, "udp")
+            if tcp_port is not None:
+                tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sockets.append(tcp)
+                tcp.bind((ipv4, tcp_port))
+                tcp.listen()
+                selector.register(tcp, selectors.EVENT_READ, "listen")
             ready = {"schema": 1, "pid": os.getpid(), "port": port,
                      "addresses": [str(ipaddress.ip_address(ipv4)), str(ipaddress.ip_address(ipv6))]}
             with Path(ready_path).open("x") as output:
@@ -61,6 +71,25 @@ def serve(ipv4, ipv6, port, ledger_path, ready_path, duration, max_requests=0):
             while time.monotonic() < deadline and (not max_requests or count < max_requests):
                 for key, _ in selector.select(max(0, deadline - time.monotonic())):
                     sock = key.fileobj
+                    if key.data == "listen":
+                        client, source = sock.accept()
+                        client.settimeout(5)
+                        clients.add(client)
+                        selector.register(client, selectors.EVENT_READ, "tcp")
+                        append(ledger, {"event": "tcp_accept", "fd": client.fileno(),
+                                        "source": source[0], "source_port": source[1]})
+                        continue
+                    if key.data == "tcp":
+                        data = sock.recv(65535)
+                        append(ledger, {"event": "tcp_request", "fd": sock.fileno(),
+                                        "payload_hex": data.hex(), "size": len(data)})
+                        if not data:
+                            selector.unregister(sock); clients.remove(sock); sock.close()
+                        else:
+                            sock.sendall(data)
+                            append(ledger, {"event": "tcp_echo", "fd": sock.fileno(),
+                                            "payload_hex": data.hex(), "size": len(data)})
+                        continue
                     data, ancillary, flags, source = sock.recvmsg(65535, 256)
                     if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
                         raise RuntimeError("Truncated peer request or packet metadata")
@@ -85,15 +114,33 @@ def serve(ipv4, ipv6, port, ledger_path, ready_path, duration, max_requests=0):
                            "size": len(data), "payload_hex": data.hex(),
                            "received_monotonic_ns": time.monotonic_ns()}
                     append(ledger, row)
-                    sent = sock.sendto(data, source)
-                    if sent != len(data):
+                    response = data if reply_size is None else payload(reply_size, data)
+                    if reply_size is not None:
+                        if len(data) != 32 or reply_size != (65508 if family == 4 else 65488):
+                            raise ValueError("Reply-limit operation requires one nonce and exact family limit+1")
+                        append(ledger, {"schema": 1, "event": "reply_attempt", "index": count,
+                                        "size": len(response), "payload_hex": response.hex()})
+                    try:
+                        sent = sock.sendto(response, source)
+                    except OSError as error:
+                        if not (reply_size == 65508 and family == 4 and error.errno == 90):
+                            raise
+                        append(ledger, {"schema": 1, "event": "reply_refused", "index": count,
+                                        "size": len(response), "errno": error.errno,
+                                        "stage": "kernel-send"})
+                        if max_requests and count >= max_requests:
+                            break
+                        continue
+                    if sent != len(response):
                         raise RuntimeError("Short peer echo")
-                    append(ledger, {"schema": 1, "event": "echo", "index": count,
+                    append(ledger, {"schema": 1, "event": "echo" if reply_size is None else "reply_sent", "index": count,
                                     "size": sent, "sent_monotonic_ns": time.monotonic_ns()})
                     if max_requests and count >= max_requests:
                         break
             append(ledger, {"schema": 1, "event": "stopped", "requests": count})
     finally:
+        for client in clients:
+            client.close()
         for sock in sockets:
             sock.close()
 
@@ -107,10 +154,16 @@ def main():
     parser.add_argument("--ready", type=Path, required=True)
     parser.add_argument("--duration", type=float, default=600)
     parser.add_argument("--max-requests", type=int, default=0)
+    parser.add_argument("--reply-size", type=int, choices=(65488, 65508),
+                        help="Reply-limit control only: receive 32-byte nonce, attempt family maximum+1")
+    parser.add_argument("--tcp-port", type=int, help="Continuity fixture: explicit IPv4 TCP stream echo")
     args = parser.parse_args()
     if not 0 < args.port <= 65535 or args.duration <= 0 or args.max_requests < 0:
         parser.error("Positive port/duration and nonnegative request count required")
-    serve(args.ipv4, args.ipv6, args.port, args.ledger, args.ready, args.duration, args.max_requests)
+    if args.tcp_port is not None and (not 0 < args.tcp_port <= 65535 or args.reply_size is not None):
+        parser.error("TCP requires a valid port and the exact-echo mode")
+    serve(args.ipv4, args.ipv6, args.port, args.ledger, args.ready, args.duration, args.max_requests,
+          args.reply_size, args.tcp_port)
 
 
 if __name__ == "__main__":

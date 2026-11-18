@@ -2458,6 +2458,8 @@ class LocalNetworkDeliveryInstrumentedTest {
 
     @Test fun localUdpOversized() = localUdpCase("oversized")
 
+    @Test fun localUdpReplySizeLimit() = localUdpCase("oversized-reply")
+
     private fun localUdpCase(expect: String) {
         val destination = checkNotNull(args.getString("krtek_peer"))
         check(InetAddresses.isNumericAddress(destination))
@@ -2469,10 +2471,11 @@ class LocalNetworkDeliveryInstrumentedTest {
             args
                 .getString(
                     "krtek_payload_size",
-                    if (expect == "oversized") "${maximum + 1}" else "4096",
+                    if (expect.startsWith("oversized")) "${maximum + 1}" else "4096",
                 )
                 .toInt()
-        check(if (expect == "oversized") size == maximum + 1 else size in 0..maximum)
+        check(if (expect.startsWith("oversized")) size == maximum + 1 else size in 0..maximum)
+        val requestSize = if (expect == "oversized-reply") 32 else size
         val token = checkNotNull(args.getString("krtek_capture_token"))
         check(token.matches(Regex("[a-z0-9-]{1,64}")))
         withConsumer(ForwardingAvailability.Active, testTimeout = 3.minutes) {
@@ -2507,7 +2510,11 @@ class LocalNetworkDeliveryInstrumentedTest {
                 val result =
                     consumer.request(
                         Bundle().apply {
-                            putString("transport", "local-udp-echo")
+                            putString(
+                                "transport",
+                                if (expect == "oversized-reply") "local-udp-reply-limit"
+                                else "local-udp-echo",
+                            )
                             putString("destination", destination)
                             putInt("payload_size", size)
                         }
@@ -2517,12 +2524,12 @@ class LocalNetworkDeliveryInstrumentedTest {
                 val decoded = JSONObject(raw)
                 assertEquals(family, decoded.getInt("family"))
                 assertEquals(result.getInt("uid"), decoded.getInt("uid"))
-                assertEquals(size, decoded.getInt("payload_size"))
+                assertEquals(requestSize, decoded.getInt("payload_size"))
                 assertEquals(18081, decoded.getInt("remote_port"))
                 assertTrue(decoded.getBoolean("option_set"))
                 val expectedPayload =
                     LocalUdpPayload.create(
-                        size,
+                        requestSize,
                         decoded
                             .getString("nonce")
                             .chunked(2)
@@ -2535,6 +2542,9 @@ class LocalNetworkDeliveryInstrumentedTest {
                 )
                 assertFalse(decoded.has("payload_hex"))
                 assertFalse(decoded.has("reply_hex"))
+                if (expect == "oversized-reply") {
+                    assertEquals(size, decoded.getInt("requested_reply_size"))
+                }
                 if (expect == "echo") {
                     assertEquals("local-udp-echo", result.getString("outcome"), raw)
                     assertTrue(decoded.getBoolean("validated"))
@@ -2554,13 +2564,17 @@ class LocalNetworkDeliveryInstrumentedTest {
                 } else {
                     assertEquals("failed", result.getString("outcome"), raw)
                     assertFalse(decoded.optBoolean("validated"))
+                    assertFalse(
+                        decoded.has("received"),
+                        "No shortened or other datagram is allowed",
+                    )
                     if (expect == "oversized" && family == 4) {
                         // IPv4's protocol maximum is also the kernel send limit.
                         // This is EMSGSIZE, not proof of the Local typed boundary.
                         assertEquals("send", decoded.getString("error_stage"))
                         assertEquals(android.system.OsConstants.EMSGSIZE, decoded.getInt("errno"))
                     } else {
-                        assertEquals(size, decoded.getInt("sent"))
+                        assertEquals(requestSize, decoded.getInt("sent"))
                         assertEquals("receive", decoded.getString("error_stage"))
                         assertTrue(
                             decoded.getInt("errno") in
@@ -2570,7 +2584,11 @@ class LocalNetworkDeliveryInstrumentedTest {
                                 )
                         )
                     }
-                    report("local_udp_requires_peer_silence_audit", true)
+                    report(
+                        if (expect == "oversized-reply") "local_udp_requires_peer_reply_limit_audit"
+                        else "local_udp_requires_peer_silence_audit",
+                        true,
+                    )
                 }
             } finally {
                 val finalCapture = appliedConfiguration(policy, ForwardingAvailability.Active)

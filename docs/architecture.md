@@ -452,10 +452,53 @@ dependent formats. ESP remains opaque: tunnel mode is supported, encrypted
 transport-mode pseudoheaders cannot be repaired without the SA. Invalid IPv6
 UDP zero checksums remain zero for the endpoint to reject.
 
-Local is a receiver, not tunnel transit. It terminates connections using its
-stack and protected, physical-network-bound sockets. Its current pre-stack
-parser rejects IPv4/IPv6 fragments. Complete Local datagrams up to the actual
-capture MTU are supported; fragmented Local UDP still requires future receiver work.
+Local is a receiver, not tunnel transit. Pristine pinned lwIP 2.2.1 owns canonical
+IPv4/IPv6 receive reassembly and UDP reply fragmentation. The daemon's irreversibly
+revocable receive scope contains no ports or transport authority. Every retained
+input node carries its logical handle and scope; a completed chain must have one
+live owner throughout. Only a complete Rust-validated TCP/UDP segment can authorize
+a flow and prepare a protected, physical-network-bound socket. smoltcp retains TCP
+sequence/MSS/retransmission ownership; kernel sockets retain physical-side IP
+processing. Ordinary tunnel classification, stateless fragment translation and
+protocol-sized receive scratch are unchanged.
+
+Local's minimal-header UDP payload ceiling is 65507 bytes for IPv4 and 65487 for
+IPv6, not IPv6's 65527-byte protocol maximum. Stock lwIP's 16-bit complete-packet
+representation includes the base IP header. Accepted additional header bytes
+consume their actual space; larger Local input/replies receive typed oversized
+refusal, never truncation or fallback. Fragmented IPv4 options, IPv6
+extension-prefixed transport and atomic Fragment input remain unsupported.
+
+One process-global native mutex, monotonic clock and 12 MiB reservation cover all
+logical handles. Retirement invalidates a handle immediately but retains scope
+guards and funding while tagged input nodes remain; stock idle timers reclaim
+them. A core-owned condition-variable worker drives timers independently of
+Tokio/runtime replacement, joins before replacement and exits on quiescence. Its
+bounded stack and bookkeeping are included in the same reservation. Native
+callbacks borrow synchronously, never authorize or wait for sockets or TUN, and
+unowned control output is suppressed. Rust copies and reply storage retain
+separate Local credit; this is not a process RSS or kernel-memory bound.
+
+Each physical UDP reply is received whole into protocol-sized scratch only after
+reserving a 192 KiB packed output batch. It occupies one existing output job,
+not a queue entry per fragment, including the 1365-packet maximum IPv4 reply at
+MTU 68. Callback capture failure discards the batch before any emission, even
+when lwIP returns success. Every packet/retry retains its flow, receive scope and
+grant and passes the exact current sink/MTU check. EAGAIN retains the same packet;
+successful writes yield between packets. An MTU shrink cancels a remainder
+containing obsolete oversized UDP packets without replaying the message. An
+already fitting tail stays eligible. TCP state and retransmission ownership
+survive compatible handovers.
+
+Reassembly retains stock five-entry and 2048-pbuf per-family pressure/oldest
+eviction behavior and first-arrival 15-second IPv4 / 60-second IPv6 countdowns
+(reclamation occurs on stock timer ticks, not an exact sub-tick deadline).
+Duplicate/overlap refusal can retain earlier pieces; IPv4's key omits protocol,
+IPv6 tail-first Next Header can misclassify completion, and fragment IDs can wrap.
+These are inherited limitations, not complete RFC corner-case compliance. See
+[known issues](known-issues.md). Dependency updates replace the pristine pin and
+rerun native/ABI, maximum-length, provenance and complete-consumer gates; a larger
+IPv6 ceiling requires a dependency/API decision, not larger pools.
 
 ### iOS
 

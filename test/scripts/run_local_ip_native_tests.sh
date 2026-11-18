@@ -47,6 +47,11 @@ done
 "$out/bridge_test" expiry
 "$out/bridge_test" pressure
 "$out/bridge_test" clock
+"${CC:-cc}" "${flags[@]}" "$native/tests/stock_lwip_matrix.c" "${objects[@]}" \
+    -o "$out/stock_lwip_matrix"
+for scenario in clock4 clock6 pressure4 pressure6 corners; do
+    "$out/stock_lwip_matrix" "$scenario"
+done
 size "$out/bridge_test" | tee "$out/bridge.size"
 nm -S --size-sort "$out/bridge_test" > "$out/bridge.symbols"
 if ((ffi)); then
