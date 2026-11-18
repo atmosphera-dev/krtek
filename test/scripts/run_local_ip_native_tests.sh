@@ -5,7 +5,7 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 native="$root/talpid-lan-forwarder/native"
 out=${KRTEK_EVIDENCE_DIR:?set KRTEK_EVIDENCE_DIR to a disk-backed evidence directory}
 mkdir -p "$out"
-python3 - "$native" <<'PY'
+python3 -E - "$native" <<'PY'
 import hashlib, json, pathlib, sys
 n = pathlib.Path(sys.argv[1])
 m = json.loads((n / 'lwip-source.json').read_text())
@@ -15,14 +15,14 @@ files = {str(p.relative_to(n / 'vendor/lwip')): hashlib.sha256(p.read_bytes()).h
 assert files == m['sha256'], 'pristine vendor file inventory mismatch'
 print(f'vendor: {len(files)} pristine files, {m["commit"]}')
 PY
-python3 "$native/tests/check_notices.py"
+python3 -E "$native/tests/check_notices.py"
 flags=(-std=c11 -O1 -g -Wall -Wextra -Werror -fno-omit-frame-pointer
     -fvisibility=hidden -I"$native" -I"$native/vendor/lwip/src/include")
 android=0
 ffi=0
 for argument in "$@"; do
     case $argument in
-        --sanitize) flags+=(-fsanitize=address,undefined) ;;
+        --sanitize) flags+=(-fsanitize=address,undefined -fno-sanitize-recover=undefined) ;;
         --android) android=1 ;;
         --ffi) ffi=1 ;;
         *) echo "usage: $0 [--sanitize] [--android] [--ffi]" >&2; exit 2 ;;
@@ -47,6 +47,8 @@ done
 "$out/bridge_test" expiry
 "$out/bridge_test" pressure
 "$out/bridge_test" clock
+"$out/bridge_test" idle-clock
+"$out/bridge_test" late-tick
 "${CC:-cc}" "${flags[@]}" "$native/tests/stock_lwip_matrix.c" "${objects[@]}" \
     -o "$out/stock_lwip_matrix"
 for scenario in clock4 clock6 pressure4 pressure6 corners; do
@@ -101,7 +103,7 @@ if ((android)); then
         "$toolchain/llvm-nm" -D --defined-only "$abiout/libkrtek_lwip-proof.so" > "$abiout/exports.txt"
         "$toolchain/llvm-size" -A "$abiout/libkrtek_lwip-proof.so" > "$abiout/sections.txt"
         "$compiler" --version > "$abiout/compiler.txt"
-        python3 - "$abiout" "$target" "$native" <<'PY'
+        python3 -E - "$abiout" "$target" "$native" <<'PY'
 import json, pathlib, re, shlex, struct, sys
 p = pathlib.Path(sys.argv[1])
 sections = {}
@@ -111,6 +113,13 @@ for line in (p/'sections.txt').read_text().splitlines():
         sections[parts[0]] = int(parts[1])
 binary = (p/'libkrtek_lwip-proof.so').read_bytes()
 assert binary[:4] == b'\x7fELF' and binary[5] == 1
+expected_class, expected_machine, expected_name = {
+    'armv7-linux-androideabi': (1, 40, 'ARM'),
+    'aarch64-linux-android': (2, 183, 'AArch64'),
+    'i686-linux-android': (1, 3, 'Intel 80386'),
+    'x86_64-linux-android': (2, 62, 'Advanced Micro Devices X86-64'),
+}[sys.argv[2]]
+assert binary[4] == expected_class and struct.unpack_from('<H', binary, 18)[0] == expected_machine, 'proof ELF target mismatch'
 if binary[4] == 2:
     shoff, phoff = struct.unpack_from('<Q',binary,40)[0], struct.unpack_from('<Q',binary,32)[0]
     shsize, shcount = struct.unpack_from('<HH',binary,58)
@@ -139,7 +148,10 @@ for line in (p/'layout.txt').read_text().splitlines():
 assert layouts['nodes'] + layouts['contexts'] <= 1048576
 elf = (p/'elf.txt').read_text()
 machines = re.findall(r'^\s*Machine:\s*(.+)$', (p/'archive.txt').read_text(), re.M)
-assert len(machines) == 24 and len(set(machines)) == 1, machines
+classes = re.findall(r'^\s*Class:\s*(.+)$', (p/'archive.txt').read_text(), re.M)
+assert len(machines) == len(classes) == 24, (machines, classes)
+assert all(machine == expected_name for machine in machines), machines
+assert all(kind == f'ELF{expected_class * 32}' for kind in classes), classes
 loads = [line.split() for line in elf.splitlines() if line.lstrip().startswith('LOAD')]
 assert loads and all(int(line[-1],16) >= 16384 for line in loads)
 stack = {}

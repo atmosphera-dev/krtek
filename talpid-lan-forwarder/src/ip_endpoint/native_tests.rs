@@ -253,7 +253,7 @@ fn stock_lwip_wrapper_resumes_retirement_after_the_owning_runtime_is_replaced() 
             Err(IpError::Full)
         ));
         api.0.lock().unwrap().expires = core.now().0 + 5;
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        wait_for_refund(&budget);
         assert_eq!(
             budget.used(),
             0,
@@ -403,4 +403,47 @@ fn stock_lwip_wrapper_combined_backing_fits_existing_reservation() {
         "native combined backing: [C all-LOAD ceiling, stack, guard, worker allowance, Rust tables/core]={receipt:?}, total={total}, reservation={NATIVE_RESERVATION}"
     );
     assert!(total <= NATIVE_RESERVATION);
+}
+
+#[test]
+fn stock_lwip_failed_core_refuses_work_on_surviving_handles_before_native_calls() {
+    let api = Api::default();
+    let core = NativeCore::scripted(api.clone());
+    let budget = Arc::new(BufferBudget::new(NATIVE_RESERVATION + 4096));
+    let mut first = core.open(budget.clone(), 1280).unwrap();
+    let mut survivor = core.open(budget.clone(), 1280).unwrap();
+    let flow = flow(false, Transport::Udp);
+    let scope = ReceiveScope::new(flow.source.ip(), flow.destination.ip(), &*budget).unwrap();
+    let id = ReceiveScopeId(scope.id());
+    survivor.register(&scope).unwrap();
+    api.0.lock().unwrap().close_status = ffi::INTERNAL;
+    first.close();
+    let ticks = api.0.lock().unwrap().ticks.len();
+    assert!(matches!(
+        core.open(budget.clone(), 1280),
+        Err(IpError::Internal)
+    ));
+    let observed_ticks = api.0.lock().unwrap().ticks.len();
+    assert_eq!(observed_ticks, ticks, "failed open never ticks");
+    assert_eq!(
+        survivor.ingest(id, &[0; 20], &mut |_| panic!("failed core")),
+        Err(IpError::Internal)
+    );
+    assert_eq!(survivor.register(&scope), Err(IpError::Internal));
+    assert_eq!(
+        survivor.reply(
+            ReplyTuple::from_flow(id, flow).unwrap(),
+            &[],
+            &mut |_| panic!("failed core")
+        ),
+        Err(IpError::Internal)
+    );
+    assert!(api.0.lock().unwrap().retained.is_empty());
+    assert_eq!(survivor.scope_refs(id), 0);
+    api.0.lock().unwrap().close_status = ffi::OK;
+    survivor.close();
+    assert!(
+        budget.used() >= NATIVE_RESERVATION,
+        "unknown native state stays funded"
+    );
 }

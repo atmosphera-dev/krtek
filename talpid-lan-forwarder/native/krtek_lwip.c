@@ -429,9 +429,42 @@ int32_t krtek_lwip_set_mtu(krtek_lwip_handle handle, uint16_t mtu)
 
 int32_t krtek_lwip_tick(uint32_t monotonic_ms)
 {
+    size_t i;
+    uint32_t elapsed = monotonic_ms - clock_ms;
+    int live = 0;
     if (entered) return KRTEK_LWIP_INTERNAL;
-    if ((uint32_t)(monotonic_ms - clock_ms) > INT32_MAX) return KRTEK_LWIP_MALFORMED;
+    for (i = 0; i < CONTEXTS; ++i) if (clients[i].id) { live = 1; break; }
+    if (!live)
+        for (i = 0; i < PBUF_POOL_SIZE; ++i) if (nodes[i].backing) { live = 1; break; }
+    /* No receive age or logical owner survives this boundary. Use the public
+     * timeout rebase after arbitrary idle intervals, including whole u32 wraps. */
+    if (!live) {
+        entered = 1;
+        clock_ms = monotonic_ms;
+        if (initialized) sys_restart_timeouts();
+        entered = 0;
+        return KRTEK_LWIP_OK;
+    }
+    if (elapsed > INT32_MAX) return KRTEK_LWIP_MALFORMED;
     entered = 1;
+    /* Drive stock callbacks at their normal cadence even if the scheduler is
+     * late. At most MAXAGE+1 seconds can affect retained fragments. Beyond that
+     * horizon no input nodes remain, so skip idle cyclic work with the public
+     * rebase API, without touching the stock reassembly algorithms. */
+    if (initialized) {
+        uint32_t horizon = (LWIP_MAX(IP_REASS_MAXAGE, IPV6_REASS_MAXAGE) + 1U) * 1000U;
+        uint32_t catchup = LWIP_MIN(elapsed, horizon);
+        while (catchup) {
+            uint32_t step = LWIP_MIN(catchup, 1000U);
+            clock_ms += step;
+            sys_check_timeouts();
+            catchup -= step;
+        }
+        if (elapsed > horizon) {
+            clock_ms = monotonic_ms;
+            sys_restart_timeouts();
+        }
+    }
     clock_ms = monotonic_ms;
     if (initialized) sys_check_timeouts();
     entered = 0;

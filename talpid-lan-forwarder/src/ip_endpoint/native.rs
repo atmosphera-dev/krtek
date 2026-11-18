@@ -15,7 +15,7 @@ use std::{
 use talpid_types::relay_flow::{RelayBufferAllocator, RelayBufferReservation};
 
 pub(crate) const NATIVE_RESERVATION: usize = 12 * 1024 * 1024;
-// C1's largest four-ABI all-LOAD receipt is 9,905,405 bytes (arm64).
+// R1's refreshed four-ABI all-LOAD ceiling is 9,905,405 bytes (arm64).
 // Include code/rodata as well as all fixed C pools, plus Rust bookkeeping and
 // the explicitly sized worker stack. The guard allowance covers a 64 KiB page;
 // allocator/OS thread runtime memory is not a process-RSS guarantee.
@@ -174,6 +174,9 @@ impl<A: NativeApi> NativeCore<A> {
     ) -> Result<NativeEngine<A>, IpError> {
         let mut state = self.state.lock().unwrap();
         let result = (|| {
+            if state.failed {
+                return Err(IpError::Internal);
+            }
             if state.funding.is_some() {
                 status(state.api.tick(self.now().0))?;
             }
@@ -217,6 +220,9 @@ impl<A: NativeApi> NativeCore<A> {
                 state.reap();
                 return Err(IpError::Internal);
             }
+            // Synchronize even a newly refunded/reopened core before creating
+            // the first live handle. The native port rebases only at quiescence.
+            status(state.api.tick(self.now().0))?;
             let mut handle = 0;
             let opened = status(state.api.open(&mut handle));
             if let Err(error) = opened {
@@ -314,6 +320,9 @@ impl<A: NativeApi> NativeEngine<A> {
     pub(crate) fn register(&mut self, scope: &ReceiveScope) -> Result<(), IpError> {
         if self.closed || !scope.current() {
             return Err(IpError::Stale);
+        }
+        if self.core.state.lock().unwrap().failed {
+            return Err(IpError::Internal);
         }
         self.registered = Some(scope.clone());
         Ok(())
@@ -474,6 +483,17 @@ impl<A: NativeApi> LocalIpEngine for NativeEngine<A> {
         }
         let mut state = self.core.state.lock().unwrap();
         let registered = self.registered.take().ok_or(IpError::Stale)?;
+        if state.failed {
+            return Err(IpError::Internal);
+        }
+        // Expire older work before admitting a newly arrived fragment. Otherwise
+        // a delayed worker's catch-up would also age this new input retroactively.
+        if status(state.api.tick(self.core.now().0)).is_err() {
+            state.failed = true;
+            self.core.changed.notify_all();
+            return Err(IpError::Internal);
+        }
+        state.reap();
         if registered.id() != scope.0 || !registered.current() {
             return Err(IpError::Stale);
         }
@@ -551,6 +571,9 @@ impl<A: NativeApi> LocalIpEngine for NativeEngine<A> {
             output: Some(output),
         };
         let mut state = self.core.state.lock().unwrap();
+        if state.failed {
+            return Err(IpError::Internal);
+        }
         // SAFETY: explicit reversed tuple and borrowed payload/context.
         let result = unsafe {
             state.api.reply(
@@ -573,6 +596,9 @@ impl<A: NativeApi> LocalIpEngine for NativeEngine<A> {
             return Err(IpError::Stale);
         }
         let mut state = self.core.state.lock().unwrap();
+        if state.failed {
+            return Err(IpError::Internal);
+        }
         status(state.api.set_mtu(self.handle, mtu))
     }
     fn poll_time(&mut self, now: MonotonicMillis) -> Result<(), IpError> {
@@ -580,6 +606,9 @@ impl<A: NativeApi> LocalIpEngine for NativeEngine<A> {
             return Err(IpError::Stale);
         }
         let mut state = self.core.state.lock().unwrap();
+        if state.failed {
+            return Err(IpError::Internal);
+        }
         if state.funding.is_none() {
             return Ok(());
         }
@@ -589,6 +618,9 @@ impl<A: NativeApi> LocalIpEngine for NativeEngine<A> {
     }
     fn next_timeout_ms(&self) -> Option<u32> {
         let mut state = self.core.state.lock().unwrap();
+        if state.failed {
+            return None;
+        }
         state.funding.as_ref()?;
         timeout(state.api.next_timeout_ms())
     }

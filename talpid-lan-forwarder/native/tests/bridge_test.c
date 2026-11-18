@@ -10,6 +10,7 @@ static uint16_t expected_mtu;
 static uint8_t family;
 static uint8_t protocol=17;
 static uint64_t expected_scope;
+static uint32_t output_id;
 static uint8_t app4[16] = {172,27,1,1}, peer4[16] = {192,168,50,9};
 static uint8_t app6[16] = {0xfd,0xf0,0xce,0x4a,0x80,0x1d,0,0,0,0,0,0,0x1,0x72,0x27,1};
 static uint8_t peer6[16] = {0xfd,0x12,0,0,0,0,0,0,0,0,0,0,0,0,0,9};
@@ -57,6 +58,7 @@ static void on_complete(void *ctx, const krtek_lwip_transport *t, const uint8_t 
 static void on_output(void *ctx, const uint8_t *p, size_t n)
 {
     size_t header, offset, length, i;
+    uint32_t id=0;
     int more;
     assert(ctx==&checks); assert(n<=expected_mtu && (p[0]>>4)==family);
     if (family==4) {
@@ -64,14 +66,18 @@ static void on_output(void *ctx, const uint8_t *p, size_t n)
         assert(finish(sum_bytes(0,p,20))==0);
         assert(memcmp(p+12,peer4,4)==0 && memcmp(p+16,app4,4)==0);
         header=20; offset=(get16(p+6)&8191)*8; more=(get16(p+6)&8192)!=0;
+        id=get16(p+4);
     } else {
         assert((size_t)get16(p+4)+40==n);
         assert(memcmp(p+8,peer6,16)==0 && memcmp(p+24,app6,16)==0);
         if (p[6]==44) {
             assert(p[40]==17 && p[41]==0);
             header=48; offset=get16(p+42)&65528; more=get16(p+42)&1;
+            id=((uint32_t)get16(p+44)<<16)|get16(p+46);
         } else { assert(p[6]==17); header=40; offset=0; more=0; }
     }
+    if (!output_count) output_id=id;
+    assert(id==output_id);
     length=n-header;
     assert(offset+length<=expected_length);
     if (more) assert(length && length%8==0);
@@ -184,9 +190,12 @@ static void boundary(krtek_lwip_handle h)
         packet[6]=60;
         assert(krtek_lwip_ingest(h,101,packet,wire,&callbacks,NULL)==KRTEK_LWIP_UNSUPPORTED);
         assert(!krtek_lwip_set_mtu(h,68));
+        wire=piece(0,expected_length,0,100,0);
         assert(krtek_lwip_ingest(h,101,packet,wire,&callbacks,NULL)==KRTEK_LWIP_UNSUPPORTED);
         assert(krtek_lwip_reply(h,&t,1,2,segment,8,&callbacks,NULL)==KRTEK_LWIP_UNSUPPORTED);
         assert(!krtek_lwip_set_mtu(h,1280));
+        expected_scope=101;
+        assert(krtek_lwip_ingest(h,101,packet,wire,&callbacks,&checks)==KRTEK_LWIP_OK);
     } else {
         t.source[15]=1;
         assert(krtek_lwip_reply(h,&t,1,2,segment,8,&callbacks,NULL)==KRTEK_LWIP_MALFORMED);
@@ -294,6 +303,38 @@ static void wrapping_clock(void)
     assert(sys_now()==500 && krtek_lwip_next_timeout_ms()<=1000);
     assert(!krtek_lwip_close(h)); ++checks;
 }
+static void idle_reopen_clock(void)
+{
+    krtek_lwip_handle h=open_client();
+    assert(!krtek_lwip_close(h));
+    /* The core is quiescent; gaps beyond signed comparison range are legal. */
+    assert(!krtek_lwip_tick(0x80000001U));
+    h=open_client();
+    assert(!krtek_lwip_tick(0x80000002U));
+    assert(krtek_lwip_next_timeout_ms()<=1000);
+    assert(!krtek_lwip_close(h));
+    assert(!krtek_lwip_tick(7)); /* arbitrary idle wrap, still no retained owner */
+    h=open_client();
+    assert(!krtek_lwip_tick(8));
+    assert(krtek_lwip_next_timeout_ms()<=1000);
+    assert(!krtek_lwip_close(h)); ++checks;
+}
+static void late_tick_expiry(void)
+{
+    krtek_lwip_handle h=open_client();
+    family=4; make_segment(4096);
+    size_t wire=piece(0,1232,1,7101,1);
+    assert(krtek_lwip_ingest(h,101,packet,wire,&callbacks,NULL)==KRTEK_LWIP_PENDING);
+    assert(krtek_lwip_scope_refs(h,101)==1);
+    assert(!krtek_lwip_tick(20000));
+    assert(!krtek_lwip_scope_refs(h,101));
+    family=6; make_segment(4096); wire=piece(0,1232,1,7102,1);
+    assert(krtek_lwip_ingest(h,102,packet,wire,&callbacks,NULL)==KRTEK_LWIP_PENDING);
+    assert(!krtek_lwip_close(h));
+    assert(!krtek_lwip_tick(1000000));
+    assert(!krtek_lwip_scope_refs(h,102));
+    assert(!completes && !output_count); checks+=2;
+}
 static void expiry(void)
 {
     krtek_lwip_handle h=open_client(), other;
@@ -343,6 +384,8 @@ int main(int argc, char **argv)
     if(argc>1) {
         if(!strcmp(argv[1],"expiry")) expiry();
         else if(!strcmp(argv[1],"clock")) wrapping_clock();
+        else if(!strcmp(argv[1],"idle-clock")) idle_reopen_clock();
+        else if(!strcmp(argv[1],"late-tick")) late_tick_expiry();
         else { assert(!strcmp(argv[1],"pressure")); pressure(); }
     } else {
         const size_t sizes[]={0,1,31,1232,1233,1252,1253,4096,4097};

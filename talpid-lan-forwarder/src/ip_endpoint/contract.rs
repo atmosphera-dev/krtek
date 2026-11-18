@@ -32,7 +32,8 @@ pub enum Ingress {
     /// Input consumed with no retained incomplete datagram. Callback delivery
     /// does not imply transport validation or successful downstream admission.
     Consumed,
-    /// Incomplete input retained by the engine; no complete-flow authority.
+    /// No completion reported; input may be retained or discarded. Use
+    /// scope_refs for guard lifetime, never this non-authorizing status.
     Pending,
 }
 

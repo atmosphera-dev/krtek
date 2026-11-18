@@ -116,6 +116,10 @@ fn main() {
                 assert_eq!(&segment[8..], &payload);
                 assert_eq!(u16::from_be_bytes([segment[0], segment[1]]), 18081);
                 assert_eq!(u16::from_be_bytes([segment[2], segment[3]]), 32001);
+                assert_eq!(
+                    usize::from(u16::from_be_bytes([segment[4], segment[5]])),
+                    segment.len()
+                );
                 let packets = std::mem::take(&mut capture.packets);
                 for (index, packet) in packets.iter().enumerate() {
                     assert_eq!(

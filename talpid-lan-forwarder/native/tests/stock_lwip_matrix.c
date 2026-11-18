@@ -101,7 +101,10 @@ static void corners(void)
     family=6; make_segment(64); before=completes;
     wire=piece(0,expected_length,0,9503,1);
     assert(krtek_lwip_ingest(h,101,packet,wire,&callbacks,&checks)==KRTEK_LWIP_UNSUPPORTED);
+    /* Independent, valid Destination Options header: UDP, Hdr Ext Len=0,
+     * six Pad1 bytes. Not the old Fragment header reinterpreted as options. */
     packet[6]=60;
+    memset(packet+40,0,8); packet[40]=17;
     assert(krtek_lwip_ingest(h,101,packet,wire,&callbacks,&checks)==KRTEK_LWIP_UNSUPPORTED);
     assert(completes==before && !krtek_lwip_scope_refs(h,101)); ++checks;
     /* Tail-first Next Header is inherited from the first arriving tail, not
