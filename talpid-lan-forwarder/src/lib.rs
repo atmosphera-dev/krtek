@@ -21,6 +21,8 @@
 
 pub mod authority;
 mod forwarder;
+#[cfg(test)]
+mod ip_endpoint;
 pub mod packet;
 
 pub use authority::{Disposition, LocalAuthority, Refused};
