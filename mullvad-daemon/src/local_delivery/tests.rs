@@ -128,6 +128,131 @@ fn authority() -> Arc<DeliveryAuthority> {
     Arc::new(DeliveryAuthority::new(&policy(), Arc::new(|_, _| Ok(()))))
 }
 
+#[test]
+fn stock_lwip_receive_scope_is_non_authorizing_and_irreversibly_revoked() {
+    let prepared = Arc::new(AtomicUsize::new(0));
+    let counter = prepared.clone();
+    let authority = DeliveryAuthority::new(
+        &policy(),
+        Arc::new(move |_, _| {
+            counter.fetch_add(1, SeqCst);
+            Ok(())
+        }),
+    );
+    let budget = BufferBudget::new(65536);
+    let flow = flow(Transport::Udp, 49120);
+    authority.update(&policy(), Some(observation()));
+    let scope = authority
+        .receive(flow.source.ip(), flow.destination.ip(), &budget)
+        .unwrap();
+    assert!(scope.current());
+    assert_eq!(
+        prepared.load(SeqCst),
+        0,
+        "receiving cannot prepare a physical socket"
+    );
+    let same = authority
+        .receive(flow.source.ip(), flow.destination.ip(), &budget)
+        .unwrap();
+    assert_eq!(scope.id(), same.id());
+    let mut off = policy();
+    off.enabled = false;
+    // No owner event is consumed between these publications.
+    authority.update(&off, Some(observation()));
+    authority.update(&policy(), Some(observation()));
+    assert!(!scope.current());
+    assert!(matches!(
+        authority.authorize_received(flow, &scope),
+        Err(Refused::Stale)
+    ));
+    let next = authority
+        .receive(flow.source.ip(), flow.destination.ip(), &budget)
+        .unwrap();
+    assert_ne!(scope.id(), next.id());
+    assert!(authority.authorize_received(flow, &next).is_ok());
+    assert_eq!(prepared.load(SeqCst), 0);
+    drop((scope, same, next));
+    authority.update(&policy(), Some(observation()));
+    assert_eq!(
+        budget.used(),
+        0,
+        "weak registrations release their own retained credit"
+    );
+}
+
+#[test]
+fn stock_lwip_receive_scope_preserves_equivalent_observations_not_network_replacement() {
+    let authority = authority();
+    let budget = BufferBudget::new(65536);
+    let flow = flow(Transport::Udp, 49121);
+    authority.update(&policy(), Some(observation()));
+    let scope = authority
+        .receive(flow.source.ip(), flow.destination.ip(), &budget)
+        .unwrap();
+    let mut observed = observation();
+    observed.sequence += 1;
+    authority.update(&policy(), Some(observed.clone()));
+    assert!(scope.current());
+    assert!(authority.authorize_received(flow, &scope).is_ok());
+    // An unrelated matching rule changes the ordinary flow lease's rule IDs,
+    // but not the receive context's eligibility or physical-network identity.
+    let mut changed = policy();
+    let mut extra = changed.rules[0].clone();
+    extra.id = "00000000-0000-0000-0000-000000000002".parse().unwrap();
+    changed.rules.push(extra);
+    authority.update(&changed, Some(observed.clone()));
+    assert!(scope.current());
+    assert!(authority.authorize_received(flow, &scope).is_ok());
+    observed.networks[0].handle += 1;
+    authority.update(&changed, Some(observed));
+    assert!(!scope.current());
+    assert!(matches!(
+        authority.authorize_received(flow, &scope),
+        Err(Refused::Stale)
+    ));
+    let successor = authority
+        .receive(flow.source.ip(), flow.destination.ip(), &budget)
+        .unwrap();
+    assert_ne!(scope.id(), successor.id());
+}
+
+#[test]
+fn stock_lwip_receive_scope_binds_endpoints_capture_and_funded_storage() {
+    let authority = authority();
+    let budget = BufferBudget::new(65536);
+    let flow = flow(Transport::Tcp, 49122);
+    authority.update(&policy(), Some(observation()));
+    let scope = authority
+        .receive(flow.source.ip(), flow.destination.ip(), &budget)
+        .unwrap();
+    let mut wrong = flow;
+    wrong.source.set_ip("172.27.1.2".parse().unwrap());
+    assert!(matches!(
+        authority.authorize_received(wrong, &scope),
+        Err(Refused::Stale)
+    ));
+    let unfunded = BufferBudget::new(0);
+    drop(scope);
+    authority.update(&policy(), Some(observation()));
+    assert!(matches!(
+        authority.receive(flow.source.ip(), flow.destination.ip(), &unfunded),
+        Err(Refused::Full)
+    ));
+    let scope = authority
+        .receive(flow.source.ip(), flow.destination.ip(), &budget)
+        .unwrap();
+    authority.revoke();
+    authority.install(CaptureAuthority::partial());
+    assert!(!scope.current());
+    assert!(matches!(
+        authority.authorize_received(flow, &scope),
+        Err(Refused::Stale)
+    ));
+    drop(scope);
+    authority.update(&policy(), Some(observation()));
+    assert_eq!(budget.used(), 0);
+}
+
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn assigned_config() -> talpid_tunnel::tun_provider::TunConfig {
     let mut config = talpid_tunnel::tun_provider::blocking_config();
@@ -784,6 +909,21 @@ struct LoopbackAuthority {
 }
 impl LocalAuthority for LoopbackAuthority {
     type Grant = DeliveryGrant;
+    fn receive(
+        &self,
+        source: IpAddr,
+        destination: IpAddr,
+        buffers: &dyn RelayBufferAllocator,
+    ) -> Result<ReceiveScope, Refused> {
+        self.authority.receive(source, destination, buffers)
+    }
+    fn authorize_received(
+        &self,
+        flow: Flow,
+        scope: &ReceiveScope,
+    ) -> Result<DeliveryGrant, Refused> {
+        self.authority.authorize_received(flow, scope)
+    }
     fn disposition(&self, destination: IpAddr) -> Disposition {
         self.authority.disposition(destination)
     }

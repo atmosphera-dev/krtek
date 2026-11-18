@@ -1418,7 +1418,8 @@ async fn mixed_backpressure_rotates_both_consumers_and_revokes_only_blocked_loca
         destination: address,
         transport: Transport::Udp,
     };
-    // Warm the real UDP flow, then retain a sustained Local reply backlog.
+    // Warm the real UDP flow, then retain a sustained kernel reply backlog.
+    // The Local owner captures one funded batch at a time from this same flow.
     forwarder.ingest(&udp(local, b"local-0"));
     bounded(async {
         while !forwarder.has_output() {
@@ -1474,6 +1475,9 @@ async fn mixed_backpressure_rotates_both_consumers_and_revokes_only_blocked_loca
     let mut revoked = false;
     bounded(async {
         while raw_received.len() < total {
+            // Match the real owner's processing cycle: successful emission
+            // makes the next physical datagram actionable, not another queue slot.
+            forwarder.process();
             // Free exactly one packet at a time, including below the kernel's
             // writable threshold. Both producers share this actual full sink.
             let bytes = tokio::select! {
@@ -1497,6 +1501,7 @@ async fn mixed_backpressure_rotates_both_consumers_and_revokes_only_blocked_loca
                 }
             }
             if !revoked && classes.len() >= 8 {
+                forwarder.process();
                 assert!(forwarder.has_output(), "Local producer was not backlogged");
                 assert!(reply.is_some() || taken < total, "raw producer was not backlogged");
                 forwarder.ingest(&udp(local, b"local-revoked-while-blocked"));

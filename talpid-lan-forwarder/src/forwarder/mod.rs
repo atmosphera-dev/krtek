@@ -4,6 +4,11 @@ mod stack;
 
 use crate::{
     Disposition, Flow, LocalAuthority, Refused, Transport,
+    ip_endpoint::{
+        capture::{self, BATCH_RESERVATION, PacketBatch},
+        contract::{IpError, LocalIpEngine, ReceiveScopeId, ReplyTuple},
+        native::Engine,
+    },
     packet::{self, MAX_PACKET_SIZE, PacketRefusal},
 };
 use smoltcp::{
@@ -134,6 +139,7 @@ impl Work {
 }
 struct Pending<G> {
     tcp: Option<Incarnation>,
+    scope: crate::ReceiveScope,
     grant: G,
     work: Work,
     held: VecDeque<RelayBuffer>,
@@ -144,6 +150,7 @@ struct Pending<G> {
     expired: bool,
 }
 struct Tcp<G> {
+    scope: crate::ReceiveScope,
     _storage: FlowStorage,
     incarnation: Incarnation,
     finished_at: Option<Instant>,
@@ -158,6 +165,7 @@ struct Tcp<G> {
     fin_delivered: bool,
 }
 struct Udp<G> {
+    scope: crate::ReceiveScope,
     grant: G,
     physical: UdpSocket,
     held: VecDeque<RelayBuffer>,
@@ -165,10 +173,58 @@ struct Udp<G> {
     last_activity: Instant,
 }
 struct Output<G> {
-    bytes: RelayBuffer,
+    bytes: OutputBytes,
     // Only protocol resets can outlive a grant. Application data always retains it.
     grant: Option<G>,
     tcp: Option<TcpOutput>,
+    udp: Option<UdpOutput>,
+}
+
+struct UdpOutput {
+    flow: Flow,
+    scope: crate::ReceiveScope,
+}
+
+enum OutputBytes {
+    Packet(RelayBuffer),
+    Batch(crate::ip_endpoint::capture::PacketBatch),
+}
+
+impl From<RelayBuffer> for OutputBytes {
+    fn from(bytes: RelayBuffer) -> Self {
+        Self::Packet(bytes)
+    }
+}
+
+impl std::ops::Deref for OutputBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Packet(bytes) => bytes,
+            Self::Batch(batch) => batch.packet(),
+        }
+    }
+}
+
+impl OutputBytes {
+    #[cfg(test)]
+    fn as_slice(&self) -> &[u8] {
+        self
+    }
+
+    fn fits(&self, mtu: usize) -> bool {
+        match self {
+            Self::Packet(bytes) => bytes.len() <= mtu,
+            Self::Batch(batch) => batch.fits(mtu),
+        }
+    }
+
+    fn advance(&mut self) -> bool {
+        match self {
+            Self::Packet(_) => false,
+            Self::Batch(batch) => batch.advance(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -262,6 +318,10 @@ pub struct Forwarder<A: LocalAuthority> {
     mtu: usize,
     buffers: Arc<dyn RelayBufferAllocator>,
     input: Arc<dyn RelayBufferAllocator>,
+    complete: Arc<dyn RelayBufferAllocator>,
+    native: Option<Engine>,
+    #[cfg(test)]
+    ip_engine: Option<crate::ip_endpoint::contract::scripted::ScriptedEngine>,
     replies: Arc<dyn RelayBufferAllocator>,
     scratch: RelayBuffer,
     _metadata: Arc<dyn RelayBufferReservation>,
@@ -282,6 +342,9 @@ impl<A: LocalAuthority> Forwarder<A> {
         // before startup. They cannot compete with newly admitted input bytes.
         let replies = region(&*buffers, REPLY_STORAGE_BYTES)?;
         let input = region(&*buffers, MAX_PACKET_SIZE + BUFFER_OVERHEAD)?;
+        // Native transport capture and minimal TCP normalization overlap, while
+        // smoltcp simultaneously needs its separately prepaid ingress copy.
+        let complete = region(&*buffers, 2 * (MAX_PACKET_SIZE + BUFFER_OVERHEAD))?;
         let scratch_charge = buffers
             .try_reserve(MAX_PACKET_SIZE + BUFFER_OVERHEAD)
             .map_err(|_| Refused::Full)?;
@@ -316,6 +379,10 @@ impl<A: LocalAuthority> Forwarder<A> {
             mtu,
             buffers,
             input,
+            complete,
+            native: None,
+            #[cfg(test)]
+            ip_engine: None,
             replies,
             scratch,
             _metadata: metadata,
@@ -326,6 +393,11 @@ impl<A: LocalAuthority> Forwarder<A> {
     pub fn set_mtu(&mut self, mtu: usize) -> Result<(), Refused> {
         validate_mtu(mtu)?;
         if mtu != self.mtu {
+            if let Some(engine) = &mut self.native {
+                engine
+                    .set_mtu(mtu as u16)
+                    .map_err(|_| Refused::UnsupportedMtu)?;
+            }
             log::debug!("local-receiver-mtu previous={} current={mtu}", self.mtu);
             self.stack.set_mtu(mtu);
             self.mtu = mtu;
@@ -402,7 +474,12 @@ impl<A: LocalAuthority> Forwarder<A> {
         tcp: Option<TcpOutput>,
     ) {
         if self.output.len() < OUTPUT_PACKETS {
-            self.output.push_back(Output { bytes, grant, tcp });
+            self.output.push_back(Output {
+                bytes: bytes.into(),
+                grant,
+                tcp,
+                udp: None,
+            });
         } else {
             self.refused(Refused::Full);
         }
@@ -506,8 +583,8 @@ impl<A: LocalAuthority> Forwarder<A> {
     }
 
     pub fn ingest(&mut self, bytes: &[u8]) {
-        let packet = match packet::parse(bytes) {
-            Ok(packet) => packet,
+        let (source, destination) = match packet::ip_endpoints(bytes) {
+            Ok(endpoints) => endpoints,
             Err(reason) => {
                 match reason {
                     PacketRefusal::Malformed => self.stats.malformed += 1,
@@ -518,6 +595,96 @@ impl<A: LocalAuthority> Forwarder<A> {
                 return;
             }
         };
+        if self.authority.disposition(destination) == Disposition::Drop {
+            self.stats.dropped_disposition += 1;
+            return;
+        }
+        if source.is_ipv6() && self.mtu < 1280 {
+            self.refused(Refused::UnsupportedMtu);
+            return;
+        }
+        let scope = match self.authority.receive(source, destination, &*self.buffers) {
+            Ok(scope) => scope,
+            Err(error) => {
+                self.refused(error);
+                return;
+            }
+        };
+        if self.native.is_none() {
+            match Engine::open(self.buffers.clone(), self.mtu as u16) {
+                Ok(engine) => self.native = Some(engine),
+                Err(error) => {
+                    self.ip_refused(error);
+                    return;
+                }
+            }
+        }
+        let engine = self.native.as_mut().expect("opened real Local engine");
+        let result = engine.register(&scope).and_then(|()| {
+            capture::ingest(engine, ReceiveScopeId(scope.id()), bytes, &*self.complete)
+        });
+        match result {
+            Ok(Some(complete)) => {
+                if let Err(error) = self.admit_complete(complete, &scope) {
+                    self.ip_refused(error);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => self.ip_refused(error),
+        }
+    }
+
+    fn ip_refused(&mut self, error: IpError) {
+        match error {
+            IpError::Full => self.stats.full += 1,
+            IpError::Stale => self.stats.stale += 1,
+            IpError::Unsupported => self.stats.unsupported_protocol += 1,
+            IpError::Checksum => self.stats.bad_checksum += 1,
+            IpError::Malformed | IpError::Oversized | IpError::Internal => {
+                self.stats.malformed += 1
+            }
+        }
+    }
+
+    // Deterministic scheduler/capture fixture only, never production fallback.
+    #[cfg(test)]
+    fn ingest_ip(
+        &mut self,
+        engine: &mut impl crate::ip_endpoint::contract::LocalIpEngine,
+        scope: &crate::ReceiveScope,
+        bytes: &[u8],
+    ) -> Result<(), crate::ip_endpoint::contract::IpError> {
+        use crate::ip_endpoint::{capture, contract::ReceiveScopeId};
+        let complete = capture::ingest(engine, ReceiveScopeId(scope.id()), bytes, &*self.complete)?;
+        let Some(complete) = complete else {
+            return Ok(());
+        };
+        self.admit_complete(complete, scope)
+    }
+
+    fn admit_complete(
+        &mut self,
+        complete: capture::OwnedTransport,
+        scope: &crate::ReceiveScope,
+    ) -> Result<(), IpError> {
+        let packet = complete.validated()?;
+        if complete.scope.0 != scope.id()
+            || !scope.current()
+            || packet.flow.source.ip() != scope.source()
+            || packet.flow.destination.ip() != scope.destination()
+        {
+            return Err(IpError::Stale);
+        }
+        if packet.flow.transport == Transport::Tcp {
+            let normalized = complete.tcp_packet(&*self.complete)?;
+            self.admit(packet, &normalized, scope);
+        } else {
+            self.admit(packet, &[], scope);
+        }
+        Ok(())
+    }
+
+    fn admit(&mut self, packet: packet::Packet<'_>, bytes: &[u8], scope: &crate::ReceiveScope) {
         let flow = packet.flow;
         if flow.source.is_ipv6() && self.mtu < 1280 {
             self.refused(Refused::UnsupportedMtu);
@@ -627,7 +794,8 @@ impl<A: LocalAuthority> Forwarder<A> {
             }
             return;
         }
-        let grant = match self.authority.authorize(flow) {
+        let authorization = self.authority.authorize_received(flow, scope);
+        let grant = match authorization {
             Ok(grant) => Arc::new(grant),
             Err(reason) => {
                 self.refused(reason);
@@ -668,6 +836,7 @@ impl<A: LocalAuthority> Forwarder<A> {
             flow,
             Pending {
                 tcp,
+                scope: scope.clone(),
                 grant,
                 work,
                 held,
@@ -726,7 +895,7 @@ impl<A: LocalAuthority> Forwarder<A> {
             .tcp
             .iter()
             .filter_map(|(flow, entry)| {
-                let revoked = !self.authority.current(&entry.grant);
+                let revoked = !self.authority.current(&entry.grant) || !entry.scope.current();
                 (revoked || now >= entry.last_activity + IDLE_LIMIT).then_some((*flow, revoked))
             })
             .collect();
@@ -739,7 +908,7 @@ impl<A: LocalAuthority> Forwarder<A> {
             self.remove_tcp(flow, true);
         }
         self.udp.retain(|_, entry| {
-            if !self.authority.current(&entry.grant) {
+            if !self.authority.current(&entry.grant) || !entry.scope.current() {
                 self.stats.revoked += 1;
                 false
             } else if now >= entry.last_activity + IDLE_LIMIT {
@@ -753,8 +922,9 @@ impl<A: LocalAuthority> Forwarder<A> {
             .pending
             .iter()
             .filter_map(|(flow, entry)| {
-                let revoked =
-                    flow.transport == Transport::Tcp && !self.authority.current(&entry.grant);
+                let revoked = (flow.transport == Transport::Tcp
+                    && !self.authority.current(&entry.grant))
+                    || !entry.scope.current();
                 (!entry.expired && (now >= entry.deadline || revoked)).then_some((*flow, revoked))
             })
             .collect();
@@ -847,7 +1017,8 @@ impl<A: LocalAuthority> Forwarder<A> {
     }
 
     fn retry(&mut self, flow: Flow, mut pending: Pending<Arc<A::Grant>>) {
-        match self.authority.authorize(flow) {
+        let authorization = self.authority.authorize_received(flow, &pending.scope);
+        match authorization {
             Ok(grant) => {
                 let grant = Arc::new(grant);
                 pending.work = self.prepare(flow, &grant, &pending.storage);
@@ -927,6 +1098,7 @@ impl<A: LocalAuthority> Forwarder<A> {
                                 self.udp.insert(
                                     flow,
                                     Udp {
+                                        scope: pending.scope,
                                         grant: pending.grant,
                                         physical,
                                         held: pending.held,
@@ -964,6 +1136,7 @@ impl<A: LocalAuthority> Forwarder<A> {
                     self.tcp.insert(
                         flow,
                         Tcp {
+                            scope: pending.scope,
                             _storage: pending.storage,
                             incarnation: pending.tcp.expect("connected TCP identity"),
                             finished_at: None,
@@ -1102,31 +1275,60 @@ impl<A: LocalAuthority> Forwarder<A> {
                     }
                 }
             }
-            while slots > 0 && self.authority.current(&entry.grant) {
-                let Ok(peak) = self.replies.try_reserve(self.mtu + BUFFER_OVERHEAD) else {
-                    break;
+            if slots > 0 && self.authority.current(&entry.grant) {
+                if !entry.scope.current()
+                    || self
+                        .output
+                        .iter()
+                        .any(|job| job.udp.as_ref().is_some_and(|owner| owner.flow == *flow))
+                {
+                    continue;
+                }
+                let Ok(batch) = PacketBatch::reserve(&*self.replies, self.mtu) else {
+                    continue;
                 };
                 match entry.physical.try_recv(&mut self.scratch) {
                     Ok(n) => {
                         slots -= 1;
                         entry.last_activity = Instant::now();
-                        let header = if flow.source.is_ipv4() { 28 } else { 48 };
-                        if n + header > self.mtu {
-                            self.stats.oversized_reply += 1;
-                            continue;
+                        let scope = &entry.scope;
+                        let tuple = ReplyTuple::from_flow(ReceiveScopeId(scope.id()), *flow)
+                            .expect("same-family UDP");
+                        #[cfg(test)]
+                        let result = if let Some(engine) = self.ip_engine.as_mut() {
+                            batch.generate(engine, tuple, &self.scratch[..n])
+                        } else {
+                            batch.generate(
+                                self.native.as_mut().expect("real Local engine"),
+                                tuple,
+                                &self.scratch[..n],
+                            )
+                        };
+                        #[cfg(not(test))]
+                        let result = batch.generate(
+                            self.native.as_mut().expect("real Local engine"),
+                            tuple,
+                            &self.scratch[..n],
+                        );
+                        match result {
+                            Ok(batch) => received.push(Output {
+                                bytes: OutputBytes::Batch(batch),
+                                grant: Some(entry.grant.clone()),
+                                tcp: None,
+                                udp: Some(UdpOutput {
+                                    flow: *flow,
+                                    scope: scope.clone(),
+                                }),
+                            }),
+                            Err(IpError::Oversized) => self.stats.oversized_reply += 1,
+                            Err(IpError::Full) => self.stats.full += 1,
+                            Err(_) => self.stats.malformed += 1,
                         }
-                        match packet::udp_reply(*flow, &self.scratch[..n]) {
-                            Ok(bytes) => match RelayBuffer::from_reservation(bytes, peak) {
-                                Ok(bytes) => received.push((bytes, entry.grant.clone())),
-                                Err(_) => self.stats.full += 1,
-                            },
-                            Err(_) => self.stats.oversized_reply += 1,
-                        }
+                        // Exactly one active batch per physical flow.
                     }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                     Err(_) => {
                         removed.push(*flow);
-                        break;
                     }
                 }
             }
@@ -1134,9 +1336,7 @@ impl<A: LocalAuthority> Forwarder<A> {
         for flow in removed {
             self.udp.remove(&flow);
         }
-        for (bytes, grant) in received {
-            self.enqueue(bytes, Some(grant), None);
-        }
+        self.output.extend(received);
     }
 
     pub fn process(&mut self) {
@@ -1165,6 +1365,17 @@ impl<A: LocalAuthority> Forwarder<A> {
     ) -> io::Result<bool> {
         while let Some(output) = self.output.front() {
             let owns_output = output.tcp.is_none_or(|owner| {
+                if self
+                    .tcp
+                    .get(&owner.flow)
+                    .is_some_and(|entry| !entry.scope.current())
+                    || self
+                        .pending
+                        .get(&owner.flow)
+                        .is_some_and(|entry| !entry.scope.current())
+                {
+                    return false;
+                }
                 let current = self
                     .tcp
                     .get(&owner.flow)
@@ -1176,7 +1387,16 @@ impl<A: LocalAuthority> Forwarder<A> {
                     });
                 current.map_or(owner.reset, |id| id == owner.id)
             });
+            let owns_udp = output.udp.as_ref().is_none_or(|owner| {
+                owner.scope.current()
+                    && self
+                        .udp
+                        .get(&owner.flow)
+                        .is_some_and(|entry| entry.scope.id() == owner.scope.id())
+            });
             if owns_output
+                && owns_udp
+                && output.bytes.fits(self.mtu)
                 && output
                     .grant
                     .as_ref()
@@ -1190,7 +1410,12 @@ impl<A: LocalAuthority> Forwarder<A> {
                     ));
                 }
                 let delivered = output.tcp;
-                self.output.pop_front();
+                let mut output = self.output.pop_front().expect("written head");
+                if output.bytes.advance() {
+                    // Give other ready jobs a turn after EACH packet, retaining
+                    // the same funded batch and exact unsent cursor.
+                    self.output.push_back(output);
+                }
                 if let Some(TcpOutput {
                     flow,
                     id,
@@ -1264,9 +1489,14 @@ impl<A: LocalAuthority> Forwarder<A> {
         // peak. Retained replies can exhaust bytes long before the slot ceiling;
         // a blocked sink must not turn that readable socket into a busy wake.
         let udp_receive_capacity = self.output.len() < OUTPUT_PACKETS
-            && self.replies.try_reserve(self.mtu + BUFFER_OVERHEAD).is_ok();
-        for entry in self.udp.values() {
-            if udp_receive_capacity {
+            && self.replies.try_reserve(BATCH_RESERVATION).is_ok();
+        for (flow, entry) in &self.udp {
+            if udp_receive_capacity
+                && !self
+                    .output
+                    .iter()
+                    .any(|job| job.udp.as_ref().is_some_and(|owner| owner.flow == *flow))
+            {
                 ready |= entry.physical.poll_recv_ready(cx).is_ready();
             }
             if !entry.held.is_empty() {
@@ -1333,6 +1563,11 @@ impl<A: LocalAuthority> Forwarder<A> {
         self.retired_tcp.clear();
         self.udp.clear();
         self.output.clear();
+        // A cancelled close still owns its pending blocking preparations and
+        // engine. Retire the native handle only after the owner's joined close.
+        if let Some(mut engine) = self.native.take() {
+            engine.close();
+        }
     }
 }
 

@@ -20,8 +20,684 @@ fn test_forwarder(authority: Arc<Authority>) -> Forwarder<Authority> {
     .unwrap()
 }
 
+// Exact root-refund assertions require native quiescence. Parallel test runtimes
+// share one real core/reservation, so each such fixture gets its own PROCESS,
+// not a reset of lwIP or a weaker accounting assertion.
+fn isolated_native_budget(name: &str) -> bool {
+    let name = format!("forwarder::tests::{name}");
+    if std::env::var("KRTEK_NATIVE_BUDGET_CHILD").as_deref() == Ok(name.as_str()) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &name, "--nocapture", "--color", "never"])
+        .env("KRTEK_NATIVE_BUDGET_CHILD", &name)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("{stdout}{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "isolated native budget fixture failed: {name}"
+    );
+    assert!(
+        stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+        "isolated fixture must execute exactly one test"
+    );
+    true
+}
+
+// Independent test-only wire generator/auditor. Neither calls the production
+// packet encoder, lwIP, nor the production completion validator as its oracle.
+fn stock_checksum(bytes: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for word in bytes.chunks(2) {
+        sum += u16::from_be_bytes([word[0], *word.get(1).unwrap_or(&0)]) as u32;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+fn stock_pseudo(flow: Flow, length: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    match (flow.source.ip(), flow.destination.ip()) {
+        (std::net::IpAddr::V4(source), std::net::IpAddr::V4(destination)) => {
+            bytes.extend(source.octets());
+            bytes.extend(destination.octets());
+            bytes.extend([0, 17]);
+            bytes.extend((length as u16).to_be_bytes());
+        }
+        (std::net::IpAddr::V6(source), std::net::IpAddr::V6(destination)) => {
+            bytes.extend(source.octets());
+            bytes.extend(destination.octets());
+            bytes.extend((length as u32).to_be_bytes());
+            bytes.extend([0, 0, 0, 17]);
+        }
+        _ => panic!("mixed fixture families"),
+    }
+    bytes
+}
+
+fn stock_udp_wire(flow: Flow, payload: &[u8], mtu: usize) -> Vec<Vec<u8>> {
+    let mut udp = Vec::from(flow.source.port().to_be_bytes());
+    udp.extend(flow.destination.port().to_be_bytes());
+    udp.extend(((payload.len() + 8) as u16).to_be_bytes());
+    udp.extend([0, 0]);
+    udp.extend(payload);
+    let mut checked = stock_pseudo(flow, udp.len());
+    checked.extend(&udp);
+    let checksum = stock_checksum(&checked);
+    udp[6..8].copy_from_slice(&if checksum == 0 { u16::MAX } else { checksum }.to_be_bytes());
+    let ipv6 = flow.source.is_ipv6();
+    let fragmented = udp.len() + if ipv6 { 40 } else { 20 } > mtu;
+    let capacity = if fragmented {
+        (mtu - if ipv6 { 48 } else { 20 }) & !7
+    } else {
+        udp.len()
+    };
+    static ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    let id = ID.fetch_add(1, Ordering::Relaxed);
+    let mut packets = Vec::new();
+    for (index, chunk) in udp.chunks(capacity).enumerate() {
+        let start = index * capacity;
+        let more = start + chunk.len() < udp.len();
+        let mut ip = vec![0u8; if ipv6 { 40 } else { 20 }];
+        if ipv6 {
+            ip[0] = 0x60;
+            ip[6] = if fragmented { 44 } else { 17 };
+            ip[7] = 64;
+            let pseudo = stock_pseudo(flow, udp.len());
+            ip[8..40].copy_from_slice(&pseudo[..32]);
+            ip[4..6].copy_from_slice(
+                &((chunk.len() + if fragmented { 8 } else { 0 }) as u16).to_be_bytes(),
+            );
+            if fragmented {
+                ip.extend([17, 0]);
+                ip.extend(((start as u16) | u16::from(more)).to_be_bytes());
+                ip.extend(id.to_be_bytes());
+            }
+        } else {
+            ip[0] = 0x45;
+            ip[8] = 64;
+            ip[9] = 17;
+            ip[2..4].copy_from_slice(&((chunk.len() + 20) as u16).to_be_bytes());
+            ip[4..6].copy_from_slice(&(id as u16).to_be_bytes());
+            ip[6..8].copy_from_slice(
+                &((start as u16 / 8) | if more { 0x2000 } else { 0 }).to_be_bytes(),
+            );
+            let pseudo = stock_pseudo(flow, udp.len());
+            ip[12..20].copy_from_slice(&pseudo[..8]);
+            let checksum = stock_checksum(&ip);
+            ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+        }
+        ip.extend(chunk);
+        packets.push(ip);
+    }
+    packets
+}
+
+fn stock_audit_udp(flow: Flow, payload: &[u8], mtu: usize, packets: &[Vec<u8>]) {
+    let mut segment = vec![0u8; payload.len() + 8];
+    let mut covered = vec![false; segment.len()];
+    let mut identity = None;
+    let mut terminal = 0;
+    for bytes in packets {
+        assert!(bytes.len() <= mtu);
+        let (offset, more, body, id) = if flow.source.is_ipv4() {
+            assert_eq!(bytes[0], 0x45);
+            assert_eq!(bytes[9], 17);
+            assert_eq!(
+                u16::from_be_bytes(bytes[2..4].try_into().unwrap()) as usize,
+                bytes.len()
+            );
+            assert_eq!(stock_checksum(&bytes[..20]), 0);
+            assert_eq!(&bytes[12..20], &stock_pseudo(flow, segment.len())[..8]);
+            let flags = u16::from_be_bytes(bytes[6..8].try_into().unwrap());
+            (
+                (flags as usize & 0x1fff) * 8,
+                flags & 0x2000 != 0,
+                &bytes[20..],
+                u16::from_be_bytes(bytes[4..6].try_into().unwrap()) as u32,
+            )
+        } else {
+            assert_eq!(bytes[0] >> 4, 6);
+            assert_eq!(
+                u16::from_be_bytes(bytes[4..6].try_into().unwrap()) as usize + 40,
+                bytes.len()
+            );
+            assert_eq!(&bytes[8..40], &stock_pseudo(flow, segment.len())[..32]);
+            if bytes[6] == 17 {
+                (0, false, &bytes[40..], 0)
+            } else {
+                assert_eq!(bytes[6], 44);
+                assert_eq!(bytes[40], 17);
+                let flags = u16::from_be_bytes(bytes[42..44].try_into().unwrap());
+                (
+                    (flags as usize) & !7,
+                    flags & 1 != 0,
+                    &bytes[48..],
+                    u32::from_be_bytes(bytes[44..48].try_into().unwrap()),
+                )
+            }
+        };
+        assert_eq!(*identity.get_or_insert(id), id);
+        if more {
+            assert_eq!(body.len() % 8, 0);
+        } else {
+            terminal += 1;
+            assert_eq!(offset + body.len(), segment.len());
+        }
+        for (i, byte) in body.iter().enumerate() {
+            assert!(offset + i < segment.len());
+            assert!(!covered[offset + i]);
+            covered[offset + i] = true;
+            segment[offset + i] = *byte;
+        }
+    }
+    assert_eq!(terminal, 1);
+    assert!(covered.into_iter().all(|value| value));
+    assert_eq!(
+        u16::from_be_bytes(segment[..2].try_into().unwrap()),
+        flow.source.port()
+    );
+    assert_eq!(
+        u16::from_be_bytes(segment[2..4].try_into().unwrap()),
+        flow.destination.port()
+    );
+    assert_eq!(
+        u16::from_be_bytes(segment[4..6].try_into().unwrap()) as usize,
+        segment.len()
+    );
+    let mut checked = stock_pseudo(flow, segment.len());
+    checked.extend(&segment);
+    assert_eq!(stock_checksum(&checked), 0);
+    assert_eq!(&segment[8..], payload);
+}
+
+#[tokio::test]
+async fn stock_lwip_real_full_udp_echoes_preserve_both_family_maxima_and_minimum_mtu() {
+    for (ipv6, size, mtu) in [
+        (false, 4096, 1280),
+        (true, 4096, 1280),
+        (false, 65507, 1280),
+        (true, 65487, 1280),
+        (false, 65507, 68),
+    ] {
+        let peer = UdpSocket::bind(loopback(ipv6)).await.unwrap();
+        let flow = target(peer.local_addr().unwrap(), Transport::Udp);
+        let authority = Arc::new(Authority::default());
+        let mut forwarder = Forwarder::with_mtu(
+            authority.clone(),
+            Arc::new(talpid_netstack::buffer_budget::BufferBudget::new(
+                128 * 1024 * 1024,
+            )),
+            mtu,
+        )
+        .unwrap();
+        let payload: Vec<u8> = (0..size).map(|i| (i * 37 + i / 251) as u8).collect();
+        let input = stock_udp_wire(flow, &payload, mtu);
+        stock_audit_udp(flow, &payload, mtu, &input);
+        for (i, piece) in input.iter().rev().enumerate() {
+            forwarder.ingest(piece);
+            if i + 1 != input.len() {
+                assert_eq!(authority.authorizations.load(Ordering::SeqCst), 0);
+                assert_eq!(authority.preparations.load(Ordering::SeqCst), 0);
+            }
+        }
+        until(&mut forwarder, settled).await;
+        let mut bytes = vec![0u8; 65536];
+        let (n, client) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&bytes[..n], payload);
+        assert_eq!(authority.authorizations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            authority.preparations.load(Ordering::SeqCst),
+            1,
+            "existing protected-socket preparation hook is observed"
+        );
+        peer.send_to(&bytes[..n], client).await.unwrap();
+        until(&mut forwarder, Forwarder::has_output).await;
+        assert_eq!(forwarder.output.len(), 1);
+        let mut output = Vec::new();
+        while forwarder.has_output() {
+            if output.is_empty() || output.len() == 2 {
+                assert_eq!(
+                    forwarder
+                        .write_output(|_| Err(io::ErrorKind::WouldBlock.into()))
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::WouldBlock
+                );
+            }
+            assert!(
+                forwarder
+                    .write_output(|bytes| {
+                        output.push(bytes.to_vec());
+                        Ok(bytes.len())
+                    })
+                    .unwrap()
+            );
+        }
+        if mtu == 68 {
+            assert_eq!(output.len(), 1365);
+        }
+        stock_audit_udp(
+            Flow {
+                source: flow.destination,
+                destination: flow.source,
+                transport: Transport::Udp,
+            },
+            &payload,
+            mtu,
+            &output,
+        );
+        assert_eq!(forwarder.stats().oversized_reply, 0);
+        println!(
+            "stock-lwip full-echo family={} payload_bytes={size} mtu={mtu} request_packets={} reply_packets={} preparations=1",
+            if ipv6 { 6 } else { 4 },
+            input.len(),
+            output.len()
+        );
+        forwarder.close_all().await;
+    }
+}
+
+#[tokio::test]
+async fn stock_lwip_scripted_completion_precedes_protected_full_udp_admission() {
+    use crate::ip_endpoint::contract::{scripted::*, *};
+    for ipv6 in [false, true] {
+        let peer = UdpSocket::bind(loopback(ipv6)).await.unwrap();
+        let flow = target(peer.local_addr().unwrap(), Transport::Udp);
+        let authority = Arc::new(Authority::default());
+        let budget = Arc::new(talpid_netstack::buffer_budget::BufferBudget::new(
+            128 * 1024 * 1024,
+        ));
+        let scope =
+            crate::ReceiveScope::new(flow.source.ip(), flow.destination.ip(), &*budget).unwrap();
+        let mut forwarder = Forwarder::with_mtu(authority.clone(), budget.clone(), 8192).unwrap();
+        let payload: Vec<u8> = (0..4096).map(|i| (i * 37) as u8).collect();
+        let whole = udp_packet(flow, &payload);
+        let segment = whole[if ipv6 { 40 } else { 20 }..].to_vec();
+        // Exact scripted seam inputs, not an IP/reassembly wire oracle. Real
+        // stock fragments and MTU-bounded batch drain are the C1 integration gate.
+        let mut engine = ScriptedEngine::new([
+            Step::Ingest {
+                scope: ReceiveScopeId(scope.id()),
+                ip: vec![1],
+                completions: vec![],
+                result: Ok(Ingress::Pending),
+            },
+            Step::Ingest {
+                scope: ReceiveScopeId(scope.id()),
+                ip: vec![2],
+                completions: vec![Completion {
+                    scope: ReceiveScopeId(scope.id()),
+                    source: flow.source.ip(),
+                    destination: flow.destination.ip(),
+                    protocol: Transport::Udp,
+                    segment,
+                }],
+                result: Ok(Ingress::Consumed),
+            },
+        ]);
+        forwarder.ingest_ip(&mut engine, &scope, &[1]).unwrap();
+        forwarder.process();
+        assert_eq!(authority.authorizations.load(Ordering::SeqCst), 0);
+        assert_eq!(authority.preparations.load(Ordering::SeqCst), 0);
+        assert!(forwarder.pending.is_empty());
+        assert!(peer.try_recv(&mut [0; 1]).is_err());
+        forwarder.ingest_ip(&mut engine, &scope, &[2]).unwrap();
+        forwarder.ip_engine = Some(ScriptedEngine::new([Step::Reply {
+            tuple: ReplyTuple::from_flow(ReceiveScopeId(scope.id()), flow).unwrap(),
+            payload: payload.clone(),
+            packets: vec![packet::udp_reply(flow, &payload).unwrap()],
+            result: Ok(()),
+        }]));
+        until(&mut forwarder, settled).await;
+        let mut received = vec![0; payload.len() + 1];
+        let (count, client) =
+            tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut received))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&received[..count], payload);
+        assert_eq!(authority.authorizations.load(Ordering::SeqCst), 1);
+        assert_eq!(authority.preparations.load(Ordering::SeqCst), 1);
+        peer.send_to(&received[..count], client).await.unwrap();
+        until(&mut forwarder, Forwarder::has_output).await;
+        let reply = forwarder.next_output().unwrap();
+        assert_eq!(packet::parse(&reply).unwrap().payload, payload);
+        engine.assert_finished();
+        forwarder.close_all().await;
+        drop((forwarder, scope));
+        assert_eq!(budget.used(), 0);
+    }
+}
+
+#[tokio::test]
+async fn stock_lwip_scripted_completion_cannot_revive_a_revoked_receive_scope() {
+    use crate::ip_endpoint::contract::{scripted::*, *};
+    let authority = Arc::new(Authority::default());
+    let mut forwarder = test_forwarder(authority.clone());
+    let flow = flow(false, Transport::Udp);
+    let budget = talpid_netstack::buffer_budget::BufferBudget::new(4096);
+    let scope = crate::ReceiveScope::new(flow.source.ip(), flow.destination.ip(), &budget).unwrap();
+    let ip = udp_packet(flow, b"not authorized");
+    let mut engine = ScriptedEngine::new([Step::Ingest {
+        scope: ReceiveScopeId(scope.id()),
+        ip: vec![],
+        completions: vec![Completion {
+            scope: ReceiveScopeId(scope.id()),
+            source: flow.source.ip(),
+            destination: flow.destination.ip(),
+            protocol: Transport::Udp,
+            segment: ip[20..].to_vec(),
+        }],
+        result: Ok(Ingress::Consumed),
+    }]);
+    scope.revoke();
+    assert_eq!(
+        forwarder.ingest_ip(&mut engine, &scope, &[]),
+        Err(IpError::Stale)
+    );
+    assert_eq!(authority.authorizations.load(Ordering::SeqCst), 0);
+    assert_eq!(authority.preparations.load(Ordering::SeqCst), 0);
+    assert!(forwarder.pending.is_empty());
+    engine.assert_finished();
+    forwarder.close_all().await;
+}
+
+#[tokio::test]
+async fn stock_lwip_scripted_physical_pump_captures_full_datagrams_as_one_funded_job() {
+    use crate::ip_endpoint::{
+        capture::BATCH_RESERVATION,
+        contract::{scripted::*, *},
+    };
+    for ipv6 in [false, true] {
+        for size in [4096, if ipv6 { 65487 } else { 65507 }] {
+            let peer = UdpSocket::bind(loopback(ipv6)).await.unwrap();
+            let flow = target(peer.local_addr().unwrap(), Transport::Udp);
+            let mut forwarder = test_forwarder(Arc::new(Authority::default()));
+            let scope = crate::ReceiveScope::new(
+                flow.source.ip(),
+                flow.destination.ip(),
+                &*forwarder.buffers,
+            )
+            .unwrap();
+            let id = ReceiveScopeId(scope.id());
+            let payload: Vec<u8> = (0..size).map(|i| (i * 37) as u8).collect();
+            let wire = udp_packet(flow, &payload);
+            let mut ingress = ScriptedEngine::new([Step::Ingest {
+                scope: id,
+                ip: vec![1],
+                completions: vec![Completion {
+                    scope: id,
+                    source: flow.source.ip(),
+                    destination: flow.destination.ip(),
+                    protocol: Transport::Udp,
+                    segment: wire[if ipv6 { 40 } else { 20 }..].to_vec(),
+                }],
+                result: Ok(Ingress::Consumed),
+            }]);
+            forwarder.ingest_ip(&mut ingress, &scope, &[1]).unwrap();
+            // The batch seam is scripted, not a wire-fragmentation oracle. Exact
+            // chunk bytes prove the physical read/capture/drain never shortens it.
+            let packets: Vec<_> = payload.chunks(1000).map(<[u8]>::to_vec).collect();
+            forwarder.ip_engine = Some(ScriptedEngine::new([Step::Reply {
+                tuple: ReplyTuple::from_flow(id, flow).unwrap(),
+                payload: payload.clone(),
+                packets: packets.clone(),
+                result: Ok(()),
+            }]));
+            until(&mut forwarder, settled).await;
+            let mut received = vec![0; 65536];
+            let (n, client) =
+                tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut received))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(&received[..n], payload);
+            // Exhaust exactly the producer reservation, leaving the socket
+            // readable. Readiness and the pump must use the SAME 192 KiB credit.
+            let available = REPLY_STORAGE_BYTES - (BATCH_RESERVATION - 1);
+            let pressure = forwarder.replies.try_reserve(available).unwrap();
+            peer.send_to(&payload, client).await.unwrap();
+            tokio::task::yield_now().await;
+            forwarder.process();
+            assert!(!forwarder.has_output());
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(
+                forwarder.poll_ready(&mut cx).is_pending(),
+                "readable UDP under byte pressure must not spin"
+            );
+            drop(pressure);
+            until(&mut forwarder, Forwarder::has_output).await;
+            assert_eq!(forwarder.output.len(), 1);
+            assert!(matches!(
+                forwarder.output.front().unwrap().bytes,
+                OutputBytes::Batch(_)
+            ));
+            let mut joined = Vec::new();
+            for expected in &packets {
+                assert!(
+                    forwarder
+                        .write_output(|bytes| {
+                            assert_eq!(bytes, expected);
+                            joined.extend_from_slice(bytes);
+                            Ok(bytes.len())
+                        })
+                        .unwrap()
+                );
+            }
+            assert_eq!(joined, payload);
+            assert!(!forwarder.has_output());
+            ingress.assert_finished();
+            forwarder.ip_engine.as_ref().unwrap().assert_finished();
+            forwarder.close_all().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn stock_lwip_scripted_physical_pump_refuses_size_and_capture_failure_before_output() {
+    use crate::ip_endpoint::contract::{scripted::*, *};
+    for oversized in [false, true] {
+        let peer = UdpSocket::bind(loopback(true)).await.unwrap();
+        let flow = target(peer.local_addr().unwrap(), Transport::Udp);
+        let mut forwarder = test_forwarder(Arc::new(Authority::default()));
+        forwarder.ingest(&udp_packet(flow, b"open"));
+        until(&mut forwarder, settled).await;
+        let mut scratch = [0; 16];
+        let (_, client) = peer.recv_from(&mut scratch).await.unwrap();
+        let scope =
+            crate::ReceiveScope::new(flow.source.ip(), flow.destination.ip(), &*forwarder.buffers)
+                .unwrap();
+        forwarder.udp.get_mut(&flow).unwrap().scope = scope.clone();
+        let payload = vec![0; if oversized { 65488 } else { 4096 }];
+        let steps = if oversized {
+            vec![]
+        } else {
+            vec![Step::Reply {
+                tuple: ReplyTuple::from_flow(ReceiveScopeId(scope.id()), flow).unwrap(),
+                payload: payload.clone(),
+                packets: vec![vec![0; 1280], vec![0; 1281]],
+                result: Ok(()),
+            }]
+        };
+        forwarder.ip_engine = Some(ScriptedEngine::new(steps));
+        peer.send_to(&payload, client).await.unwrap();
+        // Wait for physical readability without consuming the datagram.
+        forwarder
+            .udp
+            .get(&flow)
+            .unwrap()
+            .physical
+            .readable()
+            .await
+            .unwrap();
+        forwarder.process();
+        assert!(
+            !forwarder.has_output(),
+            "no packet may escape a failed batch"
+        );
+        assert_eq!(forwarder.stats().oversized_reply, u64::from(oversized));
+        assert_eq!(forwarder.stats().malformed, u64::from(!oversized));
+        forwarder.ip_engine.as_ref().unwrap().assert_finished();
+        forwarder.close_all().await;
+    }
+}
+
+#[tokio::test]
+async fn stock_lwip_batch_checked_drain_retains_eagain_cursor_and_yields_between_packets() {
+    use crate::ip_endpoint::{
+        capture::PacketBatch,
+        contract::{scripted::*, *},
+    };
+    let peer = UdpSocket::bind(loopback(false)).await.unwrap();
+    let flow = target(peer.local_addr().unwrap(), Transport::Udp);
+    let mut forwarder = test_forwarder(Arc::new(Authority::default()));
+    forwarder.ingest(&udp_packet(flow, b"open"));
+    until(&mut forwarder, settled).await;
+    let scope =
+        crate::ReceiveScope::new(flow.source.ip(), flow.destination.ip(), &*forwarder.buffers)
+            .unwrap();
+    forwarder.udp.get_mut(&flow).unwrap().scope = scope.clone();
+    let tuple = ReplyTuple::from_flow(ReceiveScopeId(scope.id()), flow).unwrap();
+    let packets: Vec<Vec<u8>> = (0..1365)
+        .map(|i| vec![(i % 251) as u8; if i == 1364 { 63 } else { 68 }])
+        .collect();
+    let mut engine = ScriptedEngine::new([Step::Reply {
+        tuple,
+        payload: vec![],
+        packets: packets.clone(),
+        result: Ok(()),
+    }]);
+    let batch = PacketBatch::reserve(&*forwarder.replies, 68)
+        .unwrap()
+        .generate(&mut engine, tuple, &[])
+        .unwrap();
+    forwarder.output.push_back(Output {
+        bytes: OutputBytes::Batch(batch),
+        grant: Some(Arc::new(())),
+        tcp: None,
+        udp: Some(UdpOutput { flow, scope }),
+    });
+    assert_eq!(
+        forwarder.output.len(),
+        1,
+        "1365 packets consume one output job"
+    );
+    forwarder.enqueue(
+        RelayBuffer::copy_from(&[0xff], &*forwarder.replies).unwrap(),
+        Some(Arc::new(())),
+        None,
+    );
+    for (i, packet) in packets.iter().enumerate() {
+        if [0, 500, 1364].contains(&i) {
+            for _ in 0..2 {
+                assert_eq!(
+                    forwarder
+                        .write_output(|bytes| {
+                            assert_eq!(bytes, packet);
+                            Err(io::ErrorKind::WouldBlock.into())
+                        })
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::WouldBlock
+                );
+            }
+        }
+        assert!(
+            forwarder
+                .write_output(|bytes| {
+                    assert_eq!(bytes, packet);
+                    Ok(bytes.len())
+                })
+                .unwrap()
+        );
+        if i == 0 {
+            assert_eq!(
+                forwarder.next_output().unwrap(),
+                [0xff],
+                "another job gets a turn before the batch tail"
+            );
+        }
+    }
+    assert!(!forwarder.has_output());
+    engine.assert_finished();
+    forwarder.close_all().await;
+}
+
+#[tokio::test]
+async fn stock_lwip_batch_checked_drain_cancels_unsent_remainder_on_revoke_or_mtu_shrink() {
+    use crate::ip_endpoint::{
+        capture::PacketBatch,
+        contract::{scripted::*, *},
+    };
+    for revoke in [false, true] {
+        let peer = UdpSocket::bind(loopback(false)).await.unwrap();
+        let flow = target(peer.local_addr().unwrap(), Transport::Udp);
+        let mut forwarder = test_forwarder(Arc::new(Authority::default()));
+        forwarder.ingest(&udp_packet(flow, b"open"));
+        until(&mut forwarder, settled).await;
+        let scope =
+            crate::ReceiveScope::new(flow.source.ip(), flow.destination.ip(), &*forwarder.buffers)
+                .unwrap();
+        forwarder.udp.get_mut(&flow).unwrap().scope = scope.clone();
+        let tuple = ReplyTuple::from_flow(ReceiveScopeId(scope.id()), flow).unwrap();
+        let mut engine = ScriptedEngine::new([Step::Reply {
+            tuple,
+            payload: vec![],
+            packets: vec![vec![1; 68], vec![2; 68], vec![3; 100]],
+            result: Ok(()),
+        }]);
+        let batch = PacketBatch::reserve(&*forwarder.replies, 1280)
+            .unwrap()
+            .generate(&mut engine, tuple, &[])
+            .unwrap();
+        forwarder.output.push_back(Output {
+            bytes: OutputBytes::Batch(batch),
+            grant: Some(Arc::new(())),
+            tcp: None,
+            udp: Some(UdpOutput {
+                flow,
+                scope: scope.clone(),
+            }),
+        });
+        assert!(
+            forwarder
+                .write_output(|bytes| {
+                    assert_eq!(bytes, &[1; 68]);
+                    Ok(bytes.len())
+                })
+                .unwrap()
+        );
+        if revoke {
+            scope.revoke();
+        } else {
+            forwarder.set_mtu(68).unwrap();
+        }
+        assert!(
+            !forwarder
+                .write_output(|_| panic!("obsolete batch remainder reached sink"))
+                .unwrap()
+        );
+        assert!(!forwarder.has_output());
+        engine.assert_finished();
+        forwarder.close_all().await;
+    }
+}
+
 #[tokio::test]
 async fn udp_receive_readiness_waits_for_reply_byte_credit_and_resumes_after_output() {
+    if isolated_native_budget(
+        "udp_receive_readiness_waits_for_reply_byte_credit_and_resumes_after_output",
+    ) {
+        return;
+    }
     for ipv6 in [false, true] {
         let peer = UdpSocket::bind(loopback(ipv6)).await.unwrap();
         let flow = target(peer.local_addr().unwrap(), Transport::Udp);
@@ -32,35 +708,34 @@ async fn udp_receive_readiness_waits_for_reply_byte_credit_and_resumes_after_out
             MAX_SUPPORTED_MTU,
         )
         .unwrap();
-        forwarder.ingest(&udp_packet(flow, b"open"));
-        until(&mut forwarder, settled).await;
-        let mut scratch = [0; 16];
-        let (count, client) =
-            tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut scratch))
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(&scratch[..count], b"open");
+        let count = REPLY_STORAGE_BYTES / BATCH_RESERVATION;
+        let mut clients = Vec::new();
+        for index in 0..=count {
+            let mut request = flow;
+            request.source.set_port(flow.source.port() + index as u16);
+            forwarder.ingest(&udp_packet(request, b"open"));
+            until(&mut forwarder, settled).await;
+            let mut scratch = [0; 16];
+            let (n, client) =
+                tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut scratch))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(&scratch[..n], b"open");
+            clients.push(client);
+        }
         let payload = vec![0x39; MAX_SUPPORTED_MTU - if ipv6 { 48 } else { 28 }];
-        for index in 0..13 {
-            peer.send_to(&payload, client).await.unwrap();
+        // One funded job per flow; pressure comes from independent ready flows,
+        // not an unbounded per-flow backlog of complete UDP messages.
+        for (index, client) in clients[..count].iter().enumerate() {
+            peer.send_to(&payload, *client).await.unwrap();
             until(&mut forwarder, |f| f.output.len() == index + 1).await;
         }
         assert!(forwarder.output.len() < OUTPUT_PACKETS);
-        assert!(
-            forwarder
-                .replies
-                .try_reserve(MAX_SUPPORTED_MTU + BUFFER_OVERHEAD)
-                .is_err()
-        );
-        peer.send_to(b"after-credit-release", client).await.unwrap();
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            forwarder.udp.values().next().unwrap().physical.readable(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        assert!(forwarder.replies.try_reserve(BATCH_RESERVATION).is_err());
+        peer.send_to(b"after-credit-release", clients[count])
+            .await
+            .unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(20), forwarder.wait())
                 .await
@@ -72,7 +747,7 @@ async fn udp_receive_readiness_waits_for_reply_byte_credit_and_resumes_after_out
         tokio::time::timeout(Duration::from_secs(2), forwarder.wait())
             .await
             .unwrap();
-        for _ in 1..13 {
+        for _ in 1..count {
             let bytes = forwarder.next_output().unwrap();
             assert_eq!(packet::parse(&bytes).unwrap().payload, payload);
         }
@@ -104,6 +779,7 @@ impl Forwarder<Authority> {
 
 #[derive(Default)]
 struct Authority {
+    receive: Mutex<Vec<crate::authority::WeakReceiveScope>>,
     drop: AtomicBool,
     deny: AtomicBool,
     revoked: AtomicBool,
@@ -136,6 +812,36 @@ impl Drop for Unblock {
 }
 impl LocalAuthority for Authority {
     type Grant = ();
+    fn receive(
+        &self,
+        source: std::net::IpAddr,
+        destination: std::net::IpAddr,
+        buffers: &dyn RelayBufferAllocator,
+    ) -> Result<crate::ReceiveScope, Refused> {
+        let mut scopes = self.receive.lock().unwrap();
+        scopes.retain(|scope| scope.upgrade().is_some());
+        if let Some(scope) = scopes
+            .iter()
+            .filter_map(|scope| scope.upgrade())
+            .find(|scope| {
+                scope.current() && scope.source() == source && scope.destination() == destination
+            })
+        {
+            return Ok(scope);
+        }
+        let scope = crate::ReceiveScope::new(source, destination, buffers)?;
+        scopes.push(scope.downgrade());
+        Ok(scope)
+    }
+    fn authorize_received(&self, flow: Flow, scope: &crate::ReceiveScope) -> Result<(), Refused> {
+        if !scope.current()
+            || scope.source() != flow.source.ip()
+            || scope.destination() != flow.destination.ip()
+        {
+            return Err(Refused::Stale);
+        }
+        self.authorize(flow)
+    }
     fn disposition(&self, _: std::net::IpAddr) -> Disposition {
         if self.drop.load(Ordering::SeqCst) {
             Disposition::Drop
@@ -250,6 +956,7 @@ async fn write(stream: &TcpStream, mut bytes: &[u8]) {
 struct App {
     stack: Stack,
     handle: SocketHandle,
+    scope: Option<crate::ReceiveScope>,
 }
 impl App {
     fn new(flow: Flow) -> Self {
@@ -266,7 +973,11 @@ impl App {
             .connect(stack.interface.context(), flow.destination, flow.source)
             .unwrap();
         let handle = stack.sockets.add(socket);
-        Self { stack, handle }
+        Self {
+            stack,
+            handle,
+            scope: None,
+        }
     }
     fn socket(&mut self) -> &mut tcp::Socket<'static> {
         self.stack.sockets.get_mut(self.handle)
@@ -288,7 +999,27 @@ impl App {
             while let Some(bytes) = self.stack.device.outgoing.pop_front() {
                 moved = true;
                 application(&bytes);
-                forwarder.ingest(&bytes);
+                if let Some(scope) = &self.scope {
+                    use crate::ip_endpoint::contract::{scripted::*, *};
+                    let packet = packet::parse(&bytes).unwrap();
+                    let mut engine = ScriptedEngine::new([Step::Ingest {
+                        scope: ReceiveScopeId(scope.id()),
+                        ip: bytes.to_vec(),
+                        completions: vec![Completion {
+                            scope: ReceiveScopeId(scope.id()),
+                            source: packet.flow.source.ip(),
+                            destination: packet.flow.destination.ip(),
+                            protocol: Transport::Tcp,
+                            segment: bytes[if packet.flow.source.is_ipv4() { 20 } else { 40 }..]
+                                .to_vec(),
+                        }],
+                        result: Ok(Ingress::Consumed),
+                    }]);
+                    forwarder.ingest_ip(&mut engine, scope, &bytes).unwrap();
+                    engine.assert_finished();
+                } else {
+                    forwarder.ingest(&bytes);
+                }
             }
             forwarder.process();
             while let Some(bytes) = forwarder.next_output() {
@@ -325,6 +1056,17 @@ impl App {
 }
 
 async fn tcp_echo(ipv6: bool) {
+    tcp_echo_mode(ipv6, false).await;
+}
+
+#[tokio::test]
+async fn stock_lwip_scripted_complete_tcp_preserves_full_stream_in_both_families() {
+    for ipv6 in [false, true] {
+        tcp_echo_mode(ipv6, true).await;
+    }
+}
+
+async fn tcp_echo_mode(ipv6: bool, scoped: bool) {
     let listener = TcpListener::bind(loopback(ipv6)).await.unwrap();
     let flow = target(listener.local_addr().unwrap(), Transport::Tcp);
     let peer = tokio::spawn(async move {
@@ -344,6 +1086,12 @@ async fn tcp_echo(ipv6: bool) {
     let authority = Arc::new(Authority::default());
     let mut forwarder = test_forwarder(authority.clone());
     let mut app = App::new(flow);
+    if scoped {
+        app.scope = Some(
+            crate::ReceiveScope::new(flow.source.ip(), flow.destination.ip(), &*forwarder.buffers)
+                .unwrap(),
+        );
+    }
     app.until(&mut forwarder, |app, _| app.socket().can_send())
         .await;
     // A distinct patterned nonce larger than either endpoint ring exercises
@@ -391,6 +1139,11 @@ async fn tcp_nonce_reaches_application_and_both_sockets_close() {
 
 #[tokio::test]
 async fn mtu_values_outside_upstream_interface_range_are_refused_without_panicking() {
+    if isolated_native_budget(
+        "mtu_values_outside_upstream_interface_range_are_refused_without_panicking",
+    ) {
+        return;
+    }
     use talpid_netstack::buffer_budget::BufferBudget;
     for ipv6 in [false, true] {
         let budget = BufferBudget::new(32 * 1024 * 1024);
@@ -464,6 +1217,11 @@ async fn ipv6_tcp_nonce_reaches_application() {
 
 #[tokio::test]
 async fn full_local_region_preserves_existing_tcp_udp_consumers_in_both_families() {
+    if isolated_native_budget(
+        "full_local_region_preserves_existing_tcp_udp_consumers_in_both_families",
+    ) {
+        return;
+    }
     use talpid_netstack::buffer_budget::BufferBudget;
     for ipv6 in [false, true] {
         let root = BufferBudget::new(64 * 1024 * 1024);
@@ -568,6 +1326,9 @@ async fn full_local_region_preserves_existing_tcp_udp_consumers_in_both_families
 
 #[tokio::test]
 async fn budget_refusal_has_no_real_time_progress_loop_and_recovers() {
+    if isolated_native_budget("budget_refusal_has_no_real_time_progress_loop_and_recovers") {
+        return;
+    }
     use talpid_netstack::buffer_budget::BufferBudget;
     let budget = BufferBudget::new(30 * 1024 * 1024);
     let authority = Arc::new(Authority::default());
@@ -604,6 +1365,9 @@ async fn budget_refusal_has_no_real_time_progress_loop_and_recovers() {
 
 #[tokio::test]
 async fn expired_and_cancelled_preparation_keeps_credit_until_join() {
+    if isolated_native_budget("expired_and_cancelled_preparation_keeps_credit_until_join") {
+        return;
+    }
     use talpid_netstack::buffer_budget::BufferBudget;
     let budget = BufferBudget::new(30 * 1024 * 1024);
     let authority = Arc::new(Authority::default());
@@ -633,6 +1397,9 @@ async fn expired_and_cancelled_preparation_keeps_credit_until_join() {
 
 #[tokio::test]
 async fn blocked_output_retains_storage_until_revoked_discard() {
+    if isolated_native_budget("blocked_output_retains_storage_until_revoked_discard") {
+        return;
+    }
     use talpid_netstack::buffer_budget::BufferBudget;
     let budget = BufferBudget::new(30 * 1024 * 1024);
     let authority = Arc::new(Authority::default());
@@ -1086,8 +1853,11 @@ async fn same_tuple_incarnations(ipv6: bool) {
     );
     assert!(forwarder.retired_tcp.is_empty());
     forwarder.output.push_front(Output {
-        bytes: RelayBuffer::copy_from(terminal.last().unwrap(), &*forwarder.replies).unwrap(),
+        bytes: RelayBuffer::copy_from(terminal.last().unwrap(), &*forwarder.replies)
+            .unwrap()
+            .into(),
         grant: None,
+        udp: None,
         tcp: Some(TcpOutput {
             flow,
             id: old_id,
@@ -1227,8 +1997,11 @@ async fn finished_incarnation_replacement(ipv6: bool) {
     // Even a delayed A FIN callback cannot inherit B's grant or acknowledge B's
     // FIN. Use the actual old identity at this private owner boundary.
     forwarder.output.push_front(Output {
-        bytes: RelayBuffer::copy_from(&final_output, &*forwarder.replies).unwrap(),
+        bytes: RelayBuffer::copy_from(&final_output, &*forwarder.replies)
+            .unwrap()
+            .into(),
         grant: Some(Arc::new(())),
+        udp: None,
         tcp: Some(TcpOutput {
             fin: true,
             ..old_owner
@@ -2321,7 +3094,7 @@ async fn malformed_fragments_icmp_and_checksums_never_authorize() {
             stats.fragments,
             stats.unsupported_protocol
         ),
-        (1, 1, 1, 1)
+        (1, 1, 0, 1)
     );
     assert_eq!(authority.authorizations.load(Ordering::SeqCst), 0);
 }
@@ -2364,7 +3137,7 @@ async fn idle_udp_expires_at_its_real_deadline() {
 }
 
 #[tokio::test]
-async fn oversized_udp_reply_is_counted_and_not_output() {
+async fn mtu_exceeding_udp_reply_is_fragmented_not_counted_oversized() {
     let peer = UdpSocket::bind(loopback(false)).await.unwrap();
     let mut forwarder = test_forwarder(Arc::new(Authority::default()));
     forwarder.ingest(&udp_packet(
@@ -2377,9 +3150,25 @@ async fn oversized_udp_reply_is_counted_and_not_output() {
         .await
         .unwrap()
         .unwrap();
-    peer.send_to(&vec![3; 1280], addr).await.unwrap();
-    until(&mut forwarder, |f| f.stats().oversized_reply == 1).await;
-    assert!(forwarder.next_output().is_none());
+    let payload = vec![3; 1280];
+    peer.send_to(&payload, addr).await.unwrap();
+    until(&mut forwarder, Forwarder::has_output).await;
+    let mut packets = Vec::new();
+    while let Some(bytes) = forwarder.next_output() {
+        packets.push(bytes);
+    }
+    let flow = target(peer.local_addr().unwrap(), Transport::Udp);
+    stock_audit_udp(
+        Flow {
+            source: flow.destination,
+            destination: flow.source,
+            transport: Transport::Udp,
+        },
+        &payload,
+        forwarder.mtu,
+        &packets,
+    );
+    assert_eq!(forwarder.stats().oversized_reply, 0);
     forwarder.close_all().await;
 }
 
@@ -3059,16 +3848,20 @@ async fn sink_backpressure(revoke: bool, stop_while_blocked: bool) {
     let mut forwarder = test_forwarder(authority.clone());
     let peer = UdpSocket::bind(loopback(false)).await.unwrap();
     let flow = target(peer.local_addr().unwrap(), Transport::Udp);
-    forwarder.ingest(&udp_packet(flow, b"request"));
-    until(&mut forwarder, settled).await;
-    let (_, address) = peer.recv_from(&mut [0; 128]).await.unwrap();
     let nonces: Vec<_> = (0..4)
         .map(|n| format!("blocked interface reply nonce {n}").into_bytes())
         .collect();
-    for nonce in &nonces {
+    // One active batch per UDP flow. Four independent flows retain the original
+    // four-job/six-attempt/revocation proof without a per-flow userspace backlog.
+    for (index, nonce) in nonces.iter().enumerate() {
+        let mut request = flow;
+        request.source.set_port(flow.source.port() + index as u16);
+        forwarder.ingest(&udp_packet(request, b"request"));
+        until(&mut forwarder, settled).await;
+        let (_, address) = peer.recv_from(&mut [0; 128]).await.unwrap();
         peer.send_to(nonce, address).await.unwrap();
+        until(&mut forwarder, |f| f.output.len() == index + 1).await;
     }
-    until(&mut forwarder, |f| f.output.len() == 4).await;
 
     // A real packet-oriented fake interface with actual kernel WouldBlock.
     let (sink, consumer) = tokio::net::UnixDatagram::pair().unwrap();

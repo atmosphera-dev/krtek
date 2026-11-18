@@ -50,6 +50,36 @@ pub struct Packet<'a> {
     pub payload: &'a [u8],
 }
 
+/// Inspect only the base IP boundary, never transport fields or authority.
+pub(crate) fn ip_endpoints(
+    bytes: &[u8],
+) -> Result<(std::net::IpAddr, std::net::IpAddr), PacketRefusal> {
+    use PacketRefusal::{Checksum, Malformed};
+    if bytes.len() > MAX_PACKET_SIZE {
+        return Err(Malformed);
+    }
+    match bytes.first().map(|byte| byte >> 4) {
+        Some(4) => {
+            let ip = Ipv4Packet::new_checked(bytes).map_err(|_| Malformed)?;
+            if usize::from(ip.total_len()) != bytes.len() {
+                return Err(Malformed);
+            }
+            if !ip.verify_checksum() {
+                return Err(Checksum);
+            }
+            Ok((ip.src_addr().into(), ip.dst_addr().into()))
+        }
+        Some(6) => {
+            let ip = Ipv6Packet::new_checked(bytes).map_err(|_| Malformed)?;
+            if ip.total_len() != bytes.len() {
+                return Err(Malformed);
+            }
+            Ok((ip.src_addr().into(), ip.dst_addr().into()))
+        }
+        _ => Err(Malformed),
+    }
+}
+
 /// Parse exactly one IP packet, without accepting trailing bytes or jumbograms.
 pub fn parse(bytes: &[u8]) -> Result<Packet<'_>, PacketRefusal> {
     use PacketRefusal::{Checksum, Fragment, Malformed};
@@ -94,6 +124,33 @@ pub fn parse(bytes: &[u8]) -> Result<Packet<'_>, PacketRefusal> {
         _ => return Err(Malformed),
     };
     parse_transport(source, destination, protocol, segment)
+}
+
+/// Validate only a library-completed segment. This does not confer authority.
+pub(crate) fn parse_complete_transport(
+    source: std::net::IpAddr,
+    destination: std::net::IpAddr,
+    protocol: Transport,
+    segment: &[u8],
+) -> Result<Packet<'_>, crate::ip_endpoint::contract::IpError> {
+    use crate::ip_endpoint::contract::IpError;
+    if source.is_ipv4() != destination.is_ipv4() {
+        return Err(IpError::Malformed);
+    }
+    parse_transport(
+        source.into(),
+        destination.into(),
+        match protocol {
+            Transport::Tcp => IpProtocol::Tcp,
+            Transport::Udp => IpProtocol::Udp,
+        },
+        segment,
+    )
+    .map_err(|error| match error {
+        PacketRefusal::Checksum => IpError::Checksum,
+        PacketRefusal::UnsupportedProtocol => IpError::Unsupported,
+        PacketRefusal::Malformed | PacketRefusal::Fragment => IpError::Malformed,
+    })
 }
 
 fn parse_transport(

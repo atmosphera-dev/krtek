@@ -4,8 +4,10 @@
 //! authority. This library must never select a network or fall back to an
 //! unprepared socket. It has no Android or daemon dependencies.
 //!
-//! Only complete, unfragmented IPv4/IPv6 TCP and UDP packets are accepted.
-//! Fragments, IPv6 extension headers, ICMP and other protocols are refused.
+//! Pinned stock lwIP completes canonical IPv4/IPv6 Local TCP and UDP input.
+//! Incomplete IP state never authorizes a flow. Rust validates complete transport
+//! checksums before admission; smoltcp retains TCP and native UDP builds replies.
+//! Extension-prefixed transport, atomic IPv6 Fragment input and ICMP are unsupported.
 //!
 //! The authority triages `Local` or `Drop`, authorizes the original tuple and
 //! prepares every physical socket off the owner task. Preparation failure never
@@ -21,10 +23,9 @@
 
 pub mod authority;
 mod forwarder;
-#[cfg(test)]
 mod ip_endpoint;
 pub mod packet;
 
-pub use authority::{Disposition, LocalAuthority, Refused};
+pub use authority::{Disposition, LocalAuthority, ReceiveScope, Refused};
 pub use forwarder::{Forwarder, MAX_SUPPORTED_MTU, MIN_SUPPORTED_MTU, Stats, validate_mtu};
 pub use packet::{Flow, Transport};

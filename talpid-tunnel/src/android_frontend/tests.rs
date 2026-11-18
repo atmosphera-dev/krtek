@@ -265,6 +265,27 @@ impl Default for Authority {
 }
 impl LocalAuthority for Authority {
     type Grant = u64;
+    fn receive(
+        &self,
+        source: IpAddr,
+        destination: IpAddr,
+        buffers: &dyn talpid_types::relay_flow::RelayBufferAllocator,
+    ) -> Result<talpid_lan_forwarder::ReceiveScope, Refused> {
+        talpid_lan_forwarder::ReceiveScope::new(source, destination, buffers)
+    }
+    fn authorize_received(
+        &self,
+        flow: Flow,
+        scope: &talpid_lan_forwarder::ReceiveScope,
+    ) -> Result<u64, Refused> {
+        if !scope.current()
+            || scope.source() != flow.source.ip()
+            || scope.destination() != flow.destination.ip()
+        {
+            return Err(Refused::Stale);
+        }
+        self.authorize(flow)
+    }
     fn disposition(&self, _: IpAddr) -> Disposition {
         if self.drop.load(SeqCst) {
             Disposition::Drop
@@ -791,6 +812,28 @@ async fn empty_interface_loop_has_no_progress_for_one_real_second() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exhausted_input_is_consumed_without_readiness_spin_then_recovers() {
+    // This assertion owns one complete Local root. Other runtime tests may
+    // legitimately retain its native reservation, so prove it in isolation.
+    const NAME: &str =
+        "android_frontend::tests::exhausted_input_is_consumed_without_readiness_spin_then_recovers";
+    if std::env::var("KRTEK_NATIVE_BUDGET_CHILD").as_deref() != Ok(NAME) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--color", "never"])
+            .env("KRTEK_NATIVE_BUDGET_CHILD", NAME)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        println!("{stdout}{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "isolated native budget fixture failed"
+        );
+        assert!(
+            stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+            "isolated fixture must execute exactly one test"
+        );
+        return;
+    }
     use talpid_netstack::buffer_budget::BufferBudget;
     let budget = BufferBudget::new(30 * 1024 * 1024);
     let authority = Arc::new(Authority::default());

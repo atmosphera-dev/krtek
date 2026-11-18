@@ -7,6 +7,7 @@ use mullvad_types::settings::local_network_access::{
 #[cfg(test)]
 use mullvad_types::states::TargetState;
 use std::{
+    collections::BTreeMap,
     future::Future,
     io,
     net::{IpAddr, SocketAddr},
@@ -15,7 +16,10 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use talpid_lan_forwarder::{Disposition, Flow, LocalAuthority, Refused};
+use talpid_lan_forwarder::{
+    Disposition, Flow, LocalAuthority, ReceiveScope, Refused,
+    authority::{MAX_RECEIVE_SCOPES, WeakReceiveScope},
+};
 use talpid_netstack::buffer_budget::BufferBudget;
 #[cfg(test)]
 use talpid_tunnel::packet_attachment::AttachmentMode;
@@ -102,6 +106,92 @@ struct Inputs {
     observation: Option<NetworkObservation>,
     capture: Option<CaptureAuthority>,
     endpoint: bool,
+    receive: BTreeMap<u64, ReceiveRecord>,
+}
+
+/// Fixed non-transport facts, deliberately without NetworkLease's rule-ID Vec.
+/// Re-evaluation permits unrelated rule edits but cannot migrate a datagram to a
+/// replacement network, logical session or app source.
+struct ReceiveIdentity {
+    capture: u64,
+    generation: Option<u64>,
+    source: IpAddr,
+    destination: IpAddr,
+    network_handle: i64,
+    interface_index: i32,
+    scope_id: u32,
+}
+
+impl ReceiveIdentity {
+    fn from_grant(grant: &DeliveryGrant) -> Self {
+        Self {
+            capture: grant.capture,
+            generation: grant.generation,
+            source: grant.source,
+            destination: grant.physical.destination,
+            network_handle: grant.physical.network_handle,
+            interface_index: grant.physical.interface_index,
+            scope_id: grant.physical.scope_id,
+        }
+    }
+
+    fn matches(&self, grant: &DeliveryGrant) -> bool {
+        self.capture == grant.capture
+            && self.generation == grant.generation
+            && self.source == grant.source
+            && self.destination == grant.physical.destination
+            && self.network_handle == grant.physical.network_handle
+            && self.interface_index == grant.physical.interface_index
+            && self.scope_id == grant.physical.scope_id
+    }
+}
+
+struct ReceiveRecord {
+    scope: WeakReceiveScope,
+    identity: ReceiveIdentity,
+    _charge: Arc<dyn RelayBufferReservation>,
+}
+
+impl Inputs {
+    fn grant(&self, source: IpAddr, destination: IpAddr) -> Result<DeliveryGrant, Refused> {
+        let capture = self.capture.as_ref().ok_or(Refused::Denied)?;
+        if !self.endpoint
+            || !capture.sources.contains(&source)
+            || capture
+                .reserved
+                .iter()
+                .any(|prefix| prefix.contains(destination))
+        {
+            return Err(Refused::Denied);
+        }
+        let generation = capture.generation()?;
+        let observation = self.observation.as_ref().ok_or(Refused::Denied)?;
+        let physical =
+            evaluate(&self.policy, observation, destination).map_err(|_| Refused::Denied)?;
+        Ok(DeliveryGrant {
+            physical,
+            capture: capture.identity,
+            generation,
+            source,
+        })
+    }
+
+    fn revalidate_receive(&mut self) {
+        let mut records = std::mem::take(&mut self.receive);
+        records.retain(|_, record| {
+            let Some(scope) = record.scope.upgrade() else {
+                return false;
+            };
+            if !self
+                .grant(scope.source(), scope.destination())
+                .is_ok_and(|grant| record.identity.matches(&grant))
+            {
+                scope.revoke();
+            }
+            scope.current()
+        });
+        self.receive = records;
+    }
 }
 
 /// Logical capture ownership, independent of descriptor/observation epochs.
@@ -170,6 +260,7 @@ impl DeliveryAuthority {
                 observation: None,
                 capture: Some(CaptureAuthority::partial()),
                 endpoint: true,
+                receive: BTreeMap::new(),
             }),
             preparer,
             revalidate: watch::channel(0).0,
@@ -182,6 +273,7 @@ impl DeliveryAuthority {
         let mut inputs = self.inputs.write().unwrap();
         inputs.policy = policy.clone();
         inputs.observation = observation;
+        inputs.revalidate_receive();
         drop(inputs);
         self.wake();
     }
@@ -195,7 +287,10 @@ impl DeliveryAuthority {
     }
 
     fn install(&self, capture: CaptureAuthority) {
-        self.inputs.write().unwrap().capture = Some(capture);
+        let mut inputs = self.inputs.write().unwrap();
+        inputs.capture = Some(capture);
+        inputs.revalidate_receive();
+        drop(inputs);
         self.wake();
     }
 
@@ -222,12 +317,16 @@ impl DeliveryAuthority {
                 current.reserved = capture.reserved;
             }
         }
+        inputs.revalidate_receive();
         drop(inputs);
         self.wake();
     }
 
     pub fn revoke(&self) {
-        self.inputs.write().unwrap().capture = None;
+        let mut inputs = self.inputs.write().unwrap();
+        inputs.capture = None;
+        inputs.revalidate_receive();
+        drop(inputs);
         self.wake();
     }
 
@@ -235,6 +334,7 @@ impl DeliveryAuthority {
         let mut inputs = self.inputs.write().unwrap();
         if inputs.endpoint != ready {
             inputs.endpoint = ready;
+            inputs.revalidate_receive();
             drop(inputs);
             self.wake();
         }
@@ -273,26 +373,62 @@ impl LocalAuthority for DeliveryAuthority {
 
     fn authorize(&self, flow: Flow) -> Result<DeliveryGrant, Refused> {
         let inputs = self.inputs.read().unwrap();
-        let capture = inputs.capture.as_ref().ok_or(Refused::Denied)?;
-        if !inputs.endpoint
-            || !capture.sources.contains(&flow.source.ip())
-            || capture
-                .reserved
-                .iter()
-                .any(|prefix| prefix.contains(flow.destination.ip()))
-        {
-            return Err(Refused::Denied);
+        inputs.grant(flow.source.ip(), flow.destination.ip())
+    }
+
+    fn receive(
+        &self,
+        source: IpAddr,
+        destination: IpAddr,
+        buffers: &dyn RelayBufferAllocator,
+    ) -> Result<ReceiveScope, Refused> {
+        let mut inputs = self.inputs.write().unwrap();
+        inputs.revalidate_receive();
+        let grant = inputs.grant(source, destination)?;
+        for record in inputs.receive.values() {
+            if let Some(scope) = record.scope.upgrade()
+                && scope.current()
+                && scope.source() == source
+                && scope.destination() == destination
+                && record.identity.matches(&grant)
+            {
+                return Ok(scope);
+            }
         }
-        let generation = capture.generation()?;
-        let observation = inputs.observation.as_ref().ok_or(Refused::Denied)?;
-        let physical = evaluate(&inputs.policy, observation, flow.destination.ip())
-            .map_err(|_| Refused::Denied)?;
-        Ok(DeliveryGrant {
-            physical,
-            capture: capture.identity,
-            generation,
-            source: flow.source.ip(),
-        })
+        if inputs.receive.len() == MAX_RECEIVE_SCOPES {
+            return Err(Refused::Full);
+        }
+        let scope = ReceiveScope::new(source, destination, buffers)?;
+        inputs.receive.insert(
+            scope.id(),
+            ReceiveRecord {
+                scope: scope.downgrade(),
+                identity: ReceiveIdentity::from_grant(&grant),
+                _charge: scope.registration_credit(),
+            },
+        );
+        Ok(scope)
+    }
+
+    fn authorize_received(
+        &self,
+        flow: Flow,
+        scope: &ReceiveScope,
+    ) -> Result<DeliveryGrant, Refused> {
+        let inputs = self.inputs.read().unwrap();
+        if !scope.current()
+            || scope.source() != flow.source.ip()
+            || scope.destination() != flow.destination.ip()
+        {
+            return Err(Refused::Stale);
+        }
+        let record = inputs.receive.get(&scope.id()).ok_or(Refused::Stale)?;
+        let grant = inputs.grant(flow.source.ip(), flow.destination.ip())?;
+        if !record.identity.matches(&grant) {
+            scope.revoke();
+            return Err(Refused::Stale);
+        }
+        Ok(grant)
     }
 
     fn prepare(&self, socket: &socket2::Socket, grant: &DeliveryGrant) -> Result<(), Refused> {

@@ -59,6 +59,7 @@ impl IpError {
             ffi::UNSUPPORTED => Err(Self::Unsupported),
             ffi::OVERSIZED => Err(Self::Oversized),
             ffi::STALE => Err(Self::Stale),
+            ffi::INTERNAL => Err(Self::Internal),
             _ => Err(Self::Internal),
         }
     }
@@ -135,10 +136,31 @@ pub trait LocalIpEngine {
         output: &mut dyn FnMut(&[u8]),
     ) -> Result<(), IpError>;
     fn set_mtu(&mut self, mtu: u16) -> Result<(), IpError>;
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "production timers live on the global core, beyond logical handle closure; this method is the synchronous fixture seam"
+        )
+    )]
     fn poll_time(&mut self, now: MonotonicMillis) -> Result<(), IpError>;
     /// Relative next wake; None maps to native UINT32_MAX. Drive even idle.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the production core schedules its own idle maintenance; fixtures query the logical engine"
+        )
+    )]
     fn next_timeout_ms(&self) -> Option<u32>;
     /// Retained tagged nodes, queryable after close until zero.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "production scope retirement is atomic under the global core lock; fixtures inspect per-handle references"
+        )
+    )]
     fn scope_refs(&self, scope: ReceiveScopeId) -> usize;
     /// Idempotent retirement. Must not reset the global clock or free funding
     /// still backing retained nodes. Later mutating operations return Stale.

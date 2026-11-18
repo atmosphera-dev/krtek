@@ -58,15 +58,7 @@ const _: () = {
     assert!(offset_of!(Callbacks, output) == size_of::<usize>());
 };
 
-// Declarations only: C0 does not link or call an engine. The real wrapper must
-// serialize calls, validate borrowed buffers and contain callback panics.
-#[cfg_attr(
-    test,
-    expect(
-        dead_code,
-        reason = "contract-only ABI declarations; no native engine in C0"
-    )
-)]
+// Called only by the serialized safe wrapper.
 unsafe extern "C" {
     pub fn krtek_lwip_abi_version() -> u32;
     pub fn krtek_lwip_open(handle: *mut Handle) -> i32;
