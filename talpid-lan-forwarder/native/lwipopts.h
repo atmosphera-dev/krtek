@@ -1,0 +1,71 @@
+#ifndef KRTEK_LWIPOPTS_H
+#define KRTEK_LWIPOPTS_H
+
+#define NO_SYS 1
+#define SYS_LIGHTWEIGHT_PROT 0
+#define LWIP_TIMERS 1
+#define LWIP_IPV4 1
+#define LWIP_IPV6 1
+#define LWIP_RAW 1
+#define LWIP_UDP 1
+#define LWIP_TCP 0
+#define LWIP_NETCONN 0
+#define LWIP_SOCKET 0
+#define LWIP_DNS 0
+#define LWIP_DHCP 0
+#define LWIP_AUTOIP 0
+#define LWIP_DHCP6 0
+#define LWIP_ARP 0
+#define LWIP_ETHERNET 0
+#define LWIP_IGMP 0
+#define LWIP_IPV6_MLD 0
+#define LWIP_NETIF_LOOPBACK 0
+#define LWIP_HAVE_LOOPIF 0
+#define IP_FORWARD 0
+#define LWIP_IPV6_FORWARD 0
+#define LWIP_IPV6_AUTOCONFIG 0
+#define LWIP_IPV6_SEND_ROUTER_SOLICIT 0
+#define LWIP_IPV6_DUP_DETECT_ATTEMPTS 0
+/* A bare IP capture has no RA/neighbor-provided MTU. nd6 falls back to mtu. */
+#define LWIP_ND6_ALLOW_RA_UPDATES 0
+#define LWIP_ND6_TCP_REACHABILITY_HINTS 0
+#define LWIP_IPV6_NUM_ADDRESSES 1
+#define IP_REASSEMBLY 1
+#define IP_FRAG 1
+#define LWIP_IPV6_REASS 1
+#define LWIP_IPV6_FRAG 1
+/* Stock's documented mode for helpers containing 64-bit pbuf pointers. */
+#define IPV6_FRAG_COPYHEADER 1
+#define MEMP_NUM_REASSDATA 5
+#define IP_REASS_MAX_PBUFS 2048
+#define PBUF_POOL_SIZE 4098
+#define PBUF_POOL_BUFSIZE 2048
+#define LWIP_SUPPORT_CUSTOM_PBUF 1
+#define MEM_LIBC_MALLOC 0
+#define MEMP_MEM_MALLOC 0
+#define MEM_SIZE 1048576
+#define MEM_ALIGNMENT 8
+#define LWIP_NETIF_TX_SINGLE_PBUF 1
+#define MEMP_NUM_RAW_PCB 8
+#define MEMP_NUM_UDP_PCB 2
+#define MEMP_NUM_SYS_TIMEOUT 8
+#define IP_REASS_MAXAGE 15
+#define IPV6_REASS_MAXAGE 60
+#define IP_REASS_FREE_OLDEST 1
+#define IP_REASS_CHECK_OVERLAP 1
+#define LWIP_CHECKSUM_CTRL_PER_NETIF 0
+#define CHECKSUM_GEN_IP 1
+#define CHECKSUM_GEN_UDP 1
+#define CHECKSUM_GEN_TCP 1
+#define CHECKSUM_GEN_ICMP 1
+#define CHECKSUM_GEN_ICMP6 1
+#define CHECKSUM_CHECK_IP 1
+#define CHECKSUM_CHECK_UDP 1
+#define CHECKSUM_CHECK_TCP 1
+#define CHECKSUM_CHECK_ICMP 1
+#define CHECKSUM_CHECK_ICMP6 1
+#define LWIP_STATS 0
+#define LWIP_ICMP 1
+#define LWIP_ICMP6 1
+
+#endif

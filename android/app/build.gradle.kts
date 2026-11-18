@@ -168,6 +168,7 @@ android {
         getByName("main") {
             assets.directories.add(relayListDirectory)
             assets.directories.add(changelogAssetsDirectory)
+            assets.directories.add("$repoRootPath/talpid-lan-forwarder/native/notice-assets")
         }
         // Workaround to include all instrumented tests in app module. Without this we'd have to
         // create an APK for each submodule and pass each on for testing with the orchestrator.
