@@ -44,12 +44,17 @@ Each issue in this document should provide, at least, the following:
 
 ### Krtek: local network rules on Android
 
-* Connecting or disconnecting Mullvad rebuilds the VPN interface. Entering or
-  leaving an error state can cause the same gap. For about 10-30 ms there is no
-  route. Open local TCP connections continue, but a UDP packet can be lost or fail
-  to send in that moment. The same UDP socket can send again afterward.
+* When connecting, disconnecting, or entering or leaving an error state changes
+  the VPN interface configuration, Android rebuilds the interface. If the
+  configuration stays the same, the interface is reused. During a rebuild there
+  is briefly no route, typically 10-30 ms in testing. Open local TCP connections
+  continue, but a UDP packet can be lost or fail to send in that moment. The same
+  UDP socket can send again afterward.
 * Changing the list of excluded apps also rebuilds the interface. Android closes
-  connections that are open at that moment; new connections work right away.
+  connections that are open at that moment; new connections normally work right
+  away. In one test run, a new local TCP connection failed once right after local
+  rules were turned off and on and the app list was restored. This has not been
+  reproduced since and is still being investigated.
 * Local rules currently drop fragmented IPv4 and IPv6 before their receiving
   stack. TCP and normal-sized UDP work, but large UDP messages to local devices
   can be silently lost. Standard receiver reassembly remains separate work.
@@ -336,6 +341,11 @@ See the report for more details.
 We don't consider this a critical leak since the in-tunnel IP does not tell a great deal about the
 user. However, users that are worried can log out and back in to the app, as this gives them a new
 tunnel IP.
+
+Krtek: on Android, Krtek's VPN interface uses its fixed addresses `172.27.1.1` and
+`fdf0:ce4a:801d::172:27:1:1` instead of the tunnel IP assigned by Mullvad. An ARP probe therefore
+reveals the same address on every Krtek device. This can show that a device runs Krtek, but it does
+not identify the device over time. Logging out and back in does not change this address.
 
 #### Timeline
 
