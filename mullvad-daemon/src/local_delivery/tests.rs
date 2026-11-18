@@ -253,6 +253,52 @@ fn stock_lwip_receive_scope_binds_endpoints_capture_and_funded_storage() {
     assert_eq!(budget.used(), 0);
 }
 
+#[test]
+fn stock_lwip_receive_endpoint_index_prunes_dead_registrations_before_full() {
+    let authority = authority();
+    authority.update(&policy(), Some(observation()));
+    let budget = BufferBudget::new((MAX_RECEIVE_SCOPES + 1) * 1024);
+    let source = IpAddr::from(ROUTER_IPV6);
+    for index in 1..=MAX_RECEIVE_SCOPES {
+        let destination = IpAddr::from(std::net::Ipv6Addr::new(
+            0xfe80,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            index as u16,
+        ));
+        let scope = authority.receive(source, destination, &budget).unwrap();
+        assert_eq!(
+            authority.inputs.read().unwrap().receive[&(source, destination)]
+                .scope
+                .upgrade()
+                .unwrap()
+                .id(),
+            scope.id()
+        );
+        // Leave only the charged weak registration, with no new publication.
+        drop(scope);
+    }
+    assert_eq!(
+        authority.inputs.read().unwrap().receive.len(),
+        MAX_RECEIVE_SCOPES
+    );
+    let flow = flow(Transport::Udp, 49123);
+    let scope = authority
+        .receive(flow.source.ip(), flow.destination.ip(), &budget)
+        .unwrap();
+    assert_eq!(authority.inputs.read().unwrap().receive.len(), 1);
+    assert_eq!(
+        budget.used(),
+        1024,
+        "dead indexed registrations refund before capacity refusal"
+    );
+    assert!(authority.authorize_received(flow, &scope).is_ok());
+}
+
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn assigned_config() -> talpid_tunnel::tun_provider::TunConfig {
     let mut config = talpid_tunnel::tun_provider::blocking_config();

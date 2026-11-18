@@ -106,7 +106,7 @@ struct Inputs {
     observation: Option<NetworkObservation>,
     capture: Option<CaptureAuthority>,
     endpoint: bool,
-    receive: BTreeMap<u64, ReceiveRecord>,
+    receive: BTreeMap<(IpAddr, IpAddr), ReceiveRecord>,
 }
 
 /// Fixed non-transport facts, deliberately without NetworkLease's rule-ID Vec.
@@ -383,24 +383,38 @@ impl LocalAuthority for DeliveryAuthority {
         buffers: &dyn RelayBufferAllocator,
     ) -> Result<ReceiveScope, Refused> {
         let mut inputs = self.inputs.write().unwrap();
-        inputs.revalidate_receive();
-        let grant = inputs.grant(source, destination)?;
-        for record in inputs.receive.values() {
-            if let Some(scope) = record.scope.upgrade()
-                && scope.current()
-                && scope.source() == source
-                && scope.destination() == destination
-                && record.identity.matches(&grant)
-            {
+        let key = (source, destination);
+        let grant = match inputs.grant(source, destination) {
+            Ok(grant) => grant,
+            Err(error) => {
+                if let Some(record) = inputs.receive.remove(&key)
+                    && let Some(scope) = record.scope.upgrade()
+                {
+                    scope.revoke();
+                }
+                return Err(error);
+            }
+        };
+        if let Some(record) = inputs.receive.get(&key)
+            && let Some(scope) = record.scope.upgrade()
+        {
+            if scope.current() && record.identity.matches(&grant) {
                 return Ok(scope);
             }
+            scope.revoke();
+        }
+        inputs.receive.remove(&key);
+        if inputs.receive.len() == MAX_RECEIVE_SCOPES {
+            inputs
+                .receive
+                .retain(|_, record| record.scope.upgrade().is_some_and(|scope| scope.current()));
         }
         if inputs.receive.len() == MAX_RECEIVE_SCOPES {
             return Err(Refused::Full);
         }
         let scope = ReceiveScope::new(source, destination, buffers)?;
         inputs.receive.insert(
-            scope.id(),
+            key,
             ReceiveRecord {
                 scope: scope.downgrade(),
                 identity: ReceiveIdentity::from_grant(&grant),
@@ -422,7 +436,17 @@ impl LocalAuthority for DeliveryAuthority {
         {
             return Err(Refused::Stale);
         }
-        let record = inputs.receive.get(&scope.id()).ok_or(Refused::Stale)?;
+        let record = inputs
+            .receive
+            .get(&(scope.source(), scope.destination()))
+            .ok_or(Refused::Stale)?;
+        if !record
+            .scope
+            .upgrade()
+            .is_some_and(|registered| registered.id() == scope.id())
+        {
+            return Err(Refused::Stale);
+        }
         let grant = inputs.grant(flow.source.ip(), flow.destination.ip())?;
         if !record.identity.matches(&grant) {
             scope.revoke();
