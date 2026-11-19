@@ -314,6 +314,7 @@ pub struct Forwarder<A: LocalAuthority> {
     retired_tcp: Vec<RetiredTcp>,
     next_tcp_id: u64,
     udp: HashMap<Flow, Udp<Arc<A::Grant>>>,
+    udp_receive_after: Option<Flow>,
     output: VecDeque<Output<Arc<A::Grant>>>,
     stats: Stats,
     started: Instant,
@@ -375,6 +376,7 @@ impl<A: LocalAuthority> Forwarder<A> {
             retired_tcp: Vec::with_capacity(TCP_TOMBSTONES),
             next_tcp_id: 0,
             udp: HashMap::with_capacity(UDP_FLOWS),
+            udp_receive_after: None,
             output: VecDeque::with_capacity(OUTPUT_PACKETS),
             stats: Stats::default(),
             started: Instant::now(),
@@ -1262,7 +1264,19 @@ impl<A: LocalAuthority> Forwarder<A> {
         let mut removed = Vec::new();
         // Global per-process receive allowance also bounds transient reply storage.
         let mut slots = OUTPUT_PACKETS - self.output.len();
-        for (flow, entry) in &mut self.udp {
+        let mut flows: Vec<_> = self.udp.keys().copied().collect();
+        if let Some(index) = flows
+            .iter()
+            .position(|flow| Some(*flow) == self.udp_receive_after)
+        {
+            let count = flows.len();
+            flows.rotate_left((index + 1) % count);
+        }
+        for flow in &flows {
+            let entry = self
+                .udp
+                .get_mut(flow)
+                .expect("current UDP admission candidate");
             while let Some(payload) = entry.held.front() {
                 if !self.authority.current(&entry.grant) {
                     break;
@@ -1302,6 +1316,7 @@ impl<A: LocalAuthority> Forwarder<A> {
                 };
                 match entry.physical.try_recv(&mut self.scratch) {
                     Ok(n) => {
+                        self.udp_receive_after = Some(*flow);
                         slots -= 1;
                         entry.last_activity = Instant::now();
                         let scope = &entry.scope;

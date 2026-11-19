@@ -593,7 +593,18 @@ async fn stock_lwip_scripted_physical_pump_captures_full_datagrams_as_one_funded
             let available = REPLY_STORAGE_BYTES - (BATCH_RESERVATION + UDP_REPLY_HEADROOM - 1);
             let pressure = forwarder.replies.try_reserve(available).unwrap();
             peer.send_to(&payload, client).await.unwrap();
-            tokio::task::yield_now().await;
+            let mut peek = [0; 1];
+            assert_eq!(
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    forwarder.udp[&flow].physical.peek(&mut peek),
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+                1,
+            );
+            assert_eq!(peek[0], payload[0]);
             forwarder.process();
             assert!(!forwarder.has_output());
             let mut cx = Context::from_waker(Waker::noop());
@@ -627,6 +638,69 @@ async fn stock_lwip_scripted_physical_pump_captures_full_datagrams_as_one_funded
             forwarder.close_all().await;
         }
     }
+}
+
+#[tokio::test]
+async fn stock_lwip_udp_admission_rotates_returned_credit_across_readable_flows() {
+    let peer = UdpSocket::bind(loopback(false)).await.unwrap();
+    let mut forwarder = test_forwarder(Arc::new(Authority::default()));
+    let mut flows = Vec::new();
+    for index in 0..6 {
+        let mut flow = target(peer.local_addr().unwrap(), Transport::Udp);
+        flow.source.set_port(49000 + index);
+        forwarder.ingest(&udp_packet(flow, b"open"));
+        flows.push(flow);
+    }
+    until(&mut forwarder, settled).await;
+    for _ in &flows {
+        let mut scratch = [0; 16];
+        let (_, client) =
+            tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut scratch))
+                .await
+                .unwrap()
+                .unwrap();
+        // All flows stay backlogged throughout the admission rounds.
+        for _ in 0..16 {
+            peer.send_to(b"reply", client).await.unwrap();
+        }
+    }
+    for flow in &flows {
+        let mut peek = [0; 5];
+        let n = tokio::time::timeout(
+            Duration::from_secs(2),
+            forwarder.udp[flow].physical.peek(&mut peek),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&peek[..n], b"reply");
+    }
+    forwarder.process();
+    assert!(
+        forwarder.output.len() < flows.len(),
+        "test must exhaust batch credit"
+    );
+    let mut served = std::collections::HashSet::new();
+    for _ in 0..flows.len() {
+        let flow = forwarder
+            .output
+            .front()
+            .expect("admitted batch")
+            .udp
+            .as_ref()
+            .unwrap()
+            .flow;
+        served.insert(flow);
+        // One small datagram is one packet, so this returns exactly one batch's credit.
+        assert!(forwarder.write_output(|bytes| Ok(bytes.len())).unwrap());
+        forwarder.process();
+    }
+    assert_eq!(
+        served.len(),
+        flows.len(),
+        "every readable flow gets returned credit"
+    );
+    forwarder.close_all().await;
 }
 
 #[tokio::test]
