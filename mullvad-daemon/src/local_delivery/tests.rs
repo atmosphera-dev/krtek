@@ -171,7 +171,16 @@ fn stock_lwip_receive_scope_is_non_authorizing_and_irreversibly_revoked() {
     assert_ne!(scope.id(), next.id());
     assert!(authority.authorize_received(flow, &next).is_ok());
     assert_eq!(prepared.load(SeqCst), 0);
-    drop((scope, same, next));
+    drop((scope, same));
+    let retained = authority
+        .receive(flow.source.ip(), flow.destination.ip(), &budget)
+        .unwrap();
+    assert_eq!(
+        retained.id(),
+        next.id(),
+        "late retirement cannot remove a successor registration"
+    );
+    drop((retained, next));
     authority.update(&policy(), Some(observation()));
     assert_eq!(
         budget.used(),
@@ -282,10 +291,7 @@ fn stock_lwip_receive_endpoint_index_prunes_dead_registrations_before_full() {
         // Leave only the charged weak registration, with no new publication.
         drop(scope);
     }
-    assert_eq!(
-        authority.inputs.read().unwrap().receive.len(),
-        MAX_RECEIVE_SCOPES
-    );
+    assert_eq!(authority.inputs.read().unwrap().receive.len(), 1);
     let flow = flow(Transport::Udp, 49123);
     let scope = authority
         .receive(flow.source.ip(), flow.destination.ip(), &budget)
@@ -297,6 +303,33 @@ fn stock_lwip_receive_endpoint_index_prunes_dead_registrations_before_full() {
         "dead indexed registrations refund before capacity refusal"
     );
     assert!(authority.authorize_received(flow, &scope).is_ok());
+}
+
+#[test]
+fn stock_lwip_retired_receive_credit_is_reclaimed_before_scope_and_flow_admission() {
+    let authority = authority();
+    authority.update(&policy(), Some(observation()));
+    let budget = BufferBudget::new(2 * 1024);
+    let source = IpAddr::from(ROUTER_IPV6);
+    let a = "fe80::1".parse().unwrap();
+    let b = "fe80::2".parse().unwrap();
+    let live = authority.receive(source, a, &budget).unwrap();
+    let dead = authority.receive(source, b, &budget).unwrap();
+    drop(dead);
+    // Reusing a live endpoint must release other retired registrations too,
+    // before the forwarder's downstream flow allocation, without a map scan.
+    let same = authority.receive(source, a, &budget).unwrap();
+    assert_eq!(same.id(), live.id());
+    let flow_credit = budget
+        .try_reserve(1024)
+        .expect("retired credit available to flow");
+    drop((flow_credit, same, live));
+    let budget_one = BufferBudget::new(1024);
+    let first = authority.receive(source, a, &budget_one).unwrap();
+    drop(first);
+    let successor = authority.receive(source, b, &budget_one).unwrap();
+    assert!(successor.current());
+    assert_eq!(budget_one.used(), 1024);
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]

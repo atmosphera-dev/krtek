@@ -12,7 +12,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     sync::{
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -147,10 +147,13 @@ impl ReceiveIdentity {
 }
 
 struct ReceiveRecord {
+    id: u64,
     scope: WeakReceiveScope,
     identity: ReceiveIdentity,
     _charge: Arc<dyn RelayBufferReservation>,
 }
+
+type RetiredReceive = ((IpAddr, IpAddr), u64, Arc<dyn RelayBufferReservation>);
 
 impl Inputs {
     fn grant(&self, source: IpAddr, destination: IpAddr) -> Result<DeliveryGrant, Refused> {
@@ -250,6 +253,7 @@ pub struct DeliveryAuthority {
     inputs: RwLock<Inputs>,
     preparer: Arc<SocketPreparer>,
     revalidate: watch::Sender<u64>,
+    retired_receive: Arc<Mutex<Vec<RetiredReceive>>>,
 }
 
 impl DeliveryAuthority {
@@ -264,6 +268,7 @@ impl DeliveryAuthority {
             }),
             preparer,
             revalidate: watch::channel(0).0,
+            retired_receive: Arc::default(),
         }
     }
 
@@ -274,6 +279,7 @@ impl DeliveryAuthority {
         inputs.policy = policy.clone();
         inputs.observation = observation;
         inputs.revalidate_receive();
+        self.reclaim_receive(&mut inputs);
         drop(inputs);
         self.wake();
     }
@@ -286,10 +292,26 @@ impl DeliveryAuthority {
         });
     }
 
+    fn reclaim_receive(&self, inputs: &mut Inputs) {
+        // Take the queue before dropping records/credits. A temporary guard can
+        // retire during revalidation, without lock recursion or a full-map scan.
+        let retired = std::mem::take(&mut *self.retired_receive.lock().unwrap());
+        for (key, id, _charge) in retired {
+            if inputs
+                .receive
+                .get(&key)
+                .is_some_and(|record| record.id == id)
+            {
+                inputs.receive.remove(&key);
+            }
+        }
+    }
+
     fn install(&self, capture: CaptureAuthority) {
         let mut inputs = self.inputs.write().unwrap();
         inputs.capture = Some(capture);
         inputs.revalidate_receive();
+        self.reclaim_receive(&mut inputs);
         drop(inputs);
         self.wake();
     }
@@ -318,6 +340,7 @@ impl DeliveryAuthority {
             }
         }
         inputs.revalidate_receive();
+        self.reclaim_receive(&mut inputs);
         drop(inputs);
         self.wake();
     }
@@ -326,6 +349,7 @@ impl DeliveryAuthority {
         let mut inputs = self.inputs.write().unwrap();
         inputs.capture = None;
         inputs.revalidate_receive();
+        self.reclaim_receive(&mut inputs);
         drop(inputs);
         self.wake();
     }
@@ -335,6 +359,7 @@ impl DeliveryAuthority {
         if inputs.endpoint != ready {
             inputs.endpoint = ready;
             inputs.revalidate_receive();
+            self.reclaim_receive(&mut inputs);
             drop(inputs);
             self.wake();
         }
@@ -383,6 +408,7 @@ impl LocalAuthority for DeliveryAuthority {
         buffers: &dyn RelayBufferAllocator,
     ) -> Result<ReceiveScope, Refused> {
         let mut inputs = self.inputs.write().unwrap();
+        self.reclaim_receive(&mut inputs);
         let key = (source, destination);
         let grant = match inputs.grant(source, destination) {
             Ok(grant) => grant,
@@ -412,10 +438,19 @@ impl LocalAuthority for DeliveryAuthority {
         if inputs.receive.len() == MAX_RECEIVE_SCOPES {
             return Err(Refused::Full);
         }
-        let scope = ReceiveScope::new(source, destination, buffers)?;
+        let retired = self.retired_receive.clone();
+        let scope = ReceiveScope::new_notifying(
+            source,
+            destination,
+            buffers,
+            Some(Box::new(move |id, charge| {
+                retired.lock().unwrap().push((key, id, charge));
+            })),
+        )?;
         inputs.receive.insert(
             key,
             ReceiveRecord {
+                id: scope.id(),
                 scope: scope.downgrade(),
                 identity: ReceiveIdentity::from_grant(&grant),
                 _charge: scope.registration_credit(),

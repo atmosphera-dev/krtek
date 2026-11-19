@@ -12,12 +12,23 @@ use talpid_types::relay_flow::{RelayBufferAllocator, RelayBufferReservation};
 /// not a packet-rate quota or a second fragment-assembly table.
 pub const MAX_RECEIVE_SCOPES: usize = 4098;
 
+pub type ReceiveRetirement = Box<dyn FnOnce(u64, Arc<dyn RelayBufferReservation>) + Send + Sync>;
+
 struct ReceiveState {
     id: u64,
     source: IpAddr,
     destination: IpAddr,
     live: AtomicBool,
     _charge: Arc<dyn RelayBufferReservation>,
+    retired: Option<ReceiveRetirement>,
+}
+
+impl Drop for ReceiveState {
+    fn drop(&mut self) {
+        if let Some(retired) = self.retired.take() {
+            retired(self.id, self._charge.clone());
+        }
+    }
 }
 
 /// Non-authorizing receive identity. It contains no ports or physical socket.
@@ -33,6 +44,19 @@ impl ReceiveScope {
         source: IpAddr,
         destination: IpAddr,
         buffers: &dyn RelayBufferAllocator,
+    ) -> Result<Self, Refused> {
+        Self::new_notifying(source, destination, buffers, None)
+    }
+
+    /// Last-guard notification cannot acquire the consumer's authority lock:
+    /// guards may be dropped while that lock is held. Queue retirement instead.
+    /// The transferred credit funds the notification and weak registration until
+    /// the consumer drains it, before admitting more scope or flow storage.
+    pub fn new_notifying(
+        source: IpAddr,
+        destination: IpAddr,
+        buffers: &dyn RelayBufferAllocator,
+        retired: Option<ReceiveRetirement>,
     ) -> Result<Self, Refused> {
         if source.is_ipv4() != destination.is_ipv4() {
             return Err(Refused::Denied);
@@ -50,6 +74,7 @@ impl ReceiveScope {
             destination,
             live: AtomicBool::new(true),
             _charge: charge,
+            retired,
         })))
     }
 
