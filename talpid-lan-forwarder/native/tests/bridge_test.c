@@ -55,6 +55,12 @@ static void on_complete(void *ctx, const krtek_lwip_transport *t, const uint8_t 
     assert(n==expected_length && memcmp(p,segment,n)==0);
     ++completes;
 }
+static int valid_fragment_extent(size_t offset, size_t length, int more)
+{
+    return offset+length<=expected_length &&
+        (more ? length && length%8==0 && offset+length<expected_length
+              : offset+length==expected_length);
+}
 static void on_output(void *ctx, const uint8_t *p, size_t n)
 {
     size_t header, offset, length, i;
@@ -79,9 +85,7 @@ static void on_output(void *ctx, const uint8_t *p, size_t n)
     if (!output_count) output_id=id;
     assert(id==output_id);
     length=n-header;
-    assert(offset+length<=expected_length);
-    if (more) assert(length && length%8==0);
-    else assert(offset+length==expected_length);
+    assert(valid_fragment_extent(offset,length,more));
     for (i=0;i<length;++i) { assert(!covered[offset+i]); covered[offset+i]=1; }
     memcpy(received+offset,p+header,length);
     received_length+=length; ++output_count;
@@ -309,11 +313,13 @@ static void idle_reopen_clock(void)
     assert(!krtek_lwip_close(h));
     /* The core is quiescent; gaps beyond signed comparison range are legal. */
     assert(!krtek_lwip_tick(0x80000001U));
+    assert(sys_now()==0x80000001U && krtek_lwip_next_timeout_ms()==0);
     h=open_client();
     assert(!krtek_lwip_tick(0x80000002U));
     assert(krtek_lwip_next_timeout_ms()<=1000);
     assert(!krtek_lwip_close(h));
     assert(!krtek_lwip_tick(7)); /* arbitrary idle wrap, still no retained owner */
+    assert(sys_now()==7 && krtek_lwip_next_timeout_ms()==0);
     h=open_client();
     assert(!krtek_lwip_tick(8));
     assert(krtek_lwip_next_timeout_ms()<=1000);
@@ -389,6 +395,11 @@ int main(int argc, char **argv)
         else { assert(!strcmp(argv[1],"pressure")); pressure(); }
     } else {
         const size_t sizes[]={0,1,31,1232,1233,1252,1253,4096,4097};
+        expected_length=4104; /* aligned last fragment must terminate too */
+        assert(!valid_fragment_extent(3696,408,1));
+        assert(valid_fragment_extent(3696,408,0));
+        assert(valid_fragment_extent(0,4104,0));
+        assert(valid_fragment_extent(0,1232,1));
         h=open_client(); assert(krtek_lwip_abi_version()==1);
         assert(krtek_lwip_open(NULL)==KRTEK_LWIP_MALFORMED);
         for(family=4;family<=6;family+=2) {

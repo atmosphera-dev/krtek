@@ -45,7 +45,6 @@ import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
@@ -904,6 +903,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         private val records = mutableListOf<RpcTunnelState.State>()
         private val changed = Channel<Unit>(Channel.CONFLATED)
         private var failure: Throwable? = null
+        private val local = OrderedLocalStatusWindow()
 
         @Synchronized
         fun cursor(): Int {
@@ -945,6 +945,19 @@ class LocalNetworkDeliveryInstrumentedTest {
         suspend fun awaitLifecycle(start: Int, matches: (RpcTunnelState.State) -> Boolean) {
             while (lifecycleSince(start).none(matches)) changed.receive()
         }
+
+        fun appendLocal(revision: ULong, eligible: Boolean) {
+            local.append(revision, eligible)
+            changed.trySend(Unit)
+        }
+
+        suspend fun awaitLocal(start: ULong, finish: ULong) {
+            while (true) {
+                cursor() // A closed/failed subscription cannot prove continuity.
+                if (local.processedThrough(start, finish)) return
+                changed.receive()
+            }
+        }
     }
 
     private data class SystemConnectReceipt(val startId: Int, val changed: String)
@@ -985,7 +998,17 @@ class LocalNetworkDeliveryInstrumentedTest {
         }
     }
 
-    private fun withOrderedTunnelEvents(block: (OrderedTunnelEvents) -> Unit) {
+    private fun withOrderedTunnelEvents(block: (OrderedTunnelEvents) -> Unit) =
+        withOrderedDaemonEvents { events, _ ->
+            block(events)
+        }
+
+    private fun withOrderedDaemonEvents(
+        localEligible: (mullvad_daemon.management_interface.LocalNetworkStatus) -> Boolean = {
+            true
+        },
+        block: (OrderedTunnelEvents, ManagementServiceClient) -> Unit,
+    ) {
         val subscribed = CompletableDeferred<Unit>()
         val socket =
             (target.applicationContext as MullvadApplication)
@@ -1036,6 +1059,16 @@ class LocalNetworkDeliveryInstrumentedTest {
                 scope.async(start = CoroutineStart.UNDISPATCHED) {
                     try {
                         for (event in channel) {
+                            val local =
+                                event.event
+                                    as?
+                                    mullvad_daemon.management_interface.DaemonEvent.Event.LocalNetworkStatus
+                            if (local != null) {
+                                events.appendLocal(
+                                    local.value.revision.toULong(),
+                                    localEligible(local.value),
+                                )
+                            }
                             val state =
                                 event.event
                                     as?
@@ -1058,7 +1091,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                     }
                 }
             runBlocking { withTimeout(10_000) { subscribed.await() } }
-            block(events)
+            block(events, rpc)
         } finally {
             collector?.cancel()
             scope.cancel()
@@ -2518,26 +2551,37 @@ class LocalNetworkDeliveryInstrumentedTest {
             report("local_udp_rule", "$cidr:$expectedRule")
             val capture = appliedConfiguration(policy, ForwardingAvailability.Active)
             consumer.identity()
-            captureBarrier(token, "start", capture)
-            try {
-                val result = runBlocking {
-                    // The capture can remain unchanged while Wi-Fi eligibility
-                    // changes. Observe the rule after the start acknowledgment
-                    // and throughout the blocking ordinary-consumer operation.
-                    val validity =
-                        launch(start = CoroutineStart.UNDISPATCHED) {
-                            repository.localNetworkStatus.collect { status ->
-                                assertTrue(
-                                    status != null &&
-                                        status.forwarding == ForwardingAvailability.Active &&
-                                        status.rules.any {
-                                            it.id == rule.id && it.state == expectedRule
-                                        },
-                                    "Local rule eligibility changed during UDP probe",
-                                )
-                            }
+            val eligible: (mullvad_daemon.management_interface.LocalNetworkStatus) -> Boolean =
+                { status ->
+                    val selected = status.rules.singleOrNull { it.id == rule.id.toString() }
+                    status.forwarding ==
+                        mullvad_daemon.management_interface.LocalNetworkStatus
+                            .ForwardingAvailability
+                            .ACTIVE &&
+                        selected != null &&
+                        if (expect == "denied") {
+                            selected.state ==
+                                mullvad_daemon.management_interface.LocalRuleStatus.State
+                                    .INACTIVE &&
+                                selected.reason ==
+                                    mullvad_daemon.management_interface.LocalRuleInactiveReason
+                                        .DIFFERENT_WIFI
+                        } else {
+                            selected.state ==
+                                mullvad_daemon.management_interface.LocalRuleStatus.State
+                                    .FORWARDING && selected.reason == null
                         }
-                    try {
+                }
+            withOrderedDaemonEvents(eligible) { events, rpc ->
+                // Subscribe before the initial snapshot. Its revision excludes
+                // earlier events; the end RPC fences all later publications.
+                val start = runBlocking {
+                    withTimeout(10_000) { rpc.GetLocalNetworkStatus().execute(Unit) }
+                }
+                assertTrue(eligible(start), "Unexpected Local status before UDP probe")
+                captureBarrier(token, "start", capture)
+                try {
+                    val result = runBlocking {
                         withContext(Dispatchers.IO) {
                             consumer
                                 .request(
@@ -2552,92 +2596,107 @@ class LocalNetworkDeliveryInstrumentedTest {
                                     }
                                 )
                                 .also {
-                                    // Preserve the raw even if the eligibility
-                                    // observer has cancelled this parent scope.
+                                    // Preserve raw evidence before checking the
+                                    // ordered status window or terminal fence.
                                     saveLargeProbe(
                                         "local_udp_${expect}_${family}_$size",
                                         checkNotNull(it.getString("local_udp_report")),
                                     )
                                 }
                         }
-                    } finally {
-                        validity.cancelAndJoin()
                     }
-                }
-                val raw = checkNotNull(result.getString("local_udp_report"))
-                val decoded = JSONObject(raw)
-                assertEquals(family, decoded.getInt("family"))
-                assertEquals(result.getInt("uid"), decoded.getInt("uid"))
-                assertEquals(requestSize, decoded.getInt("payload_size"))
-                assertEquals(18081, decoded.getInt("remote_port"))
-                assertTrue(decoded.getBoolean("option_set"))
-                val expectedPayload =
-                    LocalUdpPayload.create(
-                        requestSize,
-                        decoded
-                            .getString("nonce")
-                            .chunked(2)
-                            .map { it.toInt(16).toByte() }
-                            .toByteArray(),
-                    )
-                assertEquals(
-                    ProbePayloadSummary.sha256(expectedPayload, expectedPayload.size),
-                    decoded.getString("payload_sha256"),
-                )
-                assertFalse(decoded.has("payload_hex"))
-                assertFalse(decoded.has("reply_hex"))
-                if (expect == "oversized-reply") {
-                    assertEquals(size, decoded.getInt("requested_reply_size"))
-                }
-                if (expect == "echo") {
-                    assertEquals("local-udp-echo", result.getString("outcome"), raw)
-                    assertTrue(decoded.getBoolean("validated"))
-                    assertEquals(size, decoded.getInt("sent"))
-                    assertEquals(size, decoded.getInt("received"))
-                    assertTrue(decoded.getBoolean("bytes_equal"))
-                    assertTrue(decoded.getBoolean("source_matches"))
+                    val finish = runBlocking {
+                        withTimeout(10_000) { rpc.GetLocalNetworkStatus().execute(Unit) }
+                    }
+                    assertTrue(eligible(finish), "Unexpected Local status at UDP probe end")
+                    runBlocking {
+                        withTimeout(10_000) {
+                            events.awaitLocal(start.revision.toULong(), finish.revision.toULong())
+                        }
+                    }
+                    val raw = checkNotNull(result.getString("local_udp_report"))
+                    val decoded = JSONObject(raw)
+                    assertEquals(family, decoded.getInt("family"))
+                    assertEquals(result.getInt("uid"), decoded.getInt("uid"))
+                    assertEquals(requestSize, decoded.getInt("payload_size"))
+                    assertEquals(18081, decoded.getInt("remote_port"))
+                    assertTrue(decoded.getBoolean("option_set"))
+                    val expectedPayload =
+                        LocalUdpPayload.create(
+                            requestSize,
+                            decoded
+                                .getString("nonce")
+                                .chunked(2)
+                                .map { it.toInt(16).toByte() }
+                                .toByteArray(),
+                        )
                     assertEquals(
+                        ProbePayloadSummary.sha256(expectedPayload, expectedPayload.size),
                         decoded.getString("payload_sha256"),
-                        decoded.getString("reply_sha256"),
                     )
-                    assertEquals(
-                        address,
-                        InetAddresses.parseNumericAddress(decoded.getString("reply_source")),
-                    )
-                    assertEquals(18081, decoded.getInt("reply_port"))
-                } else {
-                    assertEquals("failed", result.getString("outcome"), raw)
-                    assertFalse(decoded.optBoolean("validated"))
-                    assertFalse(
-                        decoded.has("received"),
-                        "No shortened or other datagram is allowed",
-                    )
-                    if (expect == "oversized" && family == 4) {
-                        // IPv4's protocol maximum is also the kernel send limit.
-                        // This is EMSGSIZE, not proof of the Local typed boundary.
-                        assertEquals("send", decoded.getString("error_stage"))
-                        assertEquals(android.system.OsConstants.EMSGSIZE, decoded.getInt("errno"))
+                    assertFalse(decoded.has("payload_hex"))
+                    assertFalse(decoded.has("reply_hex"))
+                    if (expect == "oversized-reply") {
+                        assertEquals(size, decoded.getInt("requested_reply_size"))
+                    }
+                    if (expect == "echo") {
+                        assertEquals("local-udp-echo", result.getString("outcome"), raw)
+                        assertTrue(decoded.getBoolean("validated"))
+                        assertEquals(size, decoded.getInt("sent"))
+                        assertEquals(size, decoded.getInt("received"))
+                        assertTrue(decoded.getBoolean("bytes_equal"))
+                        assertTrue(decoded.getBoolean("source_matches"))
+                        assertEquals(
+                            decoded.getString("payload_sha256"),
+                            decoded.getString("reply_sha256"),
+                        )
+                        assertEquals(
+                            address,
+                            InetAddresses.parseNumericAddress(decoded.getString("reply_source")),
+                        )
+                        assertEquals(18081, decoded.getInt("reply_port"))
                     } else {
-                        assertEquals(requestSize, decoded.getInt("sent"))
-                        assertEquals("receive", decoded.getString("error_stage"))
-                        assertTrue(
-                            decoded.getInt("errno") in
-                                setOf(
-                                    android.system.OsConstants.EAGAIN,
-                                    android.system.OsConstants.ETIMEDOUT,
-                                )
+                        assertEquals("failed", result.getString("outcome"), raw)
+                        assertFalse(decoded.optBoolean("validated"))
+                        assertFalse(
+                            decoded.has("received"),
+                            "No shortened or other datagram is allowed",
+                        )
+                        if (expect == "oversized" && family == 4) {
+                            // IPv4's protocol maximum is also the kernel send limit.
+                            // This is EMSGSIZE, not proof of the Local typed boundary.
+                            assertEquals("send", decoded.getString("error_stage"))
+                            assertEquals(
+                                android.system.OsConstants.EMSGSIZE,
+                                decoded.getInt("errno"),
+                            )
+                        } else {
+                            assertEquals(requestSize, decoded.getInt("sent"))
+                            assertEquals("receive", decoded.getString("error_stage"))
+                            assertTrue(
+                                decoded.getInt("errno") in
+                                    setOf(
+                                        android.system.OsConstants.EAGAIN,
+                                        android.system.OsConstants.ETIMEDOUT,
+                                    )
+                            )
+                        }
+                        report(
+                            if (expect == "oversized-reply")
+                                "local_udp_requires_peer_reply_limit_audit"
+                            else "local_udp_requires_peer_silence_audit",
+                            true,
                         )
                     }
-                    report(
-                        if (expect == "oversized-reply") "local_udp_requires_peer_reply_limit_audit"
-                        else "local_udp_requires_peer_silence_audit",
-                        true,
+                } finally {
+                    val finalCapture = appliedConfiguration(policy, ForwardingAvailability.Active)
+                    assertEquals(
+                        capture,
+                        finalCapture,
+                        "Capture epoch changed during Local UDP probe",
                     )
+                    captureBarrier(token, "finish", finalCapture)
                 }
-            } finally {
-                val finalCapture = appliedConfiguration(policy, ForwardingAvailability.Active)
-                assertEquals(capture, finalCapture, "Capture epoch changed during Local UDP probe")
-                captureBarrier(token, "finish", finalCapture)
             }
         }
     }

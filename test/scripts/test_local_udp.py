@@ -7,14 +7,17 @@ import json
 import os
 from pathlib import Path
 import socket
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 import local_udp_audit as audit
 import local_udp_vectors as vectors
+import local_udp_peer as peer
 
 
 def observation_fixture(report, rows):
@@ -24,7 +27,8 @@ def observation_fixture(report, rows):
                        finish_seen_monotonic_ns=40)
     opened = dict(event="listening", pid=42, boot_id="fixture-boot", port=18081,
                   addresses=[report["remote_address"]], listening_monotonic_ns=10)
-    closed = dict(event="stopped", pid=42, boot_id="fixture-boot", stopped_monotonic_ns=50)
+    closed = dict(event="stopped", pid=42, boot_id="fixture-boot", stopped_monotonic_ns=50,
+                  coverage_complete=True, coverage_monotonic_ns=45, finish=dict(observation))
     scoped = []
     for row in rows:
         if row.get("event") == "stopped":
@@ -49,6 +53,73 @@ def write_observation(root, report, rows):
 
 
 class LocalUdpHarnessTest(unittest.TestCase):
+    def test_stock_lwip_common_port_startup_has_a_deadline_and_retains_success(self):
+        first, second, ipv6 = mock.Mock(), mock.Mock(), mock.Mock()
+        first.getsockname.return_value = ("127.0.0.1", 1234)
+        second.getsockname.return_value = ("127.0.0.1", 2345)
+        busy = OSError(98, "IPv6 port occupied")
+        with mock.patch.object(peer.time, "monotonic", side_effect=[0, 0, 6]), \
+                mock.patch.object(peer, "bind_peer", side_effect=[first, busy]):
+            with self.assertRaisesRegex(OSError, "No common UDP port"):
+                peer.bind_dual("127.0.0.1", "::1", 0)
+        first.close.assert_called_once()
+        with mock.patch.object(peer.time, "monotonic", side_effect=[0, 0, 1]), \
+                mock.patch.object(peer, "bind_peer", side_effect=[first, busy, second, ipv6]):
+            self.assertEqual([second, ipv6], peer.bind_dual("127.0.0.1", "::1", 0))
+        second.close.assert_not_called()
+        ipv6.close.assert_not_called()
+
+    def test_stock_lwip_peer_finish_drains_both_queued_families_and_proves_silence(self):
+        for send in (False, True):
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                command = [sys.executable, str(Path(__file__).with_name("local_udp_peer.py")),
+                           "--ipv4", "127.0.0.1", "--ipv6", "::1", "--port", "0",
+                           "--ledger", str(root / "ledger"), "--ready", str(root / "ready"),
+                           "--duration", "5", "--finish", str(root / "finish")]
+                with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                    try:
+                        deadline = time.monotonic() + 3
+                        while not (root / "ready").exists():
+                            self.assertIsNone(process.poll()); self.assertLess(time.monotonic(), deadline)
+                            time.sleep(.01)
+                        ready = json.loads((root / "ready").read_text())
+                        os.kill(process.pid, signal.SIGSTOP)
+                        if send:
+                            for family, address in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+                                with socket.socket(family, socket.SOCK_DGRAM) as consumer:
+                                    consumer.sendto(b"unexpected", (address, ready["port"]))
+                        finish = dict(peer_pid=ready["pid"], boot_id=ready["boot_id"],
+                                      token="fixture", nonce="00" * 32,
+                                      finish_seen_monotonic_ns=time.monotonic_ns())
+                        (root / "pending").write_text(json.dumps(finish))
+                        (root / "pending").rename(root / "finish")
+                        os.kill(process.pid, signal.SIGCONT)
+                        _, error = process.communicate(timeout=3)
+                        self.assertEqual(0, process.returncode, error.decode())
+                    finally:
+                        if process.poll() is None:
+                            os.kill(process.pid, signal.SIGCONT)
+                            process.terminate(); process.communicate(timeout=2)
+                rows = [json.loads(line) for line in (root / "ledger").read_text().splitlines()]
+                requests = [row for row in rows if row["event"] == "request"]
+                self.assertEqual([4, 6] if send else [], sorted(row["family"] for row in requests))
+                self.assertTrue(rows[-1]["coverage_complete"])
+                self.assertEqual(finish, rows[-1]["finish"])
+                self.assertGreaterEqual(rows[-1]["coverage_monotonic_ns"], finish["finish_seen_monotonic_ns"])
+
+    def test_stock_lwip_peer_deadline_cannot_claim_complete_coverage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            process = subprocess.run([sys.executable, str(Path(__file__).with_name("local_udp_peer.py")),
+                "--ipv4", "127.0.0.1", "--ipv6", "::1", "--port", "0", "--duration", ".1",
+                "--ledger", str(root / "ledger"), "--ready", str(root / "ready"),
+                "--finish", str(root / "never-published")], capture_output=True, timeout=3)
+            self.assertEqual(0, process.returncode, process.stderr.decode())
+            closed = json.loads((root / "ledger").read_text().splitlines()[-1])
+            self.assertFalse(closed["coverage_complete"])
+            self.assertEqual(0, closed["coverage_monotonic_ns"])
+
     def test_stock_lwip_negative_window_and_payload_independent_request_scope(self):
         body = vectors.payload(4096)
         report = dict(family=6, payload_size=len(body), nonce=bytes(range(32)).hex(),
@@ -67,6 +138,14 @@ class LocalUdpHarnessTest(unittest.TestCase):
             request = dict(event="request", family=6, payload_hex=body[:size].hex(), size=size)
             with self.assertRaisesRegex(audit.AuditError, "reached peer"):
                 audit_fixture(report, [request], expect="denied")
+            with self.assertRaisesRegex(audit.AuditError, "reached peer"):
+                audit_fixture(report, [dict(request, source="fd00::dead")], expect="denied",
+                              expected_peer_source="fd00::15")
+        for closed in (dict(rows[-1], coverage_complete=False),
+                       dict(rows[-1], coverage_monotonic_ns=39),
+                       dict(rows[-1], finish=dict(observation, token="other"))):
+            with self.assertRaises(audit.AuditError):
+                audit.audit_consumer(report, rows[:-1] + [closed], expect="denied", observation=observation)
         # A same-prefix unrelated request outside the invocation cannot become a hit.
         unrelated = dict(event="request", family=6, payload_hex=body[:1].hex(), size=1,
                          received_monotonic_ns=15)
@@ -82,6 +161,19 @@ class LocalUdpHarnessTest(unittest.TestCase):
                              payload_sha256=hashlib.sha256(payload).hexdigest(), sent=size,
                              error_stage="send" if family == 4 else "receive", errno=90 if family == 4 else 11)
             self.assertEqual(0, audit_fixture(oversized, [], expect="oversized")["peer_hits"])
+
+    def test_stock_lwip_late_stopped_row_cannot_replace_receive_coverage(self):
+        body = vectors.payload(4096)
+        report = dict(family=6, payload_size=len(body), nonce=bytes(range(32)).hex(),
+                      payload_sha256=hashlib.sha256(body).hexdigest(), remote_address="fd00::81",
+                      remote_port=18081, option_set=True, option_value=0, sent=len(body),
+                      error_stage="receive", errno=11)
+        rows, observation = observation_fixture(report, [])
+        # The stopped write can be arbitrarily late after the last receive poll.
+        rows[-1].update(coverage_complete=False, coverage_monotonic_ns=0,
+                        stopped_monotonic_ns=1_000_000)
+        with self.assertRaisesRegex(audit.AuditError, "coverage incomplete"):
+            audit.audit_consumer(report, rows, expect="denied", observation=observation)
 
     def test_stock_lwip_bounded_consumer_report_at_both_maxima(self):
         for family, size in ((4, 65507), (6, 65487)):

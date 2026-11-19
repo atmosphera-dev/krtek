@@ -131,7 +131,7 @@ def consumer_payload(report):
     return payload
 
 
-def invocation_requests(report, peer_rows, observation, expected_peer_source):
+def invocation_requests(report, peer_rows, observation):
     """Scope by exclusive capture barriers on the peer guest's monotonic clock.
 
     The runner records start_ack immediately before acknowledging Android's start
@@ -151,8 +151,14 @@ def invocation_requests(report, peer_rows, observation, expected_peer_source):
     opened, closed = listening[0], stopped[0]
     require((opened["pid"], opened["boot_id"]) == (closed["pid"], closed["boot_id"]) ==
             (observation["peer_pid"], observation["boot_id"]), "peer/clock identity mismatch")
-    require(opened["listening_monotonic_ns"] <= start < finish <= closed["stopped_monotonic_ns"],
+    require(closed.get("coverage_complete") is True, "peer receive coverage incomplete")
+    coverage = closed["coverage_monotonic_ns"]
+    require(opened["listening_monotonic_ns"] <= start < finish <= coverage <= closed["stopped_monotonic_ns"],
             "peer did not cover full invocation window")
+    terminal = closed.get("finish")
+    require(isinstance(terminal, dict) and all(terminal.get(key) == observation[key] for key in
+            ("peer_pid", "boot_id", "token", "nonce", "finish_seen_monotonic_ns")),
+            "peer did not drain this invocation finish barrier")
     require(opened["port"] == report["remote_port"] and
             ipaddress.ip_address(report["remote_address"]) in
             [ipaddress.ip_address(address) for address in opened["addresses"]], "observation peer endpoint")
@@ -166,8 +172,6 @@ def invocation_requests(report, peer_rows, observation, expected_peer_source):
         # A receive may be serviced after Android's finish barrier. Keep queued
         # evidence through shutdown rather than hiding it as late traffic.
         if row["received_monotonic_ns"] < start:
-            continue
-        if expected_peer_source is not None and ipaddress.ip_address(row["source"]) != ipaddress.ip_address(expected_peer_source):
             continue
         if (ipaddress.ip_address(row["destination"]) == ipaddress.ip_address(report["remote_address"]) and
                 row["destination_port"] == report["remote_port"]):
@@ -187,7 +191,7 @@ def audit_consumer(report, peer_rows, *, expect, expected_uid=None, expected_pee
     require(report["option_set"] and report["option_value"] == 0, "fragment-permitting socket option")
     # ALL requests in this exclusive endpoint/window belong to the invocation,
     # including empty and corrupted datagrams. Never identify them by payload.
-    hits = invocation_requests(report, peer_rows, observation, expected_peer_source)
+    hits = invocation_requests(report, peer_rows, observation)
     if expect == "echo":
         require(report.get("validated") is True and "error_stage" not in report, "consumer did not validate")
         require(report["sent"] == report["received"] == len(payload), "consumer datagram length")

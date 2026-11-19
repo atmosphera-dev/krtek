@@ -440,6 +440,8 @@ fn stock_lwip_failed_core_refuses_work_on_surviving_handles_before_native_calls(
     );
     assert!(api.0.lock().unwrap().retained.is_empty());
     assert_eq!(survivor.scope_refs(id), 0);
+    let observed_ticks = api.0.lock().unwrap().ticks.len();
+    assert_eq!(observed_ticks, ticks, "failed surviving handle never ticks");
     api.0.lock().unwrap().close_status = ffi::OK;
     survivor.close();
     assert!(

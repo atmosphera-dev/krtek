@@ -49,7 +49,8 @@ then run this peer in that guest, not on Ark or shared networking:
 
 ```sh
 python3 test/scripts/local_udp_peer.py --ipv4 "$PEER4" --ipv6 "$PEER6" \
-  --ledger "$WORK/peer.jsonl" --ready "$WORK/peer-ready.json" --duration 600
+  --ledger "$WORK/peer.jsonl" --ready "$WORK/peer-ready.json" --duration 600 \
+  --finish "$WORK/peer-finish.json"
 ```
 
 Port is 18081. The peer binds both addresses before readiness, receives complete
@@ -151,16 +152,22 @@ monotonic clock, the runner records `start_ack_monotonic_ns` immediately before
 acknowledging the Android start barrier and `finish_seen_monotonic_ns` after
 observing its finish barrier. The receipt also contains `token`, consumer `nonce`,
 `peer_pid`, guest `boot_id`, and `exclusive: true`. The runner must isolate that
-peer endpoint/source for the invocation. The peer's `listening` and `stopped`
-ledger rows must bracket the full interval with the same PID and boot identity;
-a stopped row alone proves no silence. Keep the peer running until after finish,
-including reply-limit probes. Do not compare Android and guest clocks.
+peer endpoint for the invocation. After observing finish, atomically publish
+`peer-finish.json` with `peer_pid`, `boot_id`, `token`, `nonce` and
+`finish_seen_monotonic_ns` from that receipt, on the peer guest. The peer keeps
+polling, drains both UDP sockets, and records `coverage_complete`, the exact
+finish receipt and a `coverage_monotonic_ns` receive watermark before stopping.
+The auditor requires that watermark to cover finish. Deadline or request-count
+termination without that drain is incomplete, even if the stopped timestamp is
+later. Use a fresh peer/finish path for each exclusive invocation. Do not compare
+Android and guest clocks.
 
-The auditor selects all requests to the expected peer endpoint from the expected
-physical source after start acknowledgment through peer shutdown, including
+The auditor selects all requests to the exclusive peer endpoint, regardless of
+source, after start acknowledgment through peer shutdown, including
 queued requests serviced after the finish barrier. Keep the endpoint exclusive
 until shutdown. Empty,
-short or corrupted datagrams fail negatives and cannot pass an echo. Requests
+short, wrong-source or corrupted datagrams fail negatives and cannot pass an echo.
+Positive probes additionally require the expected physical source. Requests
 before the start interval do not count merely because a payload prefix matches.
 Old receipts without these barriers are not sufficient for this stronger audit;
 retain their original results separately rather than inventing missing timing.

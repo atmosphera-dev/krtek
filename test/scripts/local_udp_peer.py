@@ -44,7 +44,8 @@ def append(ledger, row):
 
 def bind_dual(ipv4, ipv6, port):
     """Allocate and retain both families before publishing the selected port."""
-    while True:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
         first = bind_peer(ipv4, port)
         try:
             return [first, bind_peer(ipv6, first.getsockname()[1])]
@@ -52,11 +53,12 @@ def bind_dual(ipv4, ipv6, port):
             first.close()
             if port != 0 or error.errno != errno.EADDRINUSE:
                 raise
+    raise OSError(errno.EADDRINUSE, "No common UDP port available before startup deadline")
 
 
 def serve(ipv4, ipv6, port, ledger_path, ready_path, duration, max_requests=0, reply_size=None,
-          tcp_port=None):
-    """Bounded owner; zero max_requests means duration alone determines the end."""
+          tcp_port=None, finish_path=None):
+    """A finish receipt plus a drained receive set proves coverage; deadlines do not."""
     if ipaddress.ip_address(ipv4).version != 4 or ipaddress.ip_address(ipv6).version != 6:
         raise ValueError("One numeric address per family required")
     sockets = []
@@ -66,6 +68,7 @@ def serve(ipv4, ipv6, port, ledger_path, ready_path, duration, max_requests=0, r
         port = sockets[0].getsockname()[1]
         with selectors.DefaultSelector() as selector, Path(ledger_path).open("x") as ledger:
             for sock in sockets:
+                sock.setblocking(False)
                 selector.register(sock, selectors.EVENT_READ, "udp")
             if tcp_port is not None:
                 tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -89,8 +92,28 @@ def serve(ipv4, ipv6, port, ledger_path, ready_path, duration, max_requests=0, r
             pending.unlink()
             deadline = time.monotonic() + duration
             count = 0
-            while time.monotonic() < deadline and (not max_requests or count < max_requests):
-                for key, _ in selector.select(max(0, deadline - time.monotonic())):
+            finish = None
+            coverage_complete = False
+            coverage_ns = 0
+            while time.monotonic() < deadline and (finish_path or not max_requests or count < max_requests):
+                if finish_path and finish is None and Path(finish_path).exists():
+                    finish = json.loads(Path(finish_path).read_text())
+                    if ((finish.get("peer_pid"), finish.get("boot_id")) != (ready["pid"], ready["boot_id"])
+                            or not finish.get("token") or not finish.get("nonce")
+                            or not isinstance(finish.get("finish_seen_monotonic_ns"), int)
+                            or not ready["listening_monotonic_ns"] <= finish["finish_seen_monotonic_ns"] <= time.monotonic_ns()):
+                        raise ValueError("Finish receipt does not identify this peer lifetime")
+                poll_ns = time.monotonic_ns()
+                wait = 0 if finish else max(0, deadline - time.monotonic())
+                if finish_path:
+                    wait = min(wait, .05)
+                events = selector.select(wait)
+                if finish and not any(key.data == "udp" for key, _ in events):
+                    # The finish barrier was observed BEFORE this empty poll.
+                    # A late stopped write cannot extend this receive watermark.
+                    coverage_complete, coverage_ns = True, poll_ns
+                    break
+                for key, _ in events:
                     sock = key.fileobj
                     if key.data == "listen":
                         client, source = sock.accept()
@@ -149,17 +172,19 @@ def serve(ipv4, ipv6, port, ledger_path, ready_path, duration, max_requests=0, r
                         append(ledger, {"schema": 1, "event": "reply_refused", "index": count,
                                         "size": len(response), "errno": error.errno,
                                         "stage": "kernel-send"})
-                        if max_requests and count >= max_requests:
+                        if not finish_path and max_requests and count >= max_requests:
                             break
                         continue
                     if sent != len(response):
                         raise RuntimeError("Short peer echo")
                     append(ledger, {"schema": 1, "event": "echo" if reply_size is None else "reply_sent", "index": count,
                                     "size": sent, "sent_monotonic_ns": time.monotonic_ns()})
-                    if max_requests and count >= max_requests:
+                    if not finish_path and max_requests and count >= max_requests:
                         break
             append(ledger, {"schema": 1, "event": "stopped", "requests": count,
                             "pid": ready["pid"], "boot_id": ready["boot_id"],
+                            "coverage_complete": coverage_complete,
+                            "coverage_monotonic_ns": coverage_ns, "finish": finish,
                             "stopped_monotonic_ns": time.monotonic_ns()})
     finally:
         for client in clients:
@@ -180,13 +205,15 @@ def main():
     parser.add_argument("--reply-size", type=int, choices=(65488, 65508),
                         help="Reply-limit control only: receive 32-byte nonce, attempt family maximum+1")
     parser.add_argument("--tcp-port", type=int, help="Continuity fixture: explicit IPv4 TCP stream echo")
+    parser.add_argument("--finish", type=Path,
+                        help="Runner atomically publishes the peer-clock finish receipt here; required for audit coverage")
     args = parser.parse_args()
     if not 0 <= args.port <= 65535 or args.duration <= 0 or args.max_requests < 0:
         parser.error("Positive port/duration and nonnegative request count required")
     if args.tcp_port is not None and (not 0 <= args.tcp_port <= 65535 or args.reply_size is not None):
         parser.error("TCP requires a valid port and the exact-echo mode")
     serve(args.ipv4, args.ipv6, args.port, args.ledger, args.ready, args.duration, args.max_requests,
-          args.reply_size, args.tcp_port)
+          args.reply_size, args.tcp_port, args.finish)
 
 
 if __name__ == "__main__":
