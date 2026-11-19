@@ -903,7 +903,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         private val records = mutableListOf<RpcTunnelState.State>()
         private val changed = Channel<Unit>(Channel.CONFLATED)
         private var failure: Throwable? = null
-        private val local = OrderedLocalStatusWindow()
+        private val local = OrderedLocalStatusWindow.Window()
 
         @Synchronized
         fun cursor(): Int {
