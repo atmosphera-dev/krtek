@@ -191,6 +191,7 @@ cgroup2 = ["talpid-core/cgroup2"]
 default-allocator = ["dep:tikv-jemallocator"]
 multihop-pcap = ["talpid-core/multihop-pcap"]
 staggered-obfuscation = ["mullvad-relay-selector/staggered-obfuscation"]
+r06-diagnostics = ["talpid-tunnel/r06-diagnostics", "talpid-lan-forwarder/r06-diagnostics"]
 
 [lints]
 workspace = true

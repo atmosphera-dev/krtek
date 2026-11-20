@@ -294,6 +294,7 @@ struct RetiredTcp {
     deadline: Instant,
 }
 
+#[cfg_attr(feature = "r06-diagnostics", derive(Debug))]
 enum TcpInput {
     Ignore,
     Current,
@@ -542,11 +543,45 @@ impl<A: LocalAuthority> Forwarder<A> {
                 Transport::Udp => (Type::DGRAM, Protocol::UDP),
             };
             let socket = Socket::new(Domain::for_address(flow.destination), kind, Some(protocol))
-                .map_err(|_| Refused::PreparationFailed)?;
-            authority.prepare(&socket, &grant)?;
-            socket
-                .set_nonblocking(true)
-                .map_err(|_| Refused::PreparationFailed)?;
+                .map_err(|error| {
+                #[cfg(feature = "r06-diagnostics")]
+                crate::diagnostics::observe(
+                    "physical-socket-create-failed",
+                    format_args!("flow={flow:?} errno={:?}", error.raw_os_error()),
+                );
+                let _ = error;
+                Refused::PreparationFailed
+            })?;
+            #[cfg(all(feature = "r06-diagnostics", unix))]
+            {
+                use std::os::fd::AsRawFd;
+                crate::diagnostics::observe(
+                    "physical-prepare-begin",
+                    format_args!("flow={flow:?} fd={}", socket.as_raw_fd()),
+                );
+            }
+            authority.prepare(&socket, &grant).inspect_err(|error| {
+                #[cfg(feature = "r06-diagnostics")]
+                crate::diagnostics::observe(
+                    "physical-prepare-failed",
+                    format_args!("flow={flow:?} refusal={error:?}"),
+                );
+                let _ = error;
+            })?;
+            socket.set_nonblocking(true).map_err(|error| {
+                #[cfg(feature = "r06-diagnostics")]
+                crate::diagnostics::observe(
+                    "physical-nonblocking-failed",
+                    format_args!("flow={flow:?} errno={:?}", error.raw_os_error()),
+                );
+                let _ = error;
+                Refused::PreparationFailed
+            })?;
+            #[cfg(feature = "r06-diagnostics")]
+            crate::diagnostics::observe(
+                "physical-prepare-ok",
+                format_args!("flow={flow:?} local={:?}", socket.local_addr()),
+            );
             Ok(socket)
         })))
     }
@@ -589,6 +624,8 @@ impl<A: LocalAuthority> Forwarder<A> {
     }
 
     pub fn ingest(&mut self, bytes: &[u8]) {
+        #[cfg(feature = "r06-diagnostics")]
+        crate::diagnostics::tcp_packet("local-ingress", bytes);
         let (source, destination) = match packet::ip_endpoints(bytes) {
             Ok(endpoints) => endpoints,
             Err(reason) => {
@@ -626,17 +663,41 @@ impl<A: LocalAuthority> Forwarder<A> {
             }
         }
         let engine = self.native.as_mut().expect("opened real Local engine");
+        #[cfg(feature = "r06-diagnostics")]
+        crate::diagnostics::observe(
+            "native-ingest",
+            format_args!(
+                "scope={} source={source} destination={destination} bytes={}",
+                scope.id(),
+                bytes.len()
+            ),
+        );
         let result = engine.register(&scope).and_then(|()| {
             capture::ingest(engine, ReceiveScopeId(scope.id()), bytes, &*self.complete)
         });
         match result {
             Ok(Some(complete)) => {
+                #[cfg(feature = "r06-diagnostics")]
+                crate::diagnostics::observe(
+                    "native-complete",
+                    format_args!(
+                        "scope={} source={source} destination={destination}",
+                        scope.id()
+                    ),
+                );
                 if let Err(error) = self.admit_complete(complete, &scope) {
                     self.ip_refused(error);
                 }
             }
             Ok(None) => {}
-            Err(error) => self.ip_refused(error),
+            Err(error) => {
+                #[cfg(feature = "r06-diagnostics")]
+                crate::diagnostics::observe(
+                    "native-ingest-refused",
+                    format_args!("scope={} reason={error:?}", scope.id()),
+                );
+                self.ip_refused(error)
+            }
         }
     }
 
@@ -674,6 +735,16 @@ impl<A: LocalAuthority> Forwarder<A> {
         scope: &crate::ReceiveScope,
     ) -> Result<(), IpError> {
         let packet = complete.validated()?;
+        #[cfg(feature = "r06-diagnostics")]
+        crate::diagnostics::observe(
+            "validated-transport",
+            format_args!(
+                "scope={} native_scope={} flow={:?}",
+                scope.id(),
+                complete.scope.0,
+                packet.flow
+            ),
+        );
         if complete.scope.0 != scope.id()
             || !scope.current()
             || packet.flow.source.ip() != scope.source()
@@ -703,7 +774,18 @@ impl<A: LocalAuthority> Forwarder<A> {
         self.sweep();
         let tcp_segment = stack::segment(bytes);
         if let Some(segment) = tcp_segment {
-            match self.classify_tcp(flow, segment, stack::valid_syn(bytes)) {
+            let disposition = self.classify_tcp(flow, segment, stack::valid_syn(bytes));
+            #[cfg(feature = "r06-diagnostics")]
+            crate::diagnostics::observe(
+                "tcp-classify",
+                format_args!(
+                    "scope={} flow={flow:?} seq={:?} syn={} input={disposition:?}",
+                    scope.id(),
+                    segment.seq,
+                    segment.syn
+                ),
+            );
+            match disposition {
                 TcpInput::Ignore => return,
                 TcpInput::Replace => self.remove_tcp(flow, false),
                 TcpInput::Reuse => self.retired_tcp.retain(|old| old.flow != flow),
@@ -801,6 +883,15 @@ impl<A: LocalAuthority> Forwarder<A> {
             return;
         }
         let authorization = self.authority.authorize_received(flow, scope);
+        #[cfg(feature = "r06-diagnostics")]
+        crate::diagnostics::observe(
+            "forwarder-grant-result",
+            format_args!(
+                "flow={flow:?} scope={} result={:?}",
+                scope.id(),
+                authorization.as_ref().map(|_| ())
+            ),
+        );
         let grant = match authorization {
             Ok(grant) => Arc::new(grant),
             Err(reason) => {
@@ -836,6 +927,15 @@ impl<A: LocalAuthority> Forwarder<A> {
             self.next_tcp_id += 1;
             incarnation
         });
+        #[cfg(feature = "r06-diagnostics")]
+        crate::diagnostics::observe(
+            "tcp-pending-created",
+            format_args!(
+                "flow={flow:?} scope={} incarnation={:?}",
+                scope.id(),
+                tcp.map(|value| value.id)
+            ),
+        );
         let mut held = VecDeque::with_capacity(HELD_DATAGRAMS);
         held.push_back(held_bytes);
         self.pending.insert(
@@ -860,6 +960,8 @@ impl<A: LocalAuthority> Forwarder<A> {
             self.refused(refused);
         }
         while let Some(bytes) = self.stack.device.outgoing.pop_front() {
+            #[cfg(feature = "r06-diagnostics")]
+            crate::diagnostics::tcp_packet("smoltcp-output", &bytes);
             let Ok(packet) = packet::parse(&bytes) else {
                 self.stats.malformed += 1;
                 continue;
@@ -1038,6 +1140,16 @@ impl<A: LocalAuthority> Forwarder<A> {
     }
 
     fn failed_pending(&mut self, flow: Flow, mut pending: Pending<Arc<A::Grant>>, reason: Refused) {
+        #[cfg(feature = "r06-diagnostics")]
+        crate::diagnostics::observe(
+            "pending-failed",
+            format_args!(
+                "flow={flow:?} scope={} incarnation={:?} expired={} reason={reason:?}",
+                pending.scope.id(),
+                pending.tcp.map(|value| value.id),
+                pending.expired
+            ),
+        );
         self.refused(reason);
         if flow.transport == Transport::Tcp {
             if reason != Refused::Stale
@@ -1086,13 +1198,35 @@ impl<A: LocalAuthority> Forwarder<A> {
                     if flow.transport == Transport::Tcp {
                         let deadline = pending.deadline;
                         pending.work = Work::Connecting(Task::new(tokio::spawn(async move {
+                            #[cfg(feature = "r06-diagnostics")]
+                            crate::diagnostics::observe(
+                                "physical-connect-begin",
+                                format_args!(
+                                    "flow={flow:?} destination={destination} deadline={deadline:?}"
+                                ),
+                            );
                             tokio::time::timeout_at(
                                 deadline,
                                 TcpSocket::from_std_stream(socket.into()).connect(destination),
                             )
                             .await
-                            .map_err(|_| Refused::PreparationFailed)?
-                            .map_err(|_| Refused::PreparationFailed)
+                            .map_err(|error| {
+                                #[cfg(feature = "r06-diagnostics")]
+                                crate::diagnostics::observe("physical-connect-deadline", format_args!("flow={flow:?} destination={destination} os_errno=unobserved deadline={deadline:?}"));
+                                let _ = error;
+                                Refused::PreparationFailed
+                            })?
+                            .inspect(|stream| {
+                                #[cfg(feature = "r06-diagnostics")]
+                                crate::diagnostics::observe("physical-connect-ok", format_args!("flow={flow:?} local={:?} peer={:?}", stream.local_addr(), stream.peer_addr()));
+                                let _ = stream;
+                            })
+                            .map_err(|error| {
+                                #[cfg(feature = "r06-diagnostics")]
+                                crate::diagnostics::observe("physical-connect-failed", format_args!("flow={flow:?} destination={destination} errno={:?}", error.raw_os_error()));
+                                let _ = error;
+                                Refused::PreparationFailed
+                            })
                         })));
                         self.pending.insert(flow, pending);
                     } else {
@@ -1136,9 +1270,23 @@ impl<A: LocalAuthority> Forwarder<A> {
                     // installed with a different incarnation identity.
                     self.drain_stack();
                     let Some(handle) = self.stack.accept_syn(flow, syn, self.stack_now()) else {
+                        #[cfg(feature = "r06-diagnostics")]
+                        crate::diagnostics::observe(
+                            "smoltcp-accept-syn-failed",
+                            format_args!("flow={flow:?} scope={}", pending.scope.id()),
+                        );
                         self.failed_pending(flow, pending, Refused::PreparationFailed);
                         continue;
                     };
+                    #[cfg(feature = "r06-diagnostics")]
+                    crate::diagnostics::observe(
+                        "smoltcp-accept-syn-ok",
+                        format_args!(
+                            "flow={flow:?} scope={} incarnation={}",
+                            pending.scope.id(),
+                            pending.tcp.expect("connected TCP identity").id
+                        ),
+                    );
                     self.tcp.insert(
                         flow,
                         Tcp {

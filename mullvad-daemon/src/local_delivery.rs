@@ -413,6 +413,11 @@ impl LocalAuthority for DeliveryAuthority {
         let grant = match inputs.grant(source, destination) {
             Ok(grant) => grant,
             Err(error) => {
+                #[cfg(feature = "r06-diagnostics")]
+                talpid_lan_forwarder::diagnostics::observe(
+                    "receive-grant-refused",
+                    format_args!("source={source} destination={destination} reason={error:?}"),
+                );
                 if let Some(record) = inputs.receive.remove(&key)
                     && let Some(scope) = record.scope.upgrade()
                 {
@@ -425,6 +430,17 @@ impl LocalAuthority for DeliveryAuthority {
             && let Some(scope) = record.scope.upgrade()
         {
             if scope.current() && record.identity.matches(&grant) {
+                #[cfg(feature = "r06-diagnostics")]
+                talpid_lan_forwarder::diagnostics::observe(
+                    "receive-scope-reused",
+                    format_args!(
+                        "source={source} destination={destination} scope={} generation={:?} network={} observation={}",
+                        scope.id(),
+                        grant.generation,
+                        grant.physical.network_handle,
+                        grant.physical.sequence
+                    ),
+                );
                 return Ok(scope);
             }
             scope.revoke();
@@ -455,6 +471,17 @@ impl LocalAuthority for DeliveryAuthority {
                 identity: ReceiveIdentity::from_grant(&grant),
                 _charge: scope.registration_credit(),
             },
+        );
+        #[cfg(feature = "r06-diagnostics")]
+        talpid_lan_forwarder::diagnostics::observe(
+            "receive-scope-created",
+            format_args!(
+                "source={source} destination={destination} scope={} generation={:?} network={} observation={}",
+                scope.id(),
+                grant.generation,
+                grant.physical.network_handle,
+                grant.physical.sequence
+            ),
         );
         Ok(scope)
     }
@@ -487,6 +514,17 @@ impl LocalAuthority for DeliveryAuthority {
             scope.revoke();
             return Err(Refused::Stale);
         }
+        #[cfg(feature = "r06-diagnostics")]
+        talpid_lan_forwarder::diagnostics::observe(
+            "complete-flow-authorized",
+            format_args!(
+                "flow={flow:?} scope={} generation={:?} network={} observation={}",
+                scope.id(),
+                grant.generation,
+                grant.physical.network_handle,
+                grant.physical.sequence
+            ),
+        );
         Ok(grant)
     }
 
@@ -494,7 +532,16 @@ impl LocalAuthority for DeliveryAuthority {
         if !self.current(grant) {
             return Err(Refused::Stale);
         }
-        (self.preparer)(socket, &grant.physical)?;
+        let prepared = (self.preparer)(socket, &grant.physical);
+        #[cfg(feature = "r06-diagnostics")]
+        talpid_lan_forwarder::diagnostics::observe(
+            "protect-bind-result",
+            format_args!(
+                "generation={:?} network={} observation={} result={prepared:?}",
+                grant.generation, grant.physical.network_handle, grant.physical.sequence
+            ),
+        );
+        prepared?;
         if self.current(grant) {
             Ok(())
         } else {
@@ -1213,17 +1260,26 @@ mod platform {
 
     pub fn preparer(platform: Arc<LocalNetworkPlatform>) -> Arc<SocketPreparer> {
         Arc::new(move |socket, lease| {
-            platform
-                .prepare(
+            let result = platform.prepare(
+                socket.as_raw_fd(),
+                lease.network_handle,
+                lease.sequence,
+                lease.needs_wifi_name,
+            );
+            #[cfg(feature = "r06-diagnostics")]
+            talpid_lan_forwarder::diagnostics::observe(
+                "platform-protect-bind-result",
+                format_args!(
+                    "fd={} network={} observation={} result={result:?}",
                     socket.as_raw_fd(),
                     lease.network_handle,
-                    lease.sequence,
-                    lease.needs_wifi_name,
-                )
-                .map_err(|error| match error {
-                    PrepareError::Stale => Refused::Stale,
-                    _ => Refused::PreparationFailed,
-                })
+                    lease.sequence
+                ),
+            );
+            result.map_err(|error| match error {
+                PrepareError::Stale => Refused::Stale,
+                _ => Refused::PreparationFailed,
+            })
         })
     }
 }

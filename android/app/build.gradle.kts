@@ -13,6 +13,7 @@ import utilities.fullReleaseArtifacts
 import utilities.fullReleaseTasks
 import utilities.generateRemapArguments
 import utilities.getBooleanProperty
+import utilities.getBooleanPropertyOrNull
 import utilities.getStringListProperty
 import utilities.isReleaseBuild
 import utilities.leakCanaryImplementation
@@ -364,6 +365,9 @@ cargo {
         val enabledFeatures = buildList {
             if (enableApiOverride) {
                 add("api-override")
+            }
+            if (getBooleanPropertyOrNull("mullvad.app.build.cargo.r06Diagnostics") == true) {
+                add("r06-diagnostics")
             }
         }
             .toTypedArray()

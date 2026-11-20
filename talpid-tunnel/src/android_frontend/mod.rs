@@ -333,9 +333,22 @@ fn drain_checked_local<A: LocalAuthority>(
         return Ok(false);
     };
     let write = |bytes: &[u8]| {
-        capture.try_io(Interest::WRITABLE, |fd| {
+        #[cfg(feature = "r06-diagnostics")]
+        talpid_lan_forwarder::diagnostics::tcp_packet("checked-tun-write-attempt", bytes);
+        let result = capture.try_io(Interest::WRITABLE, |fd| {
             nix::unistd::write(fd, bytes).map_err(io::Error::from)
-        })
+        });
+        #[cfg(feature = "r06-diagnostics")]
+        talpid_lan_forwarder::diagnostics::observe(
+            "checked-tun-write-result",
+            format_args!(
+                "bytes={} result={result:?} errno={:?} sink={:?}",
+                bytes.len(),
+                result.as_ref().err().and_then(io::Error::raw_os_error),
+                session.map(|(_, sink)| sink.identity())
+            ),
+        );
+        result
     };
     match forwarder.write_output(|bytes| match session {
         Some((session, sink)) => session
@@ -361,25 +374,86 @@ fn ingest<A: LocalAuthority>(
     let Ok(ip) = talpid_netstack::raw_packet::inspect(bytes) else {
         return None;
     };
+    #[cfg(feature = "r06-diagnostics")]
+    {
+        talpid_lan_forwarder::diagnostics::observe(
+            "capture-ingress",
+            format_args!(
+                "logical_generation={} epoch={} source={:?} destination={:?} bytes={}",
+                observation.lease.generation(),
+                observation.generation,
+                ip.source(),
+                ip.destination(),
+                bytes.len()
+            ),
+        );
+        talpid_lan_forwarder::diagnostics::tcp_packet("capture-tcp-ingress", bytes);
+    }
     if !ip
         .source()
         .is_some_and(|ip| observation.sources.contains(ip))
     {
+        #[cfg(feature = "r06-diagnostics")]
+        talpid_lan_forwarder::diagnostics::observe(
+            "capture-source-refused",
+            format_args!("epoch={} source={:?}", observation.generation, ip.source()),
+        );
         return None;
     }
     match config {
-        CaptureConfig::Partial(_) => forwarder.ingest(bytes),
+        CaptureConfig::Partial(_) => {
+            #[cfg(feature = "r06-diagnostics")]
+            talpid_lan_forwarder::diagnostics::observe(
+                "capture-select-local-partial",
+                format_args!(
+                    "epoch={} destination={:?}",
+                    observation.generation,
+                    ip.destination()
+                ),
+            );
+            forwarder.ingest(bytes)
+        }
         CaptureConfig::Secured { disposition, .. } | CaptureConfig::Router { disposition, .. } => {
             match ip.destination().map(|ip| disposition(ip)) {
-                Some(CaptureDisposition::Local) => forwarder.ingest(bytes),
+                Some(CaptureDisposition::Local) => {
+                    #[cfg(feature = "r06-diagnostics")]
+                    talpid_lan_forwarder::diagnostics::observe(
+                        "capture-select-local",
+                        format_args!(
+                            "epoch={} destination={:?}",
+                            observation.generation,
+                            ip.destination()
+                        ),
+                    );
+                    forwarder.ingest(bytes)
+                }
                 Some(CaptureDisposition::Tunnel(target)) => {
+                    #[cfg(feature = "r06-diagnostics")]
+                    talpid_lan_forwarder::diagnostics::observe(
+                        "capture-select-tunnel",
+                        format_args!(
+                            "epoch={} destination={:?}",
+                            observation.generation,
+                            ip.destination()
+                        ),
+                    );
                     if let Ok(mut packet) = observation.lease.ingress(target, bytes)
                         && packet.try_send() == Err(AttachmentError::Full)
                     {
                         return Some(packet);
                     }
                 }
-                _ => {}
+                _ => {
+                    #[cfg(feature = "r06-diagnostics")]
+                    talpid_lan_forwarder::diagnostics::observe(
+                        "capture-select-drop",
+                        format_args!(
+                            "epoch={} destination={:?}",
+                            observation.generation,
+                            ip.destination()
+                        ),
+                    );
+                }
             }
         }
     }

@@ -22,6 +22,8 @@
 //! space are precharged separately so earlier flows can progress under pressure.
 
 pub mod authority;
+#[cfg(feature = "r06-diagnostics")]
+pub mod diagnostics;
 mod forwarder;
 mod ip_endpoint;
 pub mod packet;
