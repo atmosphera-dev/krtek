@@ -245,7 +245,7 @@ public final class LocalNetworkConsumerService extends Service {
       activeProbe = resources;
       try {
         if (Thread.currentThread().isInterrupted()) return outcome("deadline");
-        return FragmentedUdpProbe.run(family, resources::icmpSocket);
+        return FragmentedUdpProbe.run(getFilesDir(), family, resources::icmpSocket);
       } finally {
         resources.close();
         activeProbe = null;

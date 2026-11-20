@@ -2469,7 +2469,10 @@ class LocalNetworkDeliveryInstrumentedTest {
                     if (result.getString("outcome") == "fragmented-udp") {
                         assertTrue(decoded.getBoolean("validated"))
                         assertEquals(4096, decoded.getInt("sent"))
-                        assertEquals(8192, decoded.getString("query_hex").length)
+                        val queryFile = decoded.getJSONObject("query")
+                        assertEquals(4096, queryFile.getInt("size"))
+                        assertEquals(64, queryFile.getString("sha256").length)
+                        assertTrue(queryFile.getString("path").endsWith("/query.bin"))
                         assertEquals(0, decoded.getInt("option_value"))
                         assertTrue(decoded.getBoolean("option_set"))
                     }
