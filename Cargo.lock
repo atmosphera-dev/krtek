@@ -3463,6 +3463,8 @@ dependencies = [
  "dirs",
  "either",
  "futures",
+ "hickory-net",
+ "hickory-proto",
  "hickory-resolver",
  "insta",
  "ipnetwork",
