@@ -1,12 +1,13 @@
 use super::*;
 use mullvad_types::settings::local_network_access::{
-    LocalBypassRule, LocalNetworkAccess, SsidIdentity,
+    LocalBypassRule, LocalNetworkAccess, SsidIdentity, split_dns::SplitDnsPolicy,
 };
 
 fn policy() -> LocalNetworkAccess {
     LocalNetworkAccess {
         enabled: true,
         skip_local_rules_for_excluded_apps: false,
+        split_dns: Default::default(),
         rules: vec![LocalBypassRule {
             id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
             name: "private-rule-marker".into(),
@@ -98,6 +99,17 @@ fn settings_diagnostics_contain_counts_without_rule_contents() {
     ] {
         assert!(!diagnostic.contains(secret));
     }
+}
+
+fn dns_policy() -> LocalNetworkAccess {
+    let mut policy = policy();
+    policy.split_dns = SplitDnsPolicy {
+        enabled: true,
+        suffixes: vec![".HOME.".into(), "home".into(), "nas.home".into()],
+        home_resolver: Some("192.168.240.10".parse().unwrap()),
+        local_rule_id: Some(policy.rules[0].id),
+    };
+    policy
 }
 
 struct Scratch(PathBuf);
@@ -344,4 +356,201 @@ async fn accepted_policy_is_deduplicated_before_persistence_without_losing_condi
             .local_network_access,
         policy()
     );
+}
+
+#[tokio::test]
+async fn split_dns_normalized_disk_readback_precedes_notification_and_shares_exact_local_cas() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let scratch = Scratch::new();
+    let mut settings = scratch.settings();
+    let path = settings.path.clone();
+    let count = Arc::new(AtomicUsize::new(0));
+    let observer = count.clone();
+    settings.register_change_listener(move |updated| {
+        let disk = SettingsPersister::load_from_bytes(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk, *updated);
+        assert_eq!(
+            disk.local_network_access.split_dns.suffixes,
+            ["home.", "nas.home."]
+        );
+        observer.fetch_add(1, Ordering::SeqCst);
+    });
+    let old = settings.local_network_access.clone();
+    assert!(
+        settings
+            .set_local_network_access(dns_policy(), Some(old.clone()))
+            .await
+            .unwrap()
+    );
+    let normalized = settings.local_network_access.clone();
+    assert_eq!(normalized.split_dns.suffixes, ["home.", "nas.home."]);
+    assert_eq!(normalized.rules, policy().rules);
+    assert!(!normalized.skip_local_rules_for_excluded_apps);
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert!(
+        !settings
+            .set_local_network_access(dns_policy(), Some(normalized.clone()))
+            .await
+            .unwrap()
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    let disk = std::fs::read(&settings.path).unwrap();
+    for field in 0..5 {
+        let mut stale = normalized.clone();
+        match field {
+            0 => stale = old.clone(),
+            1 => stale.split_dns.suffixes.reverse(),
+            2 => stale.split_dns.enabled = false,
+            3 => stale.split_dns.home_resolver = Some("192.168.240.11".parse().unwrap()),
+            _ => stale.split_dns.local_rule_id = None,
+        }
+        let mut toggle = normalized.clone();
+        toggle.skip_local_rules_for_excluded_apps = true;
+        assert!(
+            settings
+                .set_local_network_access(toggle, Some(stale))
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&settings.path).unwrap(), disk);
+    }
+    let mut toggle = normalized.clone();
+    toggle.skip_local_rules_for_excluded_apps = true;
+    settings
+        .set_local_network_access(toggle.clone(), Some(normalized.clone()))
+        .await
+        .unwrap();
+    let mut rule_edit = normalized.clone();
+    rule_edit.rules[0].name = "concurrent edit".into();
+    assert!(
+        settings
+            .set_local_network_access(rule_edit, Some(normalized))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        SettingsPersister::load_from_file(&settings.path)
+            .await
+            .unwrap()
+            .local_network_access,
+        toggle
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn split_dns_invalid_read_can_be_repaired_without_replacing_other_policy_fields() {
+    let scratch = Scratch::new();
+    let mut settings = scratch.settings();
+    let mut invalid = dns_policy();
+    invalid.split_dns.suffixes = vec!["*.private-domain-marker".into()];
+    settings.settings.local_network_access = invalid.clone();
+    SettingsPersister::save_inner(&settings.path, &settings.settings)
+        .await
+        .unwrap();
+    let read = SettingsPersister::load_from_file(&settings.path)
+        .await
+        .unwrap();
+    assert_eq!(read.local_network_access, invalid);
+    assert!(read.local_network_access.validate().is_err());
+    let mut replacement = read.local_network_access.clone();
+    replacement.split_dns.suffixes = vec!["home".into()];
+    settings
+        .set_local_network_access(replacement.clone(), Some(invalid))
+        .await
+        .unwrap();
+    replacement.normalize().unwrap();
+    assert_eq!(
+        SettingsPersister::load_from_file(&settings.path)
+            .await
+            .unwrap()
+            .local_network_access,
+        replacement
+    );
+    assert_eq!(replacement.rules, policy().rules);
+    assert!(!replacement.skip_local_rules_for_excluded_apps);
+    assert!(!format!("{:?}", settings.to_settings()).contains("private-domain-marker"));
+}
+
+#[tokio::test]
+async fn split_dns_validation_and_failed_write_leave_disk_memory_and_notifications_unchanged() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let scratch = Scratch::new();
+    let mut settings = scratch.settings();
+    settings
+        .set_local_network_access(dns_policy(), None)
+        .await
+        .unwrap();
+    let before = settings.to_settings();
+    let path = settings.path.clone();
+    let disk = std::fs::read(&path).unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let observer = count.clone();
+    settings.register_change_listener(move |_| {
+        observer.fetch_add(1, Ordering::SeqCst);
+    });
+    for index in 0..4 {
+        let mut invalid = before.local_network_access.clone();
+        match index {
+            0 => invalid.split_dns.suffixes = vec!["*.home".into()],
+            1 => invalid.split_dns.home_resolver = None,
+            2 => invalid.split_dns.local_rule_id = Some(Default::default()),
+            _ => invalid.rules[0].cidrs.clear(),
+        }
+        assert!(
+            settings
+                .set_local_network_access(invalid, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(settings.to_settings(), before);
+        assert_eq!(std::fs::read(&path).unwrap(), disk);
+    }
+    let forbidden = scratch.0.join("write-blocker");
+    std::fs::create_dir(&forbidden).unwrap();
+    settings.path = forbidden;
+    let mut changed = before.local_network_access.clone();
+    changed.split_dns.enabled = false;
+    assert!(
+        settings
+            .set_local_network_access(changed, None)
+            .await
+            .is_err()
+    );
+    assert_eq!(settings.to_settings(), before);
+    assert_eq!(std::fs::read(path).unwrap(), disk);
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn split_dns_reset_preserves_complete_and_incomplete_drafts_only_with_whole_policy_key() {
+    for mut configured in [dns_policy(), policy()] {
+        if !configured.split_dns.enabled {
+            configured.split_dns.local_rule_id = Some(Default::default());
+            configured.split_dns.suffixes = vec![".HOME.".into(), "home".into()];
+        }
+        let mut settings = persister(PathBuf::new());
+        settings.settings.local_network_access = configured.clone();
+        settings
+            .reset(SettingsKeyList {
+                keys: vec![SettingsKey::LocalNetworkAccess],
+            })
+            .await
+            .unwrap();
+        assert_eq!(settings.local_network_access, configured);
+        assert!(
+            !settings
+                .local_network_access
+                .skip_local_rules_for_excluded_apps
+        );
+        settings.reset(SettingsKeyList::default()).await.unwrap();
+        assert_eq!(settings.local_network_access, LocalNetworkAccess::default());
+    }
+    // Like the inherited reset test, cfg(test) deliberately skips its disk save.
 }

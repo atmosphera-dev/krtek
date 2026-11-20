@@ -7,6 +7,7 @@ data class LocalNetworkAccess(
     val enabled: Boolean = false,
     val rules: List<LocalBypassRule> = emptyList(),
     val skipLocalRulesForExcludedApps: Boolean = true,
+    val splitDns: SplitDnsPolicy = SplitDnsPolicy(),
 ) {
     fun validationError(): LocalPolicyValidationError? =
         when {
@@ -21,6 +22,7 @@ data class LocalNetworkAccess(
                 LocalPolicyValidationError.TooManySsids
             rules.any { it.enabled && it.cidrs.isEmpty() } ->
                 LocalPolicyValidationError.EmptyEnabledRule
+            splitDns.validationError(rules) != null -> LocalPolicyValidationError.InvalidSplitDns
             else -> null
         }
 
@@ -53,4 +55,5 @@ enum class LocalPolicyValidationError {
     TooManyCidrs,
     TooManySsids,
     NameTooLong,
+    InvalidSplitDns,
 }

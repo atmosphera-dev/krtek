@@ -377,7 +377,7 @@ impl LocalAuthority for DeliveryAuthority {
     fn disposition(&self, destination: IpAddr) -> Disposition {
         let inputs = self.inputs.read().unwrap();
         if inputs.policy.enabled
-            && inputs.policy.validate().is_ok()
+            && inputs.policy.validate_local_rules().is_ok()
             && !inputs.capture.as_ref().is_some_and(|capture| {
                 capture
                     .reserved

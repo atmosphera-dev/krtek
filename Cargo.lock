@@ -3836,6 +3836,8 @@ dependencies = [
  "chrono",
  "clap",
  "either",
+ "hickory-proto",
+ "idna",
  "intersection-derive",
  "ipnetwork",
  "log",

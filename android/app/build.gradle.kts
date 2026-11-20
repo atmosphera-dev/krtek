@@ -173,6 +173,7 @@ android {
         // Workaround to include all instrumented tests in app module. Without this we'd have to
         // create an APK for each submodule and pass each on for testing with the orchestrator.
         getByName("androidTest") {
+            assets.directories.add("$repoRootPath/test/fixtures")
             val instrumentedTests =
                 rootProject.subprojects
                     .mapNotNull { subProject ->

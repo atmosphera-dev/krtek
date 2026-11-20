@@ -7,6 +7,7 @@ use std::{collections::HashSet, fmt, net::IpAddr, str::FromStr};
 use uuid::Uuid;
 
 pub mod eligibility;
+pub mod split_dns;
 pub mod status;
 
 const LOCAL_SCOPES: [&str; 6] = [
@@ -159,6 +160,7 @@ pub struct LocalNetworkAccess {
     /// Only Partial capture may include apps excluded from Mullvad.
     #[serde(default = "default_skip_local_rules_for_excluded_apps")]
     pub skip_local_rules_for_excluded_apps: bool,
+    pub split_dns: split_dns::SplitDnsPolicy,
 }
 
 fn default_skip_local_rules_for_excluded_apps() -> bool {
@@ -171,6 +173,7 @@ impl Default for LocalNetworkAccess {
             enabled: false,
             rules: vec![],
             skip_local_rules_for_excluded_apps: default_skip_local_rules_for_excluded_apps(),
+            split_dns: split_dns::SplitDnsPolicy::default(),
         }
     }
 }
@@ -224,12 +227,22 @@ pub enum PolicyError {
     TooManySsids,
     #[error("local rule name is too long")]
     NameTooLong,
+    #[error(transparent)]
+    SplitDns(#[from] split_dns::SplitDnsPolicyError),
 }
 
 impl LocalNetworkAccess {
     /// Validate updates before deduplication, including disabled rules. Loading
     /// existing settings uses the normal upstream deserialization path instead.
     pub fn validate(&self) -> Result<(), PolicyError> {
+        self.validate_local_rules()?;
+        self.split_dns.validate(&self.rules)?;
+        Ok(())
+    }
+
+    /// Local delivery must not depend on a separately invalid DNS draft. Atomic
+    /// replacements validate both concerns, but each receiver owns its eligibility.
+    pub fn validate_local_rules(&self) -> Result<(), PolicyError> {
         if self.rules.len() > MAX_RULES {
             return Err(PolicyError::TooManyRules);
         }
@@ -264,6 +277,16 @@ impl LocalNetworkAccess {
         }
     }
 
+    /// Normalize only accepted replacements, never read snapshots or CAS tokens.
+    pub fn normalize(&mut self) -> Result<(), PolicyError> {
+        self.validate()?;
+        self.split_dns
+            .normalize_suffixes()
+            .map_err(|_| PolicyError::SplitDns(split_dns::SplitDnsPolicyError::InvalidDomain))?;
+        self.deduplicate();
+        Ok(())
+    }
+
     pub fn matching_rules(&self, destination: IpAddr) -> impl Iterator<Item = &LocalBypassRule> {
         self.rules.iter().filter(move |rule| {
             self.enabled && rule.enabled && rule.cidrs.iter().any(|cidr| cidr.contains(destination))
@@ -273,7 +296,7 @@ impl LocalNetworkAccess {
     /// Capture destinations, not delivery grants. Conditions never affect routes.
     /// Keep overlapping prefixes intact: widening or merging changes policy.
     pub fn announced_routes(&self) -> Vec<LocalCidr> {
-        if !self.enabled || self.validate().is_err() {
+        if !self.enabled || self.validate_local_rules().is_err() {
             return vec![];
         }
         let mut routes: Vec<_> = self
@@ -305,6 +328,7 @@ mod tests {
         LocalNetworkAccess {
             enabled: true,
             skip_local_rules_for_excluded_apps: true,
+            split_dns: Default::default(),
             rules: vec![LocalBypassRule {
                 id: Uuid::nil(),
                 name: "test-rule".into(),
@@ -519,6 +543,8 @@ mod tests {
         assert!(policy.skip_local_rules_for_excluded_apps);
         let mut canonical = value;
         canonical["skip_local_rules_for_excluded_apps"] = true.into();
+        canonical["split_dns"] =
+            serde_json::to_value(split_dns::SplitDnsPolicy::default()).unwrap();
         assert_eq!(serde_json::to_value(policy).unwrap(), canonical);
     }
 
@@ -580,6 +606,66 @@ mod tests {
                 .local_network_access
                 .skip_local_rules_for_excluded_apps
         );
+    }
+
+    #[test]
+    fn split_dns_legacy_defaults_and_invalid_drafts_preserve_exact_local_policy() {
+        let legacy: LocalNetworkAccess =
+            serde_json::from_str(r#"{"enabled":true,"rules":[]}"#).unwrap();
+        assert_eq!(legacy.split_dns, split_dns::SplitDnsPolicy::default());
+        assert!(legacy.skip_local_rules_for_excluded_apps);
+        let mut configured = policy();
+        let routes = configured.announced_routes();
+        let local_rule = configured.rules[0].clone();
+        configured.skip_local_rules_for_excluded_apps = false;
+        configured.split_dns = split_dns::SplitDnsPolicy {
+            enabled: true,
+            suffixes: vec!["*.secret.home".into(), "*.secret.home".into()],
+            home_resolver: Some("192.168.240.10".parse().unwrap()),
+            local_rule_id: Some(local_rule.id),
+        };
+        assert!(configured.validate().is_err());
+        assert_eq!(configured.validate_local_rules(), Ok(()));
+        assert_eq!(configured.announced_routes(), routes);
+        assert_eq!(configured.rules, vec![local_rule]);
+        let snapshot = configured.clone();
+        assert!(configured.normalize().is_err());
+        assert_eq!(configured, snapshot);
+        let read: LocalNetworkAccess =
+            serde_json::from_slice(&serde_json::to_vec(&configured).unwrap()).unwrap();
+        assert_eq!(read, configured);
+        let diagnostic = format!("{read:?} {:?}", read.split_dns);
+        assert!(!diagnostic.contains("secret") && !diagnostic.contains("192.168"));
+    }
+
+    #[test]
+    fn split_dns_replacement_normalizes_only_suffixes_and_keeps_independent_local_fields() {
+        let mut configured = policy();
+        configured.skip_local_rules_for_excluded_apps = false;
+        configured.split_dns = split_dns::SplitDnsPolicy {
+            enabled: true,
+            suffixes: vec![".HOME.".into(), "home".into(), "nas.home".into()],
+            home_resolver: Some("192.168.240.10".parse().unwrap()),
+            local_rule_id: Some(configured.rules[0].id),
+        };
+        let before = configured.clone();
+        configured.normalize().unwrap();
+        assert_eq!(configured.split_dns.suffixes, ["home.", "nas.home."]);
+        assert_eq!(configured.rules, before.rules);
+        assert_eq!(configured.enabled, before.enabled);
+        assert!(!configured.skip_local_rules_for_excluded_apps);
+        assert_eq!(
+            configured.split_dns.home_resolver,
+            before.split_dns.home_resolver
+        );
+        assert_eq!(
+            configured.split_dns.local_rule_id,
+            before.split_dns.local_rule_id
+        );
+        configured.enabled = false;
+        configured.rules[0].enabled = false;
+        configured.validate().unwrap();
+        assert!(!configured.enabled && !configured.rules[0].enabled);
     }
 
     #[test]

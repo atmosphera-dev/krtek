@@ -641,6 +641,7 @@ mod tests {
         LocalNetworkAccess {
             enabled: true,
             skip_local_rules_for_excluded_apps: true,
+            split_dns: Default::default(),
             rules: vec![LocalBypassRule {
                 id: "00000000-0000-0000-0000-000000000000".parse().unwrap(),
                 name: String::new(),

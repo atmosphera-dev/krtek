@@ -3,9 +3,12 @@ package net.mullvad.mullvadvpn.lib.grpc.mapper
 import java.util.UUID
 import mullvad_daemon.management_interface.LocalBypassRule
 import mullvad_daemon.management_interface.LocalNetworkAccess
+import mullvad_daemon.management_interface.SplitDnsPolicy as WireSplitDnsPolicy
+import net.mullvad.mullvadvpn.lib.model.HomeDnsResolver
 import net.mullvad.mullvadvpn.lib.model.LocalBypassRule as ModelLocalBypassRule
 import net.mullvad.mullvadvpn.lib.model.LocalCidr
 import net.mullvad.mullvadvpn.lib.model.LocalNetworkAccess as ModelLocalNetworkAccess
+import net.mullvad.mullvadvpn.lib.model.SplitDnsPolicy
 import net.mullvad.mullvadvpn.lib.model.SsidIdentity
 import okio.ByteString.Companion.toByteString
 
@@ -14,10 +17,31 @@ internal fun LocalNetworkAccess.toDomain(): ModelLocalNetworkAccess {
     // Only mutation serialization validates and normalizes policy.
     return ModelLocalNetworkAccess(
         enabled = enabled,
-        rules = rules.map { it.toDomain() },
+        rules = rules.map(LocalBypassRule::toDomain),
         skipLocalRulesForExcludedApps = skip_local_rules_for_excluded_apps ?: true,
+        splitDns = split_dns?.toSplitDnsPolicy() ?: SplitDnsPolicy(),
     )
 }
+
+private fun WireSplitDnsPolicy.toSplitDnsPolicy(): SplitDnsPolicy =
+    SplitDnsPolicy(
+        enabled = enabled,
+        suffixes = suffixes,
+        homeResolver =
+            home_resolver?.let {
+                HomeDnsResolver.parse(it)
+                    ?: throw IllegalArgumentException("Invalid Home resolver address")
+            },
+        localRuleId = local_rule_id?.let(::localRuleId),
+    )
+
+private fun SplitDnsPolicy.toWireSplitDnsPolicy(): WireSplitDnsPolicy =
+    WireSplitDnsPolicy(
+        enabled = enabled,
+        suffixes = suffixes,
+        home_resolver = homeResolver?.numericAddress,
+        local_rule_id = localRuleId?.toString(),
+    )
 
 private fun LocalBypassRule.toDomain(): ModelLocalBypassRule {
     return ModelLocalBypassRule(
@@ -59,6 +83,7 @@ internal fun ModelLocalNetworkAccess.asExpected(): LocalNetworkAccess {
     return LocalNetworkAccess(
         enabled = enabled,
         skip_local_rules_for_excluded_apps = skipLocalRulesForExcludedApps,
+        split_dns = splitDns.takeUnless { it == SplitDnsPolicy() }?.toWireSplitDnsPolicy(),
         rules =
             rules.map { rule ->
                 LocalBypassRule(

@@ -354,7 +354,7 @@ pub fn evaluate(
     destination: IpAddr,
 ) -> Result<NetworkLease, DeliveryRefusal> {
     use DeliveryRefusal::*;
-    if !policy.enabled || policy.validate().is_err() {
+    if !policy.enabled || policy.validate_local_rules().is_err() {
         return Err(PolicyOff);
     }
     if !unicast(destination) {
@@ -540,6 +540,7 @@ mod tests {
         LocalNetworkAccess {
             enabled: true,
             skip_local_rules_for_excluded_apps: true,
+            split_dns: Default::default(),
             rules: vec![LocalBypassRule {
                 id: Uuid::from_u128(1),
                 name: "synthetic-rule".into(),
@@ -625,6 +626,29 @@ mod tests {
         assert_eq!(lease.rule_ids, vec![Uuid::from_u128(1)]);
         assert!(!lease.needs_wifi_name);
         assert_eq!(lease.sequence, 71);
+    }
+
+    #[test]
+    fn split_dns_invalid_draft_does_not_disable_existing_local_network_eligibility() {
+        let mut configured = policy(true);
+        let observed = observation();
+        let original = result(&configured, &observed, "10.0.2.2").unwrap();
+        configured.split_dns.enabled = true;
+        configured.split_dns.suffixes = vec!["*.home".into()];
+        assert!(configured.validate().is_err());
+        assert_eq!(configured.validate_local_rules(), Ok(()));
+        assert_eq!(result(&configured, &observed, "10.0.2.2"), Ok(original));
+        configured.rules[0].ssid_ids =
+            vec![SsidIdentity::from_bytes(b"other-network".to_vec()).unwrap()];
+        assert_eq!(
+            result(&configured, &observed, "10.0.2.2"),
+            Err(DeliveryRefusal::DifferentWifi)
+        );
+        configured.enabled = false;
+        assert_eq!(
+            result(&configured, &observed, "10.0.2.2"),
+            Err(DeliveryRefusal::PolicyOff)
+        );
     }
 
     #[test]

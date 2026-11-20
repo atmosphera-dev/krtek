@@ -1969,10 +1969,12 @@ async fn continuation_leaves_off_status_for_the_daemon_notification_boundary() {
             enabled: true,
             rules: vec![],
             skip_local_rules_for_excluded_apps: true,
+            split_dns: Default::default(),
         },
         LocalNetworkAccess {
             enabled: true,
             skip_local_rules_for_excluded_apps: true,
+            split_dns: Default::default(),
             rules: policy()
                 .rules
                 .into_iter()

@@ -62,6 +62,7 @@ fn policy() -> LocalNetworkAccess {
     LocalNetworkAccess {
         enabled: true,
         skip_local_rules_for_excluded_apps: true,
+        split_dns: Default::default(),
         rules: vec![LocalBypassRule {
             id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
             name: "synthetic".into(),
@@ -853,6 +854,35 @@ fn authority_triages_without_preparing_and_refuses_wrong_sources_and_missing_obs
     authority.update(&configured, Some(observation()));
     assert_eq!(
         authority.disposition(request.destination.ip()),
+        Disposition::Drop
+    );
+}
+
+#[test]
+fn split_dns_invalid_draft_cannot_disable_or_authorize_unrelated_local_delivery() {
+    let authority = authority();
+    authority.update(&policy(), Some(observation()));
+    let grant = authority.authorize(flow(Transport::Udp, 40001)).unwrap();
+    let mut configured = policy();
+    configured.split_dns.enabled = true;
+    configured.split_dns.suffixes = vec!["*.home".into()];
+    assert!(configured.validate().is_err());
+    authority.update(&configured, Some(observation()));
+    assert_eq!(
+        authority.disposition("10.0.2.2".parse().unwrap()),
+        Disposition::Local
+    );
+    assert!(authority.authorize(flow(Transport::Udp, 40002)).is_ok());
+    assert!(authority.current(&grant));
+    assert_eq!(
+        authority.disposition("1.1.1.1".parse().unwrap()),
+        Disposition::Drop
+    );
+    configured.enabled = false;
+    authority.update(&configured, Some(observation()));
+    assert!(!authority.current(&grant));
+    assert_eq!(
+        authority.disposition("10.0.2.2".parse().unwrap()),
         Disposition::Drop
     );
 }
