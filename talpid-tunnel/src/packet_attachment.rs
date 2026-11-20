@@ -1187,6 +1187,10 @@ impl PendingCaptureRequest {
 }
 
 impl ConfigurationRequest {
+    /// Opaque request identity for observations; it carries no authority.
+    pub fn id(&self) -> u64 {
+        self.request.id
+    }
     /// Borrow this operation's cancellation identity, never a later selection.
     pub fn cleanup(&self) -> TransportCleanup {
         TransportCleanup {

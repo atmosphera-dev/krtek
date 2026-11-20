@@ -364,9 +364,18 @@ cargo {
         }
     targetDirectory = "$repoRootPath/target"
     features {
+        val publicDnsDiagnostics =
+            providers
+                .gradleProperty("krtek.publicDnsDiagnostics")
+                .getOrElse("false")
+                .toBooleanStrict()
         val enabledFeatures = buildList {
             if (enableApiOverride) {
                 add("api-override")
+            }
+            // Explicit diagnostic APK only; absent from the normal build.
+            if (publicDnsDiagnostics) {
+                add("public-dns-diagnostics")
             }
         }
             .toTypedArray()
