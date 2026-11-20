@@ -44,6 +44,39 @@ def append(ledger, row):
     os.fsync(ledger.fileno())
 
 
+class TcpLedger:
+    """Commit every TCP service's complete observations with one durable flush.
+
+    Per-nonce fsync inside TcpPeer's frame loop delays the next echo by the
+    number of frames in a burst. UDP keeps its existing per-event append path.
+    A failed commit is terminal: replaying a possibly written batch duplicates
+    evidence and cannot establish a receive watermark.
+    """
+    def __init__(self, ledger):
+        self.ledger = ledger
+        self.pending = []
+        self.failure = None
+
+    def append(self, row):
+        if self.failure is not None:
+            raise self.failure
+        self.pending.append(row)
+
+    def flush(self):
+        if self.failure is not None:
+            raise self.failure
+        if not self.pending:
+            return
+        try:
+            self.ledger.write("".join(json.dumps(row, sort_keys=True) + "\n" for row in self.pending))
+            self.ledger.flush()
+            os.fsync(self.ledger.fileno())
+        except OSError as error:
+            self.failure = error
+            raise
+        self.pending.clear()
+
+
 def bind_dual(ipv4, ipv6, port):
     """Allocate and retain both families before publishing the selected port."""
     deadline = time.monotonic() + 5
@@ -71,8 +104,14 @@ def serve(ipv4, ipv6, port, ledger_path, ready_path, duration, max_requests=0, r
             for sock in sockets:
                 sock.setblocking(False)
                 selector.register(sock, selectors.EVENT_READ, "udp")
-            tcp = TcpPeer(selector, lambda row: append(ledger, row))
-            cleanup.callback(tcp.finish)
+            tcp_ledger = TcpLedger(ledger)
+            tcp = TcpPeer(selector, tcp_ledger.append)
+            def finish_tcp():
+                try:
+                    return tcp.finish()
+                finally:
+                    tcp_ledger.flush()
+            cleanup.callback(finish_tcp)
             if tcp_port is not None:
                 tcp_port = tcp.listen(ipv4, ipv6, tcp_port)
             ready = {"schema": 1, "pid": os.getpid(), "port": port,
@@ -117,7 +156,10 @@ def serve(ipv4, ipv6, port, ledger_path, ready_path, duration, max_requests=0, r
                 for key, mask in events:
                     sock = key.fileobj
                     if key.data != "udp":
-                        tcp.service(sock, key.data[1], mask)
+                        try:
+                            tcp.service(sock, key.data[1], mask)
+                        finally:
+                            tcp_ledger.flush()
                         continue
                     data, ancillary, flags, source = sock.recvmsg(65535, 256)
                     if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
@@ -166,7 +208,7 @@ def serve(ipv4, ipv6, port, ledger_path, ready_path, duration, max_requests=0, r
                                     "size": sent, "sent_monotonic_ns": time.monotonic_ns()})
                     if not finish_path and max_requests and count >= max_requests:
                         break
-            tcp_summary = tcp.finish()
+            tcp_summary = finish_tcp()
             append(ledger, {"schema": 1, "event": "stopped", "requests": count,
                              "pid": ready["pid"], "boot_id": ready["boot_id"],
                              "coverage_complete": coverage_complete and not tcp_summary["tcp_errors"],

@@ -17,6 +17,7 @@ import unittest
 from unittest import mock
 
 from local_tcp_peer import Connection, TcpPeer
+from local_udp_peer import TcpLedger, append
 
 
 @contextmanager
@@ -214,6 +215,52 @@ class LocalTcpPeerTest(unittest.TestCase):
         self.assertEqual("write", rows[-2]["operation"])
         self.assertFalse(rows[-1]["complete"])
         self.assertEqual(1, peer.errors)
+
+    def test_burst_observations_commit_once_per_socket_service_not_per_nonce(self):
+        frame = b"krtek-m3-01234567-89ab-cdef-0123-456789abcdef"
+        data = frame * 40
+        peer, connection, _ = self.fixture(pending=b"", eof=False)
+        connection.socket.recv.return_value = data
+        connection.socket.send.return_value = len(data)
+        with tempfile.TemporaryFile(mode="w+") as output, mock.patch("local_udp_peer.os.fsync") as sync:
+            journal = TcpLedger(output)
+            peer.emit = journal.append
+            peer.service(connection.socket, connection, selectors.EVENT_READ)
+            self.assertEqual(0, sync.call_count)
+            self.assertEqual(41, len(journal.pending))
+            journal.flush()
+            self.assertEqual(1, sync.call_count)
+            peer.service(connection.socket, connection, selectors.EVENT_WRITE)
+            journal.flush()
+            self.assertEqual(2, sync.call_count)
+            output.seek(0)
+            rows = [json.loads(line) for line in output]
+        for event in ("tcp_frame_request", "tcp_frame_echo"):
+            selected = [row for row in rows if row["event"] == event]
+            self.assertEqual(list(range(0, len(data), len(frame))), [row["offset"] for row in selected])
+            self.assertEqual(data, b"".join(bytes.fromhex(row["payload_hex"]) for row in selected))
+
+    def test_failed_tcp_ledger_commit_is_not_replayed_or_reported_durable(self):
+        output = mock.Mock()
+        journal = TcpLedger(output)
+        journal.append(dict(event="tcp_request", size=45))
+        with mock.patch("local_udp_peer.os.fsync", side_effect=OSError(errno.EIO, "fixture")):
+            with self.assertRaises(OSError):
+                journal.flush()
+            with self.assertRaises(OSError):
+                journal.flush()
+            with self.assertRaises(OSError):
+                journal.append(dict(event="tcp_echo", size=45))
+        self.assertEqual(1, output.write.call_count)
+        self.assertEqual(1, len(journal.pending))
+
+    def test_udp_single_event_durability_is_unchanged(self):
+        output = mock.Mock()
+        with mock.patch("local_udp_peer.os.fsync") as sync:
+            append(output, dict(event="udp_request", size=45))
+        self.assertEqual(1, output.write.call_count)
+        self.assertEqual(1, output.flush.call_count)
+        sync.assert_called_once_with(output.fileno())
 
 
 if __name__ == "__main__":
