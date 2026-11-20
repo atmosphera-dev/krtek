@@ -167,6 +167,18 @@ class LocalNetworkAccessTest {
     }
 
     @Test
+    fun `should default excluded apps preference on and keep it through policy copies`() {
+        val original = LocalNetworkAccess(true, listOf(rule()))
+        assertEquals(true, original.skipLocalRulesForExcludedApps)
+        val off = original.copy(skipLocalRulesForExcludedApps = false)
+        assertFalse(off.skipLocalRulesForExcludedApps)
+        assertFalse(off.copy(enabled = false).skipLocalRulesForExcludedApps)
+        assertFalse(off.copy(rules = emptyList()).skipLocalRulesForExcludedApps)
+        assertFalse(original == off)
+        assertEquals(original.validationError(), off.validationError())
+    }
+
+    @Test
     fun `should reject ambiguous rules without leaking policy contents`() {
         val rule = rule()
         assertEquals(

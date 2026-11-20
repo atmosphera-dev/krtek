@@ -1039,6 +1039,8 @@ public final class LocalNetworkConsumerService extends Service {
       report.begin("connect");
       socket.connect(address, port);
       report.connectedAt = SystemClock.elapsedRealtimeNanos();
+      SocketReport.put(report.root, "local_port", socket.getLocalPort());
+      SocketReport.put(report.root, "local_address", socket.getLocalAddress().getHostAddress());
       report.ok(0);
       report.begin("write");
       socket.send(new DatagramPacket(payload, payload.length));

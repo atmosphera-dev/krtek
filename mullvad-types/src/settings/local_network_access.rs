@@ -151,11 +151,28 @@ impl<'de> Deserialize<'de> for SsidIdentity {
     }
 }
 
-#[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct LocalNetworkAccess {
     pub enabled: bool,
     pub rules: Vec<LocalBypassRule>,
+    /// Only Partial capture may include apps excluded from Mullvad.
+    #[serde(default = "default_skip_local_rules_for_excluded_apps")]
+    pub skip_local_rules_for_excluded_apps: bool,
+}
+
+fn default_skip_local_rules_for_excluded_apps() -> bool {
+    true
+}
+
+impl Default for LocalNetworkAccess {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rules: vec![],
+            skip_local_rules_for_excluded_apps: default_skip_local_rules_for_excluded_apps(),
+        }
+    }
 }
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -287,6 +304,7 @@ mod tests {
     fn policy() -> LocalNetworkAccess {
         LocalNetworkAccess {
             enabled: true,
+            skip_local_rules_for_excluded_apps: true,
             rules: vec![LocalBypassRule {
                 id: Uuid::nil(),
                 name: "test-rule".into(),
@@ -498,7 +516,10 @@ mod tests {
         let policy: LocalNetworkAccess = serde_json::from_value(value.clone()).unwrap();
         policy.validate().unwrap();
         assert_eq!(policy.rules[0].ssid_ids[0].bytes(), &[0, 255, 65, 32]);
-        assert_eq!(serde_json::to_value(policy).unwrap(), value);
+        assert!(policy.skip_local_rules_for_excluded_apps);
+        let mut canonical = value;
+        canonical["skip_local_rules_for_excluded_apps"] = true.into();
+        assert_eq!(serde_json::to_value(policy).unwrap(), canonical);
     }
 
     #[test]
@@ -507,6 +528,7 @@ mod tests {
         assert_eq!(empty, LocalNetworkAccess::default());
         assert!(!empty.enabled);
         assert!(empty.rules.is_empty());
+        assert!(empty.skip_local_rules_for_excluded_apps);
         let mut value = serde_json::to_value(policy()).unwrap();
         value["rules"][0]
             .as_object_mut()
@@ -514,6 +536,50 @@ mod tests {
             .remove("ssid_ids");
         let without_condition: LocalNetworkAccess = serde_json::from_value(value).unwrap();
         assert!(without_condition.rules[0].ssid_ids.is_empty());
+    }
+
+    #[test]
+    fn excluded_apps_preference_defaults_on_and_round_trips_both_values() {
+        let old = serde_json::to_value(policy()).unwrap();
+        let mut absent = old.clone();
+        absent
+            .as_object_mut()
+            .unwrap()
+            .remove("skip_local_rules_for_excluded_apps");
+        assert_eq!(
+            serde_json::from_value::<LocalNetworkAccess>(absent).unwrap(),
+            policy()
+        );
+        for skip in [false, true] {
+            let mut configured = policy();
+            configured.skip_local_rules_for_excluded_apps = skip;
+            let bytes = serde_json::to_vec(&configured).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<LocalNetworkAccess>(&bytes).unwrap(),
+                configured
+            );
+            assert_eq!(configured.announced_routes(), policy().announced_routes());
+            assert_eq!(
+                configured
+                    .matching_rules("192.168.240.10".parse().unwrap())
+                    .count(),
+                1
+            );
+            configured.deduplicate();
+            assert_eq!(configured.skip_local_rules_for_excluded_apps, skip);
+        }
+        for invalid in [serde_json::Value::Null, "false".into(), 0.into()] {
+            let mut malformed = old.clone();
+            malformed["skip_local_rules_for_excluded_apps"] = invalid;
+            assert!(serde_json::from_value::<LocalNetworkAccess>(malformed).is_err());
+        }
+        let settings: super::super::Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.local_network_access, LocalNetworkAccess::default());
+        assert!(
+            settings
+                .local_network_access
+                .skip_local_rules_for_excluded_apps
+        );
     }
 
     #[test]

@@ -574,6 +574,8 @@ message LocalBypassRule {
 message LocalNetworkAccess {
   bool enabled = 1;
   repeated LocalBypassRule rules = 2;
+  // Absent in older clients/settings means true. Explicit false is retained.
+  optional bool skip_local_rules_for_excluded_apps = 3;
 }
 
 message LocalNetworkPolicyUpdate {

@@ -1787,132 +1787,178 @@ async fn reconnect_from_unsecured_error_and_failed_close_is_not_latched() {
 
 #[tokio::test]
 async fn exclusion_change_establishes_one_effective_capture() {
-    for settings_first in [false, true] {
-        let mut h = Handover::new(policy());
-        h.runtime.set_excluded_packages(vec![]);
-        h.continuation.connect();
-        assert_eq!(h.admit().await, Some("Connect"));
-        h.connect_endpoint().await;
-        let broker = h.runtime.broker();
-        let session = broker.snapshot().session_generation;
-        let authority = h.platform.authority.lock().unwrap().clone().unwrap();
-        let grant = authority.authorize(flow(Transport::Udp, 45996)).unwrap();
-        let old = h.transport.take().unwrap();
-        let old_request = h.request.take().unwrap();
-        let attempt = old.control.capability();
-        let mut stale = attempt
-            .packet(
-                talpid_types::relay_flow::RelayBuffer::copy_from(
-                    b"stale-exclusion",
-                    broker.application_buffers().as_ref(),
+    for skip in [false, true] {
+        for settings_first in [false, true] {
+            let mut configured = policy();
+            configured.skip_local_rules_for_excluded_apps = skip;
+            let mut h = Handover::new(configured);
+            h.runtime.set_excluded_packages(vec![]);
+            h.continuation.connect();
+            assert_eq!(h.admit().await, Some("Connect"));
+            h.connect_endpoint().await;
+            let broker = h.runtime.broker();
+            let session = broker.snapshot().session_generation;
+            let authority = h.platform.authority.lock().unwrap().clone().unwrap();
+            let grant = authority.authorize(flow(Transport::Udp, 45996)).unwrap();
+            let old = h.transport.take().unwrap();
+            let old_request = h.request.take().unwrap();
+            let attempt = old.control.capability();
+            let mut stale = attempt
+                .packet(
+                    talpid_types::relay_flow::RelayBuffer::copy_from(
+                        b"stale-exclusion",
+                        broker.application_buffers().as_ref(),
+                    )
+                    .unwrap(),
                 )
-                .unwrap(),
-            )
-            .unwrap();
-        let before = h.platform.starts.load(SeqCst);
+                .unwrap();
+            let before = h.platform.starts.load(SeqCst);
+            let packages = vec![
+                "missing.package".to_owned(),
+                "later.installed.package".to_owned(),
+            ];
+            if settings_first {
+                h.runtime.set_excluded_packages(packages.clone());
+                h.runtime.update(&h.policy, h.target, h.phase).await;
+            }
+            h.observe(TunnelPhase::Disconnecting);
+            old.control.detach();
+            drop(old);
+            old_request.transport_joined();
+            h.observe(TunnelPhase::Connecting);
+            h.runtime.update(&h.policy, h.target, h.phase).await;
+            let mut config = assigned_config();
+            config.excluded_packages = packages.clone();
+            h.connect_endpoint_with(config.clone()).await;
+            // The TSM can configure its new request before the asynchronous settings
+            // acknowledgement reaches the daemon. Old persisted app coverage must
+            // not independently hand that new capture back to the old projection.
+            if !settings_first {
+                h.runtime.set_excluded_packages(packages.clone());
+                h.runtime.update(&h.policy, h.target, h.phase).await;
+                h.settle_capture().await;
+            }
+            assert_eq!(
+                h.platform.starts.load(SeqCst),
+                before + 1,
+                "one effective coverage change"
+            );
+            assert_eq!(
+                h.platform
+                    .opened
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .excluded_packages,
+                packages
+            );
+            assert_eq!(broker.snapshot().session_generation, session);
+            assert!(matches!(
+                stale.write(|_| panic!("stale writer")),
+                talpid_types::relay_flow::RelayWriteOutcome::Stale
+            ));
+            drop(old_request);
+            let generation = broker.snapshot().capture_generation;
+            config.excluded_packages.reverse();
+            config.excluded_packages.push("missing.package".to_owned());
+            h.runtime
+                .set_excluded_packages(config.excluded_packages.clone());
+            let request = h.request.take().unwrap();
+            h.transport.take();
+            request.transport_joined();
+            h.observe(TunnelPhase::Disconnecting);
+            h.observe(TunnelPhase::Connecting);
+            h.connect_endpoint_with(config).await;
+            assert_eq!(
+                h.platform.starts.load(SeqCst),
+                before + 1,
+                "equivalent coverage must reuse capture"
+            );
+            assert_eq!(broker.snapshot().capture_generation, generation);
+            assert_eq!(broker.snapshot().session_generation, session);
+            drop(request);
+            assert!(authority.current(&grant));
+            h.user_disconnect();
+            h.observe(TunnelPhase::Disconnecting);
+            h.acknowledge_transport_close();
+            h.advance().await.unwrap();
+            h.settle_capture().await;
+            assert_eq!(
+                h.platform
+                    .application_coverage
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap(),
+                &if skip {
+                    vec![
+                        "later.installed.package".to_owned(),
+                        "missing.package".to_owned(),
+                        "missing.package".to_owned(),
+                    ]
+                } else {
+                    vec![]
+                },
+                "Partial alone projects the excluded-app preference"
+            );
+            assert_eq!(broker.snapshot().session_generation, session);
+            h.close().await;
+        }
+        let mut configured = policy();
+        configured.skip_local_rules_for_excluded_apps = skip;
+        let mut h = Handover::new(configured);
         let packages = vec![
             "missing.package".to_owned(),
             "later.installed.package".to_owned(),
         ];
-        if settings_first {
-            h.runtime.set_excluded_packages(packages.clone());
-            h.runtime.update(&h.policy, h.target, h.phase).await;
-        }
-        h.observe(TunnelPhase::Disconnecting);
-        old.control.detach();
-        drop(old);
-        old_request.transport_joined();
-        h.observe(TunnelPhase::Connecting);
+        h.runtime.set_excluded_packages(packages.clone());
+        h.enter_blocking_error_with(packages.clone()).await;
         h.runtime.update(&h.policy, h.target, h.phase).await;
-        let mut config = assigned_config();
-        config.excluded_packages = packages.clone();
-        h.connect_endpoint_with(config.clone()).await;
-        // The TSM can configure its new request before the asynchronous settings
-        // acknowledgement reaches the daemon. Old persisted app coverage must
-        // not independently hand that new capture back to the old projection.
-        if !settings_first {
-            h.runtime.set_excluded_packages(packages.clone());
-            h.runtime.update(&h.policy, h.target, h.phase).await;
-            h.settle_capture().await;
-        }
-        assert_eq!(
-            h.platform.starts.load(SeqCst),
-            before + 1,
-            "one effective coverage change"
-        );
-        assert_eq!(
-            h.platform
-                .opened
-                .lock()
-                .unwrap()
-                .last()
-                .unwrap()
-                .excluded_packages,
-            packages
-        );
-        assert_eq!(broker.snapshot().session_generation, session);
-        assert!(matches!(
-            stale.write(|_| panic!("stale writer")),
-            talpid_types::relay_flow::RelayWriteOutcome::Stale
-        ));
-        drop(old_request);
-        let generation = broker.snapshot().capture_generation;
-        config.excluded_packages.reverse();
-        config.excluded_packages.push("missing.package".to_owned());
-        h.runtime
-            .set_excluded_packages(config.excluded_packages.clone());
-        let request = h.request.take().unwrap();
-        h.transport.take();
-        request.transport_joined();
-        h.observe(TunnelPhase::Disconnecting);
-        h.observe(TunnelPhase::Connecting);
-        h.connect_endpoint_with(config).await;
-        assert_eq!(
-            h.platform.starts.load(SeqCst),
-            before + 1,
-            "equivalent coverage must reuse capture"
-        );
-        assert_eq!(broker.snapshot().capture_generation, generation);
-        assert_eq!(broker.snapshot().session_generation, session);
-        drop(request);
-        assert!(authority.current(&grant));
-        h.user_disconnect();
-        h.observe(TunnelPhase::Disconnecting);
-        h.acknowledge_transport_close();
-        h.advance().await.unwrap();
         h.settle_capture().await;
         assert_eq!(
-            h.platform
-                .application_coverage
-                .lock()
-                .unwrap()
-                .last()
-                .unwrap(),
-            &vec![
-                "later.installed.package".to_owned(),
-                "missing.package".to_owned(),
-                "missing.package".to_owned()
-            ],
-            "Partial uses the stored current exclusions, including missing names"
+            h.platform.application_coverage.lock().unwrap().last(),
+            Some(&packages),
+            "Error before any target uses current exclusions"
         );
-        assert_eq!(broker.snapshot().session_generation, session);
         h.close().await;
     }
-    let mut h = Handover::new(policy());
-    let packages = vec![
-        "missing.package".to_owned(),
-        "later.installed.package".to_owned(),
-    ];
-    h.runtime.set_excluded_packages(packages.clone());
-    h.enter_blocking_error_with(packages.clone()).await;
-    h.runtime.update(&h.policy, h.target, h.phase).await;
-    h.settle_capture().await;
-    assert_eq!(
-        h.platform.application_coverage.lock().unwrap().last(),
-        Some(&packages),
-        "Error before any target uses current exclusions"
-    );
-    h.close().await;
+}
+
+#[tokio::test]
+async fn excluded_apps_flag_only_full_and_error_updates_do_not_establish_or_reconnect() {
+    for error in [false, true] {
+        let mut h = Handover::new(policy());
+        let packages = vec!["com.android.deskclock".to_owned()];
+        h.runtime.set_excluded_packages(packages.clone());
+        if error {
+            h.enter_blocking_error_with(packages.clone()).await;
+        } else {
+            h.continuation.connect();
+            assert_eq!(h.admit().await, Some("Connect"));
+            let mut config = assigned_config();
+            config.excluded_packages = packages.clone();
+            h.connect_endpoint_with(config).await;
+        }
+        h.settle_capture().await;
+        let broker = h.runtime.broker();
+        let generation = broker.snapshot().capture_generation;
+        let starts = h.platform.starts.load(SeqCst);
+        let commands = h.commands.clone();
+        for skip in [false, true] {
+            h.policy.skip_local_rules_for_excluded_apps = skip;
+            h.runtime.update(&h.policy, h.target, h.phase).await;
+            h.settle_capture().await;
+            assert_eq!(h.platform.starts.load(SeqCst), starts);
+            assert_eq!(broker.snapshot().capture_generation, generation);
+            assert_eq!(h.commands, commands);
+            assert_eq!(
+                h.platform.application_coverage.lock().unwrap().last(),
+                Some(&packages)
+            );
+        }
+        h.close().await;
+    }
 }
 
 #[tokio::test]
@@ -1922,9 +1968,11 @@ async fn continuation_leaves_off_status_for_the_daemon_notification_boundary() {
         LocalNetworkAccess {
             enabled: true,
             rules: vec![],
+            skip_local_rules_for_excluded_apps: true,
         },
         LocalNetworkAccess {
             enabled: true,
+            skip_local_rules_for_excluded_apps: true,
             rules: policy()
                 .rules
                 .into_iter()

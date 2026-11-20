@@ -314,7 +314,11 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
             (!routes.is_empty()).then_some(DeliveryConfig::Partial(
                 talpid_tunnel::tun_provider::PartialConfig {
                     routes,
-                    excluded_packages: self.excluded_packages.clone().unwrap_or_default(),
+                    excluded_packages: if policy.skip_local_rules_for_excluded_apps {
+                        self.excluded_packages.clone().unwrap_or_default()
+                    } else {
+                        vec![]
+                    },
                 },
             ))
         };
@@ -636,6 +640,7 @@ mod tests {
     fn policy() -> LocalNetworkAccess {
         LocalNetworkAccess {
             enabled: true,
+            skip_local_rules_for_excluded_apps: true,
             rules: vec![LocalBypassRule {
                 id: "00000000-0000-0000-0000-000000000000".parse().unwrap(),
                 name: String::new(),

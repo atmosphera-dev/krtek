@@ -109,7 +109,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         report("continuity_intent", JSONObject().put("kind", kind).put("time_ns", time))
     }
 
-    private fun report(key: String, value: Any) {
+    internal fun report(key: String, value: Any) {
         instrumentation.sendStatus(0, Bundle().apply { putString("krtek_$key", value.toString()) })
     }
 
@@ -137,7 +137,7 @@ class LocalNetworkDeliveryInstrumentedTest {
             (delimitedField(line, "flags=[", ']')?.trim() ?: "")
     }
 
-    private fun withConsumer(
+    internal fun withConsumer(
         expectation: ForwardingAvailability?,
         testTimeout: Duration = 1.minutes,
         after: (LocalNetworkEditorInstrumentedTest) -> Unit = {},
@@ -236,7 +236,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         }
     }
 
-    private fun awaitState(
+    internal fun awaitState(
         repository: SettingsRepository,
         connection: ConnectionProxy,
         forwarding: ForwardingAvailability,
@@ -1148,7 +1148,7 @@ class LocalNetworkDeliveryInstrumentedTest {
             }
         }
 
-    private fun connect(connection: ConnectionProxy, reconnect: Boolean = false) = runBlocking {
+    internal fun connect(connection: ConnectionProxy, reconnect: Boolean = false) = runBlocking {
         continuityIntent(if (reconnect) "reconnect" else "connect")
         report(
             "session_intent",
@@ -1656,7 +1656,7 @@ class LocalNetworkDeliveryInstrumentedTest {
     /**
      * Selects an owned empty custom list (NoMatchingRelay), then restores the exact relay proto.
      */
-    private suspend fun <T> withEmptyRelayList(
+    internal suspend fun <T> withEmptyRelayList(
         repository: SettingsRepository,
         block: suspend () -> T,
     ): T {
@@ -2189,7 +2189,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         }
     }
 
-    private fun peerPolicy(
+    internal fun peerPolicy(
         enabled: Boolean = true,
         ruleEnabled: Boolean = true,
         cidr: String = "$peer/32",
@@ -2206,6 +2206,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                     wifi,
                 )
             ),
+            skipLocalRulesForExcludedApps = true,
         )
 
     private fun withPolicy(
@@ -2821,7 +2822,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         }
     }
 
-    private fun setPolicy(repository: SettingsRepository, policy: LocalNetworkAccess) =
+    internal fun setPolicy(repository: SettingsRepository, policy: LocalNetworkAccess) =
         runBlocking {
             val current = checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
             assertTrue(repository.setLocalNetworkAccess(policy, current).isRight())
@@ -2837,7 +2838,7 @@ class LocalNetworkDeliveryInstrumentedTest {
             }
         }
 
-    private fun disconnect(connection: ConnectionProxy) = runBlocking {
+    internal fun disconnect(connection: ConnectionProxy) = runBlocking {
         continuityIntent("disconnect")
         assertTrue(
             connection.disconnect(DisconnectReason.USER_INITIATED_DISCONNECT_BUTTON).isRight()
@@ -3264,7 +3265,7 @@ class LocalNetworkDeliveryInstrumentedTest {
             probeIcmp(consumer, "echo")
         }
 
-    private data class AppliedCapture(
+    internal data class AppliedCapture(
         val addresses: Set<String>,
         val routeTypes: Set<CaptureReadiness.Route>,
         val dns: String,
@@ -3293,7 +3294,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                     .toSet()
     }
 
-    private fun uidIncluded(ranges: String, uid: Int): Boolean =
+    internal fun uidIncluded(ranges: String, uid: Int): Boolean =
         ranges.split(',').any { range ->
             val bounds = range.trim().split('-').map { it.toInt() }
             uid >= bounds.first() && uid <= bounds.last()
@@ -3375,12 +3376,12 @@ class LocalNetworkDeliveryInstrumentedTest {
         if (expect == "blocked") assertEquals(0, received, "Public ICMP must remain blocked")
     }
 
-    private fun probeSocket(
+    internal fun probeSocket(
         consumer: Consumer,
         transport: String,
         expect: String,
         sessionFrame: Boolean = false,
-    ) {
+    ): Bundle {
         // Denied probes against the strict session peer must be valid frames:
         // a peer's format rejection must never masquerade as network blocking.
         val nonce =
@@ -3415,6 +3416,9 @@ class LocalNetworkDeliveryInstrumentedTest {
                     putInt("timeout_ms", 5_000)
                 }
             )
+        report("probe_index", index)
+        report("probe_consumer_uid", result.getInt("uid"))
+        report("probe_consumer_package", checkNotNull(result.getString("package")))
         report("probe_transport", checkNotNull(transport))
         report("probe_outcome", checkNotNull(result.getString("outcome")))
         result.getString("error_class")?.let { report("probe_error_class", it) }
@@ -3434,6 +3438,7 @@ class LocalNetworkDeliveryInstrumentedTest {
             )
         if (expect == "blocked")
             assertTrue(checkNotNull(result.getString("error_class")).contains('.'))
+        return result
     }
 
     private fun canonicalPrefix(text: String): String =
@@ -3456,7 +3461,7 @@ class LocalNetworkDeliveryInstrumentedTest {
     private fun tokenField(text: String, marker: String): String? =
         delimitedField(text, marker, ' ')?.takeIf { it.isNotEmpty() }
 
-    private fun appliedConfiguration(
+    internal fun appliedConfiguration(
         policy: LocalNetworkAccess,
         forwarding: ForwardingAvailability,
         expectedTunnel: String = args.getString("krtek_expect_tunnel", "Disconnected"),
@@ -3719,7 +3724,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         return receipt.generation to receipt.handle
     }
 
-    private inner class Consumer : AutoCloseable {
+    internal inner class Consumer(private val packageName: String = testPackage) : AutoCloseable {
         private val service = CompletableFuture<Messenger>()
         @Volatile private var pending: Pair<String, CompletableFuture<Bundle>>? = null
         private val reply =
@@ -3738,8 +3743,8 @@ class LocalNetworkDeliveryInstrumentedTest {
             Intent()
                 .setComponent(
                     ComponentName(
-                        instrumentation.context,
-                        LocalNetworkConsumerService::class.java,
+                        packageName,
+                        LocalNetworkConsumerService::class.java.name,
                     )
                 )
         private val connection =
@@ -3775,7 +3780,11 @@ class LocalNetworkDeliveryInstrumentedTest {
                         }
                     )
                 return result.get(35, TimeUnit.SECONDS).also {
-                    assertEquals(testPackage, it.getString("package"))
+                    assertEquals(packageName, it.getString("package"))
+                    assertEquals(
+                        target.packageManager.getApplicationInfo(packageName, 0).uid,
+                        it.getInt("uid"),
+                    )
                     assertNotEquals(Process.myUid(), it.getInt("uid"))
                     LocalNetworkConsumerService.requiredPermissions().forEach { permission ->
                         val granted = it.getBoolean("permission_$permission")
@@ -3796,7 +3805,7 @@ class LocalNetworkDeliveryInstrumentedTest {
             assertEquals("identity", result.getString("outcome"))
             assertEquals("android.app.Application", result.getString("application_class"))
             assertEquals(
-                target.packageManager.getApplicationInfo(testPackage, 0).uid,
+                target.packageManager.getApplicationInfo(packageName, 0).uid,
                 result.getInt("uid"),
             )
             assertEquals(target.applicationInfo.uid, Process.myUid())

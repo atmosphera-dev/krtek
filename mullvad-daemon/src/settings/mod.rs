@@ -839,6 +839,7 @@ mod test {
         original.allow_lan = true;
         original.local_network_access = LocalNetworkAccess {
             enabled: false,
+            skip_local_rules_for_excluded_apps: false,
             rules: vec![LocalBypassRule {
                 id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
                 name: "x".repeat(65),
@@ -931,6 +932,7 @@ mod test {
                 &LocalNetworkAccess {
                     enabled: true,
                     rules: vec![],
+                    skip_local_rules_for_excluded_apps: false,
                 },
                 target,
                 phase,
@@ -991,6 +993,7 @@ mod test {
         stored.allow_lan = true;
         stored.local_network_access = LocalNetworkAccess {
             enabled: false,
+            skip_local_rules_for_excluded_apps: false,
             rules: vec![LocalBypassRule {
                 id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
                 name: "x".repeat(65),

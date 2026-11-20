@@ -434,6 +434,7 @@ mod tests {
         wire.local_network_access = Some(mullvad_management_interface::types::LocalNetworkAccess {
             enabled: false,
             rules: vec![Default::default()],
+            skip_local_rules_for_excluded_apps: None,
         });
         let read = mullvad_management_interface::types::SettingsRead::try_from(wire).unwrap();
         assert!(local_policy_configured(&read.local_network_access));

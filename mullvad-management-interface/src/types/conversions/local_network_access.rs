@@ -8,6 +8,7 @@ impl From<&LocalNetworkAccess> for proto::LocalNetworkAccess {
     fn from(policy: &LocalNetworkAccess) -> Self {
         Self {
             enabled: policy.enabled,
+            skip_local_rules_for_excluded_apps: Some(policy.skip_local_rules_for_excluded_apps),
             rules: policy
                 .rules
                 .iter()
@@ -61,6 +62,9 @@ fn local_policy_for_update(
     }
     let policy = LocalNetworkAccess {
         enabled: policy.enabled,
+        skip_local_rules_for_excluded_apps: policy
+            .skip_local_rules_for_excluded_apps
+            .unwrap_or(true),
         rules: policy
             .rules
             .into_iter()
@@ -78,6 +82,9 @@ pub(super) fn read_local_policy(
 ) -> Result<LocalNetworkAccess, FromProtobufTypeError> {
     Ok(LocalNetworkAccess {
         enabled: policy.enabled,
+        skip_local_rules_for_excluded_apps: policy
+            .skip_local_rules_for_excluded_apps
+            .unwrap_or(true),
         rules: policy
             .rules
             .into_iter()
@@ -134,6 +141,7 @@ mod tests {
     fn policy() -> LocalNetworkAccess {
         LocalNetworkAccess {
             enabled: true,
+            skip_local_rules_for_excluded_apps: false,
             rules: vec![LocalBypassRule {
                 id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
                 name: "test rule".into(),
@@ -281,6 +289,35 @@ mod tests {
         let encoded = proto::LocalNetworkAccess::from(&original).encode_to_vec();
         let decoded = proto::LocalNetworkAccess::decode(encoded.as_slice()).unwrap();
         assert_eq!(LocalNetworkAccess::try_from(decoded).unwrap(), original);
+    }
+
+    #[test]
+    fn excluded_apps_optional_wire_defaults_and_exact_expected_are_presence_aware() {
+        for value in [None, Some(false), Some(true)] {
+            let mut wire = proto::LocalNetworkAccess::from(&policy());
+            wire.skip_local_rules_for_excluded_apps = value;
+            let decoded =
+                proto::LocalNetworkAccess::decode(wire.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(decoded.skip_local_rules_for_excluded_apps, value);
+            let mut expected = policy();
+            expected.skip_local_rules_for_excluded_apps = value.unwrap_or(true);
+            assert_eq!(read_local_policy(decoded.clone()).unwrap(), expected);
+            assert_eq!(
+                LocalNetworkAccess::try_from(decoded.clone()).unwrap(),
+                expected
+            );
+            assert_eq!(local_policy_for_compare_set(decoded).unwrap(), expected);
+            assert_eq!(
+                proto::LocalNetworkAccess::from(&expected).skip_local_rules_for_excluded_apps,
+                Some(value.unwrap_or(true))
+            );
+        }
+        let mut legacy = proto::LocalNetworkAccess::from(&policy());
+        legacy.skip_local_rules_for_excluded_apps = None;
+        assert_ne!(local_policy_for_compare_set(legacy).unwrap(), policy());
+        let legacy_empty = read_local_policy(proto::LocalNetworkAccess::default()).unwrap();
+        assert_eq!(legacy_empty, LocalNetworkAccess::default());
+        assert!(legacy_empty.skip_local_rules_for_excluded_apps);
     }
 
     #[test]
