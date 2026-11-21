@@ -82,4 +82,45 @@ class R06FailureLedgerTest {
         assertTrue(actual.suppressed.isEmpty())
         assertEquals(1, ledger.failures.size)
     }
+
+    @Test
+    fun independentRestorationContinuesAfterFailureWithoutRunningFinalProof() {
+        val original = AssertionError("include app")
+        val attempted = mutableListOf<String>()
+        val ledger = R06FailureLedger.Ledger { _, _ -> }
+        val restored =
+            ledger.attemptAll(
+                "include-app" to
+                    {
+                        attempted += "include"
+                        throw original
+                    },
+                "split-enabled" to { attempted += "split" },
+                "allow-lan" to { attempted += "lan" },
+            )
+        if (restored) attempted += "final-proof"
+        assertEquals(listOf("include", "split", "lan"), attempted)
+        assertEquals(listOf("include-app"), ledger.failures.map { it.phase })
+        assertSame(original, assertThrows(AssertionError::class.java) { ledger.throwIfFailed() })
+    }
+
+    @Test
+    fun independentRestorationRetainsEveryErrorAndBodyPrimary() {
+        val body = AssertionError("body")
+        val split = IllegalStateException("split")
+        val lan = IllegalStateException("lan")
+        val ledger = R06FailureLedger.Ledger { _, _ -> }
+        ledger.record("body", body)
+        assertEquals(false, ledger.attemptAll("split" to { throw split }, "lan" to { throw lan }))
+        assertSame(body, assertThrows(AssertionError::class.java) { ledger.throwIfFailed() })
+        assertEquals(listOf(split, lan), body.suppressed.toList())
+    }
+
+    @Test
+    fun successfulIndependentRestorationAllowsFinalProofDespitePriorBodyFailure() {
+        val ledger = R06FailureLedger.Ledger { _, _ -> }
+        ledger.record("body", AssertionError("body"))
+        assertTrue(ledger.attemptAll("split" to {}, "lan" to {}))
+        assertEquals(listOf("body"), ledger.failures.map { it.phase })
+    }
 }

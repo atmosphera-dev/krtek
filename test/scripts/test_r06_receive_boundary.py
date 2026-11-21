@@ -207,6 +207,52 @@ class ReceiveBoundaryTests(unittest.TestCase):
                 preconnect(android, p/'private', p/'collected/call', self.spec(), self.request())
             self.assertEqual(android.acks, [])
 
+    def test_ack_transport_failure_records_incomplete_receipt(self):
+        error = RuntimeError('PRIVATE transport failure')
+        class BrokenAck(Android):
+            def run_as(self, command, data, **kwargs):
+                raise error
+        with tempfile.TemporaryDirectory() as root:
+            p, android = Path(root), BrokenAck()
+            with self.assertRaises(Exception) as caught:
+                preconnect(android, p/'private', p/'collected/call', self.spec(), self.request())
+            self.assertIn('incomplete', str(caught.exception))
+            self.assertIs(caught.exception.__cause__, error)
+            value = json.loads((p/'collected/call/receive-7/receive-boundary.json').read_text())
+            self.assertEqual(value['unavailable']['ack'], 'RuntimeError')
+            self.assertEqual(value['ack_delivery'], 'unconfirmed')
+            self.assertNotIn('PRIVATE', json.dumps(value))
+
+    def test_expiry_between_receipt_and_ack_is_recorded_without_sending(self):
+        now = [0.0]
+        def collected(*args):
+            value = snapshot(*args)
+            now[0] = 31.0
+            return value
+        with tempfile.TemporaryDirectory() as root, patch('r06_receive_boundary.time.monotonic', side_effect=lambda: now[0]), \
+                patch('r06_receive_boundary.snapshot', side_effect=collected):
+            p, android = Path(root), Android()
+            with self.assertRaises(Exception):
+                preconnect(android, p/'private', p/'collected/call', self.spec(), self.request())
+            value = json.loads((p/'collected/call/receive-7/receive-boundary.json').read_text())
+            self.assertEqual(value['unavailable'].get('ack'), 'TimeoutError')
+            self.assertEqual(android.acks, [])
+
+    def test_late_ack_confirmation_does_not_leave_a_complete_receipt(self):
+        now = [0.0]
+        class SlowConfirmation(Android):
+            def run_as(self, command, data, **kwargs):
+                super().run_as(command, data, **kwargs)
+                now[0] = 31.0
+        with tempfile.TemporaryDirectory() as root, patch('r06_receive_boundary.time.monotonic', side_effect=lambda: now[0]):
+            p, android = Path(root), SlowConfirmation()
+            with self.assertRaises(Exception):
+                preconnect(android, p/'private', p/'collected/call', self.spec(), self.request())
+            value = json.loads((p/'collected/call/receive-7/receive-boundary.json').read_text())
+            self.assertEqual(value['unavailable'].get('ack'), 'TimeoutError')
+            self.assertEqual(value['ack_delivery'], 'unconfirmed')
+            self.assertEqual(len(android.acks), 1)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

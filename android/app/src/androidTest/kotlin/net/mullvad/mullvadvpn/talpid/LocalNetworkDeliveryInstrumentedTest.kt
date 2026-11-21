@@ -230,7 +230,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                     r06Custody?.recordFailure("consumer-body", error)
                     throw error
                 } finally {
-                    r06Restoration("permission-restoration") {
+                    r06Checked("permission-restoration") {
                         before.forEach { (key, _) ->
                             val (name, permission) = key
                             report(
@@ -258,7 +258,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         if (custody == null) body() else custody.ledger.run(body, {})
     }
 
-    private fun r06Restoration(phase: String, body: () -> Unit) {
+    private fun r06Checked(phase: String, body: () -> Unit) {
         try {
             body()
         } catch (error: Throwable) {
@@ -1816,11 +1816,13 @@ class LocalNetworkDeliveryInstrumentedTest {
                 assertEquals("CLOCK_BOOTTIME", it.getString("clock"))
                 assertEquals(consumerPid, it.getInt("pid"))
                 r06Custody?.observeSession(it)
-                assertEquals(
-                    "",
-                    it.getString("failure"),
-                    "Session failure must not become a blocking pass",
-                )
+                r06Checked("session-command") {
+                    assertEquals(
+                        "",
+                        it.getString("failure"),
+                        "Session failure must not become a blocking pass",
+                    )
+                }
             }
         }
 
@@ -1939,32 +1941,39 @@ class LocalNetworkDeliveryInstrumentedTest {
                     )
                 }
             val usedRebuilds = mutableSetOf<Int>()
-            if (appListChangeAt != null) {
-                assertTrue(stop.getString("failure") in setOf("", "tcp-exchange"))
-                if (stop.getString("failure") == "tcp-exchange") {
-                    assertTrue(
-                        local.any {
-                            it.getString("transport") == "tcp" &&
-                                it.getString("outcome") in setOf("error", "cancelled") &&
-                                it.optString("error_class") == "java.net.SocketException" &&
-                                it.getLong("return_ns") >= checkNotNull(appListChangeAt)
-                        },
-                        "Only Android's post-app-list socket destruction is expected",
-                    )
+            r06Checked("session-stop") {
+                try {
+                    if (appListChangeAt != null) {
+                        assertTrue(stop.getString("failure") in setOf("", "tcp-exchange"))
+                        if (stop.getString("failure") == "tcp-exchange") {
+                            assertTrue(
+                                local.any {
+                                    it.getString("transport") == "tcp" &&
+                                        it.getString("outcome") in setOf("error", "cancelled") &&
+                                        it.optString("error_class") == "java.net.SocketException" &&
+                                        it.getLong("return_ns") >= checkNotNull(appListChangeAt)
+                                },
+                                "Only Android's post-app-list socket destruction is expected",
+                            )
+                        }
+                        report("app_list_existing_socket_failure", stop.getString("failure"))
+                    } else if (revokedAt == null) assertEquals("", stop.getString("failure"))
+                    else
+                        assertTrue(
+                            stop.getString("failure") in
+                                setOf(
+                                    "tcp-exchange",
+                                    "udp-exchange",
+                                    "tcp-frame-watchdog",
+                                    "udp-frame-watchdog",
+                                ),
+                            "Only the intentional Local retirement may fail",
+                        )
+                } catch (error: Throwable) {
+                    r06Custody?.observeSession(stop)
+                    throw error
                 }
-                report("app_list_existing_socket_failure", stop.getString("failure"))
-            } else if (revokedAt == null) assertEquals("", stop.getString("failure"))
-            else
-                assertTrue(
-                    stop.getString("failure") in
-                        setOf(
-                            "tcp-exchange",
-                            "udp-exchange",
-                            "tcp-frame-watchdog",
-                            "udp-frame-watchdog",
-                        ),
-                    "Only the intentional Local retirement may fail",
-                )
+            }
             assertEquals("requested", stop.getString("stop_reason"))
             assertTrue(stop.getLong("stopped_ns") > stop.getLong("started_ns"))
             assertEquals(stop.getInt("local_count"), local.size)
@@ -2873,7 +2882,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                 r06Custody?.recordFailure("connected-body", error)
                 throw error
             } finally {
-                r06Restoration("policy-restoration") {
+                r06Checked("policy-restoration") {
                     // Disconnect first so restoration never reconnects after instrumentation exits.
                     disconnect(connection)
                     setPolicy(repository, original)
@@ -3259,7 +3268,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                 r06Custody?.recordFailure("settings-body", error)
                 throw error
             } finally {
-                r06Restoration("settings-restoration") {
+                r06Checked("settings-restoration") {
                     runBlocking {
                         assertTrue(split.includeApp(excluded).isRight())
                         assertTrue(

@@ -14,6 +14,7 @@ import net.mullvad.mullvadvpn.lib.repository.SplitTunnelingRepository
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Test
 import org.koin.android.ext.android.getKoin
 
@@ -24,6 +25,10 @@ class R06SequenceInstrumentedTest {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val target = instrumentation.targetContext
         val args = InstrumentationRegistry.getArguments()
+        assumeTrue(
+            args.getString("krtek_r06_custody", "false") == "true",
+            "Historical campaign requires krtek_r06_custody=true",
+        )
         val trace = args.getString("trace", "off")
         require(trace in setOf("off", "boundaries"))
         val fixture = LocalNetworkDeliveryInstrumentedTest()
@@ -233,25 +238,55 @@ class R06SequenceInstrumentedTest {
                         custody.completed("body")
                     },
                     restoration = {
-                        custody.stage("include-deskclock-restore-split-restore-lan")
-                        runBlocking {
-                            assertTrue(split.includeApp(excluded).isRight())
-                            assertTrue(
-                                split
-                                    .enableSplitTunneling(original.splitTunnelSettings.enabled)
-                                    .isRight()
+                        val restoredSettings =
+                            custody.ledger.attemptAll(
+                                "settings-restoration-stage" to
+                                    {
+                                        custody.stage("include-deskclock-restore-split-restore-lan")
+                                    },
+                                "include-deskclock" to
+                                    {
+                                        runBlocking {
+                                            assertTrue(split.includeApp(excluded).isRight())
+                                        }
+                                    },
+                                "restore-split-enabled" to
+                                    {
+                                        runBlocking {
+                                            assertTrue(
+                                                split
+                                                    .enableSplitTunneling(
+                                                        original.splitTunnelSettings.enabled
+                                                    )
+                                                    .isRight()
+                                            )
+                                        }
+                                    },
+                                "restore-legacy-lan" to
+                                    {
+                                        runBlocking {
+                                            assertTrue(
+                                                repository
+                                                    .setLocalNetworkSharing(original.allowLan)
+                                                    .isRight()
+                                            )
+                                        }
+                                    },
+                                "saved-settings-readback" to
+                                    {
+                                        runBlocking {
+                                            withTimeout(10_000) {
+                                                repository.settingsUpdates.first {
+                                                    it?.allowLan == original.allowLan &&
+                                                        it.splitTunnelSettings ==
+                                                            original.splitTunnelSettings
+                                                }
+                                            }
+                                        }
+                                    },
+                                "restore-peer-policy" to { fixture.setPolicy(repository, policy) },
                             )
-                            assertTrue(
-                                repository.setLocalNetworkSharing(original.allowLan).isRight()
-                            )
-                            withTimeout(10_000) {
-                                repository.settingsUpdates.first {
-                                    it?.allowLan == original.allowLan &&
-                                        it.splitTunnelSettings == original.splitTunnelSettings
-                                }
-                            }
-                        }
-                        fixture.setPolicy(repository, policy)
+                        if (!restoredSettings) custody.ledger.throwIfFailed()
                         // Historical final CP had NO generation floor. TCP is
                         // first, then UDP, then ordinary HTTPS. No retry.
                         val restored = proof("final-fresh-tcp-udp-https")

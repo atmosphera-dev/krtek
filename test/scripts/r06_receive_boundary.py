@@ -80,6 +80,14 @@ class Deadline:
                     guest_monotonic_after_ns=int(time.monotonic() * 1e9))
 
 
+def write_receipt(path, value, exclusive=False):
+    with path.open('x' if exclusive else 'w') as stream:
+        json.dump(value, stream, indent=2)
+        stream.write('\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
 def snapshot(android, private, public, identity, deadline=None):
     deadline = deadline or Deadline()
     if private.resolve() != private or private.is_relative_to(public.parent):
@@ -124,17 +132,13 @@ def snapshot(android, private, public, identity, deadline=None):
                  clocks=clocks, private_root=str(private), private_files=saved, unavailable=unavailable,
                  summary=summarize(texts, identity.get('consumer_uid')),
                  timing='Sequential read-only snapshots, not atomic or proof of per-packet drop')
-    with (public / 'receive-boundary.json').open('x') as stream:
-        json.dump(value, stream, indent=2)
-        stream.write('\n')
-        stream.flush()
-        os.fsync(stream.fileno())
+    write_receipt(public / 'receive-boundary.json', value, exclusive=True)
     try:
         deadline.remaining()
     except TimeoutError:
         # Retain the incomplete receipt even if writing it exhausted the budget.
         value['unavailable']['deadline'] = 'TimeoutError'
-        (public / 'receive-boundary.json').write_text(json.dumps(value, indent=2) + '\n')
+        write_receipt(public / 'receive-boundary.json', value)
     return value
 
 
@@ -164,9 +168,20 @@ def preconnect(android, private, public, spec, request):
     temp, final = '%s/receive-%d.ack.next' % (root, index), '%s/receive-%d.ack' % (root, index)
     # The device checks time again immediately before publication. Whole-second
     # ceiling is conservative; no delayed shell can publish an expired ACK.
-    android.run_as('set -eu; umask 077; test ! -e %s; test ! -e %s; cat > %s; test "$(wc -c < %s)" -eq %d; '
-                   'read -r uptime rest < /proc/uptime; test "$(( (${uptime%%%%.*} + 1) * 1000000000 ))" -lt %d; mv %s %s'
-                   % (final, temp, temp, temp, len(ack), android_deadline, temp, final),
-                   data=ack, timeout=deadline.remaining())
-    deadline.remaining()
+    try:
+        android.run_as('set -eu; umask 077; test ! -e %s; test ! -e %s; cat > %s; test "$(wc -c < %s)" -eq %d; '
+                       'read -r uptime rest < /proc/uptime; test "$(( (${uptime%%%%.*} + 1) * 1000000000 ))" -lt %d; mv %s %s'
+                       % (final, temp, temp, temp, len(ack), android_deadline, temp, final),
+                       data=ack, timeout=deadline.remaining())
+        deadline.remaining()
+    except Exception as error:
+        value['unavailable']['ack'] = type(error).__name__
+        # A transport failure cannot prove whether a timely ACK was published.
+        value['ack_delivery'] = 'unconfirmed'
+        try:
+            write_receipt(public / ('receive-%d' % index) / 'receive-boundary.json', value)
+        except Exception as storage_error:
+            raise RuntimeError('ACK unconfirmed; incomplete receipt write failed: ' +
+                               type(storage_error).__name__) from error
+        raise RuntimeError('Receive-boundary observation incomplete; ACK not confirmed') from error
     return value

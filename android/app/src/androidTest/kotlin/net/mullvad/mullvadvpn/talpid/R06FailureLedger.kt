@@ -38,6 +38,19 @@ internal object R06FailureLedger {
             throwIfFailed()
         }
 
+        fun attemptAll(vararg operations: Pair<String, () -> Unit>): Boolean {
+            var restored = true
+            operations.forEach { (phase, operation) ->
+                try {
+                    operation()
+                } catch (error: Throwable) {
+                    record(phase, error)
+                    restored = false
+                }
+            }
+            return restored
+        }
+
         fun throwIfFailed() {
             val primary = recorded.firstOrNull()?.error ?: return
             recorded.drop(1).forEach { failure ->
