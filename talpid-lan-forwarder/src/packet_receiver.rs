@@ -8,18 +8,19 @@
 
 pub use crate::ip_endpoint::contract::IpError;
 use crate::ip_endpoint::{
-    capture::{self, OwnedTransport},
-    contract::{LocalIpEngine, ReceiveScopeId},
+    capture::{self, OwnedTransport, PacketBatch},
+    contract::{LocalIpEngine, ReceiveScopeId, ReplyTuple},
     native::Engine,
 };
 use crate::{ReceiveScope, Transport, packet};
 use smoltcp::wire::{IpProtocol, Ipv4Packet, Ipv6ExtHeader, Ipv6FragmentHeader, Ipv6Packet};
 use std::{
     collections::BTreeMap,
+    io,
     net::IpAddr,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU16, Ordering},
     },
 };
 use talpid_types::relay_flow::{
@@ -64,6 +65,7 @@ pub struct CompletedDatagram {
 
 struct ReceiverLifetime {
     live: AtomicBool,
+    mtu: AtomicU16,
     _charge: Arc<dyn RelayBufferReservation>,
 }
 
@@ -95,6 +97,66 @@ impl CompletedDatagram {
     }
 }
 
+/// A funded native UDP reply retaining the exact completed input incarnation.
+/// This is NOT a transport grant. The consumer must enclose every synchronous
+/// sink write in its retained reply authority and exact capture/sink check.
+pub struct DatagramReply {
+    output: Option<DatagramOutput>,
+}
+
+struct DatagramOutput {
+    input: CompletedDatagram,
+    batch: PacketBatch,
+}
+
+impl DatagramReply {
+    pub fn has_output(&self) -> bool {
+        self.output.is_some()
+    }
+
+    /// One checked whole packet per call, yielding between fragments. WouldBlock
+    /// retains the same bytes/cursor. Retirement or an obsolete MTU discards the
+    /// entire unsent remainder without replaying any already delivered fragment.
+    pub fn write_output(
+        &mut self,
+        sink_mtu: u16,
+        write: impl FnOnce(&[u8]) -> io::Result<usize>,
+    ) -> io::Result<bool> {
+        let Some(output) = self.output.as_mut() else {
+            return Ok(false);
+        };
+        let mtu = usize::from(
+            output
+                .input
+                .receiver
+                .mtu
+                .load(Ordering::Acquire)
+                .min(sink_mtu),
+        );
+        if !output.input.current() || !output.batch.fits(mtu) {
+            self.output.take();
+            return Ok(false);
+        }
+        let bytes = output.batch.packet();
+        match write(bytes) {
+            Ok(n) if n == bytes.len() => {
+                if !output.batch.advance() {
+                    self.output.take();
+                }
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(error),
+            result => {
+                // Fatal/partial writes must never become a replayable packet.
+                self.output.take();
+                Err(result.err().unwrap_or_else(|| {
+                    io::Error::new(io::ErrorKind::WriteZero, "partial IP packet write")
+                }))
+            }
+        }
+    }
+}
+
 /// One logical handle on the existing process-global native core. Retained
 /// originals and metadata use the caller's existing shared byte allocator.
 pub struct PacketReceiver {
@@ -113,8 +175,44 @@ impl PacketReceiver {
             pending: BTreeMap::new(),
             live: Arc::new(ReceiverLifetime {
                 live: AtomicBool::new(true),
+                mtu: AtomicU16::new(mtu),
                 _charge: charge,
             }),
+        })
+    }
+
+    /// Compatible MTU changes retain the input incarnation, but queued replies
+    /// always see this receiver's latest MTU rather than a caller's old snapshot.
+    pub fn set_mtu(&mut self, mtu: u16) -> Result<(), IpError> {
+        self.engine.set_mtu(mtu)?;
+        self.live.mtu.store(mtu, Ordering::Release);
+        Ok(())
+    }
+
+    /// Generate with the existing pristine-native batch encoder. No physical
+    /// socket or Local grant for the intercepted destination is acquired here.
+    /// The supplied reply arena must be shared with sibling output producers;
+    /// admission preserves the same two maximum TCP peaks as ordinary Local UDP.
+    pub fn reply(
+        &mut self,
+        input: CompletedDatagram,
+        payload: &[u8],
+        replies: &dyn RelayBufferAllocator,
+    ) -> Result<DatagramReply, IpError> {
+        if !Arc::ptr_eq(&input.receiver, &self.live) || !input.current() {
+            return Err(IpError::Stale);
+        }
+        let tuple = ReplyTuple::from_flow(input.complete.scope, input.packet()?.flow)?;
+        tuple.check_payload_len(payload.len())?;
+        let mtu = usize::from(self.live.mtu.load(Ordering::Acquire));
+        let batch =
+            PacketBatch::reserve_preserving(replies, mtu, crate::forwarder::UDP_REPLY_HEADROOM)?
+                .generate(&mut self.engine, tuple, payload)?;
+        if !input.current() {
+            return Err(IpError::Stale);
+        }
+        Ok(DatagramReply {
+            output: Some(DatagramOutput { input, batch }),
         })
     }
 

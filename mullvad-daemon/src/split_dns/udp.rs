@@ -18,7 +18,12 @@ use hickory_proto::{
     serialize::binary::{BinEncodable, BinEncoder},
 };
 use mullvad_types::settings::local_network_access::split_dns::{DnsLane, SuffixMatcher};
-use talpid_types::relay_flow::{BUFFER_OVERHEAD, RelayBufferAllocator, RelayBufferReservation};
+use talpid_lan_forwarder::packet_receiver::{
+    CompletedDatagram, DatagramReply, IpError, PacketReceiver,
+};
+use talpid_types::relay_flow::{
+    BUFFER_OVERHEAD, RelayBufferAllocator, RelayBufferReservation, RelayCapture, RelaySink,
+};
 
 use super::{
     home_path::{HomeDnsPath, HomeDnsQuery},
@@ -97,11 +102,40 @@ pub(super) struct UdpReply {
 /// This guard checks Home lifetime only; it does not grant capture authority.
 pub(super) struct HomeUdpReply {
     reply: UdpReply,
+    request: Message,
     leases: [Option<Arc<dyn HomeDnsQuery>>; 2],
     _storage: Arc<dyn RelayBufferReservation>,
 }
 
 impl HomeUdpReply {
+    /// Bind the retained Home result to its exact completed capture tuple before
+    /// native generation. The output owns both guards until the final fragment.
+    pub(super) fn into_output(
+        self,
+        receiver: &mut PacketReceiver,
+        input: CompletedDatagram,
+        replies: &dyn RelayBufferAllocator,
+        capture: RelayCapture,
+    ) -> Result<HomeUdpOutput, IpError> {
+        let output = self
+            .with_current(|source, destination, bytes| {
+                let packet = input.packet()?;
+                let flow = packet.flow;
+                if flow.source != destination || flow.destination != source {
+                    return Err(IpError::Malformed);
+                }
+                if decode_message(packet.payload).map_err(|_| IpError::Malformed)? != self.request {
+                    return Err(IpError::Malformed);
+                }
+                receiver.reply(input, bytes, replies)
+            })
+            .map_err(|_| IpError::Stale)??;
+        Ok(HomeUdpOutput {
+            output: Some((self, output)),
+            capture,
+        })
+    }
+
     pub(super) fn with_current<T>(
         &self,
         emit: impl FnOnce(SocketAddr, SocketAddr, &[u8]) -> T,
@@ -114,6 +148,57 @@ impl HomeUdpReply {
             self.reply.destination,
             &self.reply.bytes,
         ))
+    }
+}
+
+/// Native output is inaccessible without its original Home reply authority.
+/// The frontend still supplies the exact capture/sink-checked synchronous writer.
+pub(super) struct HomeUdpOutput {
+    output: Option<(HomeUdpReply, DatagramReply)>,
+    capture: RelayCapture,
+}
+
+impl HomeUdpOutput {
+    pub(super) fn has_output(&self) -> bool {
+        self.output.is_some()
+    }
+
+    pub(super) fn write_output(
+        &mut self,
+        sink: &RelaySink,
+        write: impl FnOnce(&[u8]) -> std::io::Result<usize>,
+    ) -> std::io::Result<bool> {
+        let Some((authority, output)) = self.output.as_mut() else {
+            return Ok(false);
+        };
+        if !sink
+            .identity()
+            .sources
+            .contains(authority.reply.destination.ip())
+        {
+            self.output.take();
+            return Ok(false);
+        }
+        let result = authority.with_current(|_, _, _| {
+            output.write_output(sink.identity().mtu, |bytes| {
+                self.capture
+                    .with_sink(sink, || write(bytes))
+                    .map_err(|_| std::io::Error::other("DNS capture sink retired"))?
+            })
+        });
+        let drained = !output.has_output();
+        match result {
+            Err(_) => {
+                self.output.take();
+                Ok(false)
+            }
+            Ok(result) => {
+                if drained {
+                    self.output.take();
+                }
+                result
+            }
+        }
     }
 }
 
@@ -176,6 +261,7 @@ impl UdpQuery {
             .await?;
         let reply = HomeUdpReply {
             reply,
+            request: self.request,
             leases,
             _storage: storage,
         };
@@ -192,7 +278,7 @@ impl UdpQuery {
     /// false, and an oversized answer becomes SERVFAIL rather than a leaked retry.
     /// `injection_limit` is the actual complete-datagram output capability, not MTU.
     async fn answer_with<F, Fut>(
-        self,
+        &self,
         mut home: F,
         tcp_retry: bool,
         injection_limit: u16,

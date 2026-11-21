@@ -1,5 +1,5 @@
 use super::*;
-use crate::{forwarder::tests::stock_udp_wire, packet::tests::flow};
+use crate::{Flow, forwarder::tests::stock_udp_wire, packet::tests::flow};
 use talpid_netstack::buffer_budget::BufferBudget;
 
 fn isolated(name: &str) -> bool {
@@ -280,6 +280,252 @@ fn packet_custody_conflicting_overlap_can_never_release_an_alternate_message() {
             assert!(
                 matches!(terminal, Err(IpError::Malformed)),
                 "IPv4 keeps the earlier assembly; the custody audit must reject the conflicting copy"
+            );
+        }
+    }
+}
+
+fn completed(receiver: &mut PacketReceiver, scope: &ReceiveScope) -> CompletedDatagram {
+    let flow = Flow {
+        source: std::net::SocketAddr::new(scope.source(), 49152),
+        destination: std::net::SocketAddr::new(scope.destination(), 53),
+        transport: Transport::Udp,
+    };
+    receiver
+        .ingest(scope, &stock_udp_wire(flow, b"question", 1280)[0])
+        .unwrap()
+        .unwrap()
+}
+
+#[test]
+fn packet_custody_reply_native_maxima_reach_complete_consumer_with_original_tuple() {
+    if isolated("packet_custody_reply_native_maxima_reach_complete_consumer_with_original_tuple") {
+        return;
+    }
+    for (ipv6, mtu) in [(false, 68), (false, 1280), (true, 1280)] {
+        let (buffers, mut receiver, scope) = setup(ipv6);
+        receiver.set_mtu(mtu).unwrap();
+        let input = completed(&mut receiver, &scope);
+        let original = input.packet().unwrap().flow;
+        let payload = vec![39; if ipv6 { 65487 } else { 65507 }];
+        let mut output = receiver.reply(input, &payload, buffers.as_ref()).unwrap();
+        let mut consumer = PacketReceiver::new(buffers.clone(), mtu).unwrap();
+        let reverse =
+            ReceiveScope::new(scope.destination(), scope.source(), buffers.as_ref()).unwrap();
+        let mut delivered = None;
+        let mut count = 0;
+        while output.has_output() {
+            assert!(
+                output
+                    .write_output(mtu, |bytes| {
+                        assert!(bytes.len() <= usize::from(mtu));
+                        count += 1;
+                        if let Some(complete) = consumer.ingest(&reverse, bytes).unwrap() {
+                            assert!(delivered.is_none());
+                            let parsed = complete.packet().unwrap();
+                            assert_eq!(parsed.flow.source, original.destination);
+                            assert_eq!(parsed.flow.destination, original.source);
+                            assert_eq!(parsed.payload, payload);
+                            delivered = Some(complete);
+                        }
+                        Ok(bytes.len())
+                    })
+                    .unwrap()
+            );
+        }
+        assert!(delivered.is_some());
+        assert!(count > 1);
+        if mtu == 68 {
+            assert_eq!(count, 1365);
+        }
+        assert!(
+            !output
+                .write_output(mtu, |_| panic!("drained replay"))
+                .unwrap()
+        );
+    }
+}
+
+#[test]
+fn packet_custody_reply_retry_and_revocation_keep_exact_output_owner() {
+    if isolated("packet_custody_reply_retry_and_revocation_keep_exact_output_owner") {
+        return;
+    }
+    for retire_receiver in [false, true] {
+        let (buffers, mut receiver, scope) = setup(false);
+        let input = completed(&mut receiver, &scope);
+        let mut output = receiver
+            .reply(input, &[41; 4096], buffers.as_ref())
+            .unwrap();
+        let funded = buffers.used();
+        let mut first = Vec::new();
+        for _ in 0..2 {
+            assert_eq!(
+                output
+                    .write_output(1280, |bytes| {
+                        if first.is_empty() {
+                            first = bytes.to_vec();
+                        }
+                        assert_eq!(bytes, first);
+                        Err(io::ErrorKind::WouldBlock.into())
+                    })
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert_eq!(buffers.used(), funded);
+        }
+        assert!(
+            output
+                .write_output(1280, |bytes| {
+                    assert_eq!(bytes, first);
+                    Ok(bytes.len())
+                })
+                .unwrap()
+        );
+        if retire_receiver {
+            drop(receiver);
+        } else {
+            scope.revoke();
+        }
+        assert!(
+            !output
+                .write_output(1280, |_| panic!("retired tail"))
+                .unwrap()
+        );
+        assert!(!output.has_output());
+        assert!(buffers.used() < funded);
+    }
+}
+
+#[test]
+fn packet_custody_reply_requires_same_receiver_and_live_input() {
+    if isolated("packet_custody_reply_requires_same_receiver_and_live_input") {
+        return;
+    }
+    let (buffers, mut receiver, scope) = setup(false);
+    let mut successor = PacketReceiver::new(buffers.clone(), 1280).unwrap();
+    let input = completed(&mut receiver, &scope);
+    assert!(matches!(
+        successor.reply(input, b"wrong owner", buffers.as_ref()),
+        Err(IpError::Stale)
+    ));
+    let input = completed(&mut receiver, &scope);
+    scope.revoke();
+    assert!(matches!(
+        receiver.reply(input, b"retired", buffers.as_ref()),
+        Err(IpError::Stale)
+    ));
+}
+
+#[test]
+fn packet_custody_reply_funding_preserves_tcp_peaks_and_refunds_on_drop() {
+    if isolated("packet_custody_reply_funding_preserves_tcp_peaks_and_refunds_on_drop") {
+        return;
+    }
+    let (buffers, mut receiver, scope) = setup(false);
+    let needed =
+        crate::ip_endpoint::capture::BATCH_RESERVATION + crate::forwarder::UDP_REPLY_HEADROOM;
+    let replies = BufferBudget::new(needed - 1);
+    let input = completed(&mut receiver, &scope);
+    assert!(matches!(
+        receiver.reply(input, b"unfunded", &replies),
+        Err(IpError::Full)
+    ));
+    assert_eq!(replies.used(), 0);
+    let replies = BufferBudget::new(needed);
+    let input = completed(&mut receiver, &scope);
+    let output = receiver.reply(input, b"funded", &replies).unwrap();
+    let headroom = replies
+        .reserve(crate::forwarder::UDP_REPLY_HEADROOM)
+        .unwrap();
+    assert_eq!(replies.used(), needed);
+    drop(headroom);
+    drop(output);
+    assert_eq!(replies.used(), 0);
+    assert!(buffers.used() < buffers.limit());
+}
+
+#[test]
+fn packet_custody_reply_mtu_shrink_discards_obsolete_remainder_without_replay() {
+    if isolated("packet_custody_reply_mtu_shrink_discards_obsolete_remainder_without_replay") {
+        return;
+    }
+    for update_receiver in [false, true] {
+        let (buffers, mut receiver, scope) = setup(false);
+        let input = completed(&mut receiver, &scope);
+        let mut output = receiver
+            .reply(input, &[43; 4096], buffers.as_ref())
+            .unwrap();
+        assert!(output.write_output(1280, |bytes| Ok(bytes.len())).unwrap());
+        let sink_mtu = if update_receiver {
+            receiver.set_mtu(68).unwrap();
+            1280
+        } else {
+            68
+        };
+        assert!(
+            !output
+                .write_output(sink_mtu, |_| panic!("oversized remainder"))
+                .unwrap()
+        );
+        assert!(!output.has_output());
+    }
+    let (buffers, mut receiver, scope) = setup(false);
+    let input = completed(&mut receiver, &scope);
+    let mut output = receiver
+        .reply(input, &[44; 1296], buffers.as_ref())
+        .unwrap();
+    assert!(output.write_output(1280, |bytes| Ok(bytes.len())).unwrap());
+    receiver.set_mtu(68).unwrap();
+    assert!(
+        output
+            .write_output(68, |bytes| {
+                assert!(bytes.len() <= 68);
+                Ok(bytes.len())
+            })
+            .unwrap()
+    );
+    assert!(!output.has_output());
+}
+
+#[test]
+fn packet_custody_reply_oversized_and_partial_write_never_shorten_or_replay() {
+    if isolated("packet_custody_reply_oversized_and_partial_write_never_shorten_or_replay") {
+        return;
+    }
+    for ipv6 in [false, true] {
+        let (buffers, mut receiver, scope) = setup(ipv6);
+        let input = completed(&mut receiver, &scope);
+        assert!(matches!(
+            receiver.reply(
+                input,
+                &vec![0; if ipv6 { 65488 } else { 65508 }],
+                buffers.as_ref()
+            ),
+            Err(IpError::Oversized)
+        ));
+        for fatal in [false, true] {
+            let input = completed(&mut receiver, &scope);
+            let mut output = receiver
+                .reply(input, b"whole packet only", buffers.as_ref())
+                .unwrap();
+            assert!(
+                output
+                    .write_output(1280, |bytes| {
+                        if fatal {
+                            Err(io::ErrorKind::BrokenPipe.into())
+                        } else {
+                            Ok(bytes.len() - 1)
+                        }
+                    })
+                    .is_err()
+            );
+            assert!(!output.has_output());
+            assert!(
+                !output
+                    .write_output(1280, |_| panic!("fatal replay"))
+                    .unwrap()
             );
         }
     }
