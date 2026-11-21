@@ -49,6 +49,7 @@ members = [
   "talpid-types",
   "talpid-windows",
   "talpid-wireguard",
+  "test/split-dns-server",
   "tunnel-obfuscation",
   "windows-installer"
 ]

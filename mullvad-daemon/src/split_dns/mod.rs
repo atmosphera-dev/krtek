@@ -9,3 +9,7 @@ pub(crate) mod home_io;
 #[cfg(test)]
 #[path = "../../../test/scripts/split_dns_fixture.rs"]
 mod fixture;
+
+#[cfg(test)]
+#[path = "../../../test/scripts/split_dns_server.rs"]
+mod fixture_server;
