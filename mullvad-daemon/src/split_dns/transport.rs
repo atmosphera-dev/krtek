@@ -34,7 +34,7 @@ pub(super) enum Protocol {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum ExchangeError {
+pub(crate) enum ExchangeError {
     #[error("DNS transport failed")]
     Transport(#[from] hickory_net::NetError),
     #[error("DNS I/O failed")]

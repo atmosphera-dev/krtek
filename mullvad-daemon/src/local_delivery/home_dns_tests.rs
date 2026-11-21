@@ -26,6 +26,113 @@ fn query_flow(transport: Transport) -> Flow {
     flow
 }
 
+#[tokio::test]
+async fn split_dns_home_query_hickory_runtime_retains_exact_resolver_and_revocation_fence() {
+    use crate::split_dns::home_io::HomeIoOwner;
+    use hickory_net::runtime::RuntimeProvider;
+    let prepared = Arc::new(AtomicUsize::new(0));
+    let count = prepared.clone();
+    let authority = Arc::new(DeliveryAuthority::new(
+        &configured(),
+        Arc::new(move |_, lease| {
+            assert_eq!(lease.network_handle, 71);
+            assert_eq!(lease.destination, "10.0.2.2".parse::<IpAddr>().unwrap());
+            count.fetch_add(1, SeqCst);
+            Ok(())
+        }),
+    ));
+    authority.update(&configured(), Some(observation()));
+    let budget = Arc::new(BufferBudget::new(65536));
+    let flow = query_flow(Transport::Udp);
+    let grant = authority.home_dns_authorize(flow, &*budget).unwrap();
+    let owner = HomeIoOwner::new(budget);
+    let runtime = owner.runtime(authority.clone(), grant.clone()).unwrap();
+    assert!(
+        runtime
+            .bind_udp(
+                "0.0.0.0:0".parse().unwrap(),
+                "10.0.2.53:53".parse().unwrap()
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        runtime
+            .connect_tcp(flow.destination, None, None)
+            .await
+            .is_err(),
+        "UDP grant authorized TCP"
+    );
+    assert_eq!(prepared.load(SeqCst), 0);
+    let socket = runtime
+        .bind_udp("0.0.0.0:0".parse().unwrap(), flow.destination)
+        .await
+        .unwrap();
+    assert_eq!(prepared.load(SeqCst), 1);
+    grant.retire();
+    use hickory_net::runtime::DnsUdpSocket;
+    assert_eq!(
+        socket
+            .send_to(b"must not send", flow.destination)
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    drop(socket);
+    assert!(
+        runtime
+            .bind_udp("0.0.0.0:0".parse().unwrap(), flow.destination)
+            .await
+            .is_err()
+    );
+    let mut request = hickory_proto::op::Message::query();
+    request.add_query(hickory_proto::op::Query::query(
+        hickory_proto::rr::Name::from_ascii("home.").unwrap(),
+        hickory_proto::rr::RecordType::A,
+    ));
+    assert!(
+        owner
+            .exchange(
+                authority.clone(),
+                &grant,
+                std::time::Duration::from_secs(2),
+                request
+            )
+            .await
+            .is_err()
+    );
+    assert!(owner.runtime(authority, grant).is_err());
+    drop(runtime);
+    owner.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn split_dns_home_query_authority_retirement_wakes_pending_io_without_network_readiness() {
+    let on = configured();
+    let authority = Arc::new(DeliveryAuthority::new(&on, Arc::new(|_, _| Ok(()))));
+    authority.update(&on, Some(observation()));
+    let buffers = BufferBudget::new(65536);
+    let query = authority
+        .home_dns_authorize(query_flow(Transport::Udp), &buffers)
+        .unwrap();
+    let waiting = authority.home_dns_retired(&query);
+    tokio::pin!(waiting);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiting)
+            .await
+            .is_err()
+    );
+    let mut off = on.clone();
+    off.split_dns.enabled = false;
+    authority.update_policy(&off);
+    authority.update_policy(&on);
+    tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+        .await
+        .unwrap();
+    assert!(!authority.home_dns_current(&query));
+}
+
 #[test]
 fn split_dns_home_query_uses_only_associated_rule_and_prepares_exact_original_network() {
     let count = Arc::new(AtomicUsize::new(0));

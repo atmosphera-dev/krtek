@@ -4,5 +4,8 @@
 mod transport;
 
 #[cfg(test)]
+pub(crate) mod home_io;
+
+#[cfg(test)]
 #[path = "../../../test/scripts/split_dns_fixture.rs"]
 mod fixture;

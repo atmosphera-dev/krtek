@@ -128,7 +128,7 @@ type ReceiveKey = (IpAddr, IpAddr, ReceivePurpose);
 // B3's real query entry remains inactive until capture and both DNS lanes are
 // fully integrated. Tests exercise the same existing Local authority owner.
 #[cfg(test)]
-mod home_dns;
+pub(crate) mod home_dns;
 
 /// Fixed non-transport facts, deliberately without NetworkLease's rule-ID Vec.
 /// Re-evaluation permits unrelated rule edits but cannot migrate a datagram to a

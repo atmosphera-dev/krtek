@@ -15,6 +15,10 @@ struct HomeQuery {
 }
 
 impl HomeDnsGrant {
+    pub(crate) fn transport(&self) -> talpid_lan_forwarder::Transport {
+        self.0.flow.transport
+    }
+
     pub(crate) fn destination(&self) -> SocketAddr {
         let mut destination = self.0.flow.destination;
         if let SocketAddr::V6(address) = &mut destination {
@@ -38,6 +42,21 @@ impl HomeDnsGrant {
 }
 
 impl DeliveryAuthority {
+    /// Observe authority changes as well as explicit per-query retirement. A
+    /// blocked socket does not have to become readable to notice revocation.
+    pub(crate) async fn home_dns_retired(&self, query: &HomeDnsGrant) {
+        let mut authority = self.subscribe();
+        loop {
+            if !self.home_dns_current(query) {
+                return;
+            }
+            tokio::select! {
+                _ = query.retired() => return,
+                result = authority.changed() => if result.is_err() { return; },
+            }
+        }
+    }
+
     pub(crate) fn home_dns_authorize(
         &self,
         flow: Flow,
