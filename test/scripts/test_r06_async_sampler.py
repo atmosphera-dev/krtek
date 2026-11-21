@@ -8,6 +8,7 @@ import struct
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 import r06_async_sampler as s
 
@@ -204,6 +205,81 @@ class SamplerTest(unittest.TestCase):
     def test_framework_unavailable_not_empty_success(self):
         with self.assertRaises(ValueError):
             s.framework_summary(b'100\nPermission denied\n120\n')
+
+    def test_framework_timeout_marker_rejects_partial_network_heading(self):
+        with self.assertRaisesRegex(ValueError, 'incomplete'):
+            s.framework_summary(b"100\nNetwork partial\n*** SERVICE 'connectivity' DUMP TIMEOUT (10000ms) EXPIRED ***\n120\n")
+
+    def test_framework_shell_preserves_failing_command_status(self):
+        sampler = object.__new__(s.AsyncSampler)
+        sampler.private, sampler.remote = self.root, '/unused'
+        sampler.stop_event, sampler.errors, sampler.framework = Mock(), [], []
+        sampler.stop_event.is_set.return_value = False
+        sampler.android = Mock()
+        observed = []
+        def fail_mid_sequence(command, **_kwargs):
+            # Replace only executable names; execute the actual shell structure.
+            command = command.replace('/unused/sampler --boottime', 'printf "100\\n"')
+            command = command.replace('dumpsys connectivity', 'false')
+            result = subprocess.run(['sh', '-c', command], capture_output=True)
+            observed.append(result)
+            raise RuntimeError('remote exit')
+        sampler.android.su.side_effect = fail_mid_sequence
+        sampler._framework()
+        self.assertNotEqual(observed[0].returncode, 0)
+        self.assertEqual(observed[0].stdout, b'100\n')
+        self.assertEqual(len(sampler.errors), 1)
+        self.assertEqual(sampler.framework, [])
+
+    def stop_fixture(self):
+        sampler = object.__new__(s.AsyncSampler)
+        sampler.stop_event, sampler.android = Mock(), Mock()
+        sampler.remote, sampler.errors, sampler.framework = '/remote', [], [dict()]
+        sampler.proc, sampler.thread = Mock(), Mock()
+        sampler.proc.poll.return_value = None
+        sampler.proc.returncode = 0
+        sampler.thread.is_alive.return_value = False
+        sampler.raw, sampler.error_log = Mock(), Mock()
+        return sampler
+
+    def test_stop_remote_failure_still_waits_joins_and_closes(self):
+        sampler = self.stop_fixture()
+        error = RuntimeError('remote TERM failed')
+        sampler.android.su.side_effect = error
+        with patch.object(s, 'summarize') as summarize:
+            with self.assertRaises(RuntimeError) as caught:
+                sampler.stop()
+            self.assertIs(caught.exception, error)
+            summarize.assert_not_called()
+        sampler.proc.wait.assert_called_once_with(timeout=20)
+        sampler.thread.join.assert_called_once_with(timeout=20)
+        sampler.raw.close.assert_called_once()
+        sampler.error_log.close.assert_called_once()
+        self.assertTrue(sampler.errors)
+
+    def test_stop_wait_failure_still_reaps_joins_and_closes(self):
+        sampler = self.stop_fixture()
+        error = subprocess.TimeoutExpired('adb', 20)
+        sampler.proc.wait.side_effect = [error, 0]
+        with self.assertRaises(subprocess.TimeoutExpired) as caught:
+            sampler.stop()
+        self.assertIs(caught.exception, error)
+        sampler.proc.terminate.assert_called_once()
+        sampler.thread.join.assert_called_once_with(timeout=20)
+        sampler.raw.close.assert_called_once()
+        sampler.error_log.close.assert_called_once()
+
+    def test_all_local_cleanup_is_attempted_and_first_failure_remains_primary(self):
+        sampler = self.stop_fixture()
+        error = RuntimeError('remote TERM failed')
+        sampler.android.su.side_effect = error
+        sampler.thread.join.side_effect = RuntimeError('join failed')
+        sampler.raw.close.side_effect = OSError('close failed')
+        with self.assertRaises(RuntimeError) as caught:
+            sampler.stop()
+        self.assertIs(caught.exception, error)
+        sampler.error_log.close.assert_called_once()
+        self.assertEqual(len(sampler.errors), 3)
 
     def test_framework_vpn_combined_with_underlying_transport(self):
         for transports in ('WIFI|VPN', 'CELLULAR|VPN', 'VPN|WIFI'):

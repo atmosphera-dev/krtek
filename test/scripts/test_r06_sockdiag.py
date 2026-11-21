@@ -31,7 +31,7 @@ class R06SockdiagTest(unittest.TestCase):
 
     def check_socket(self, rows, consumer, family, protocol):
         records = [row for row in rows if row["event"] == "socket" and row["source_port"] == consumer.getsockname()[1]]
-        self.assertEqual(2, len(records))
+        self.assertEqual([1, 2], [row['sequence'] for row in records])
         self.assertEqual(1, len({tuple(row["cookie"]) for row in records}))
         self.assertEqual(1, len({row["inode"] for row in records}))
         for row in records:
@@ -66,6 +66,17 @@ class R06SockdiagTest(unittest.TestCase):
                 rows = self.sample("udp", address, 18081)
                 self.check_socket(rows, consumer, 4 if family == socket.AF_INET else 6, socket.IPPROTO_UDP)
 
+    def test_dotted_ipv4_query_observes_ipv4_mapped_ipv6_tcp_socket(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(('127.0.0.1', 0))
+            listener.listen()
+            with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as consumer:
+                consumer.settimeout(2)
+                consumer.connect(('::ffff:127.0.0.1', listener.getsockname()[1]))
+                with listener.accept()[0]:
+                    rows = self.sample('tcp', '127.0.0.1', listener.getsockname()[1])
+                    self.check_socket(rows, consumer, 6, socket.IPPROTO_TCP)
+
     def test_unavailable_fd_scan_is_distinct_from_no_socket(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as consumer:
             consumer.connect(("127.0.0.1", 18081))
@@ -79,7 +90,8 @@ class R06SockdiagTest(unittest.TestCase):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as consumer:
             consumer.connect(("127.0.0.1", 18081))
             rows = self.sample("udp", "127.0.0.2", 18081)
-            self.assertFalse(any(row["event"] == "socket" for row in rows))
+            self.assertFalse(any(row['event'] == 'fd' and row['fd'] == consumer.fileno()
+                                 and row['pid'] == os.getpid() for row in rows))
 
     def test_invalid_arguments_fail_before_observation(self):
         for arguments in ([], ["tcp", "host.example", "18080", "1", "1", "0"],

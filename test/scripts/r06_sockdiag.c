@@ -72,8 +72,8 @@ static int fd_rows(unsigned pid, uint32_t inode, uint32_t sequence) {
     return matched;
 }
 
-static int snapshot(int fd, int family, int protocol, const unsigned char *wanted,
-                    unsigned port, unsigned pid, uint32_t sequence) {
+static int dump_family(int fd, int family, int protocol, const unsigned char *wanted,
+                       unsigned port, unsigned pid, uint32_t sequence, unsigned *count) {
     struct { struct nlmsghdr header; struct inet_diag_req_v2 request; } request = {0};
     request.header.nlmsg_len = sizeof(request);
     request.header.nlmsg_type = SOCK_DIAG_BY_FAMILY;
@@ -83,10 +83,7 @@ static int snapshot(int fd, int family, int protocol, const unsigned char *wante
     request.request.sdiag_protocol = protocol;
     request.request.idiag_states = UINT32_MAX;
     struct sockaddr_nl kernel = {.nl_family = AF_NETLINK};
-    printf("{\"event\":\"snapshot_begin\",\"sequence\":%" PRIu32
-           ",\"boottime_ns\":%" PRIu64 "}\n", sequence, boot_ns());
     if (sendto(fd, &request, sizeof(request), 0, (struct sockaddr *)&kernel, sizeof(kernel)) != sizeof(request)) return -1;
-    unsigned count = 0;
     for (;;) {
         /* UAPI structs require alignment, unlike a bare byte array. */
         union { struct nlmsghdr align; unsigned char bytes[65536]; } buffer;
@@ -106,10 +103,7 @@ static int snapshot(int fd, int family, int protocol, const unsigned char *wante
                     memcpy(&result, NLMSG_DATA(header), sizeof(result));
                     if (result) return -1;
                 }
-                printf("{\"event\":\"snapshot_end\",\"sequence\":%" PRIu32
-                       ",\"boottime_ns\":%" PRIu64 ",\"sockets\":%u,\"complete\":true}\n",
-                       sequence, boot_ns(), count);
-                return fflush(stdout) ? -1 : 0;
+                return 0;
             }
             if (header->nlmsg_type != SOCK_DIAG_BY_FAMILY ||
                 header->nlmsg_len < NLMSG_LENGTH(sizeof(struct inet_diag_msg))) return -1;
@@ -140,10 +134,28 @@ static int snapshot(int fd, int family, int protocol, const unsigned char *wante
                    source, destination, ntohs(value->id.idiag_sport), ntohs(value->id.idiag_dport),
                    value->idiag_uid, value->idiag_inode, value->id.idiag_cookie[0], value->id.idiag_cookie[1],
                    value->id.idiag_if, mark, have_mark ? "true" : "false", matches < 0 ? "false" : "true", matches);
-            count++;
+            (*count)++;
         }
         if (remaining) return -1;
     }
+}
+
+static int snapshot(int fd, int family, int protocol, const unsigned char *wanted,
+                    unsigned port, unsigned pid, uint32_t sequence) {
+    unsigned count = 0;
+    printf("{\"event\":\"snapshot_begin\",\"sequence\":%" PRIu32
+           ",\"boottime_ns\":%" PRIu64 "}\n", sequence, boot_ns());
+    if (dump_family(fd, family, protocol, wanted, port, pid, sequence, &count)) return -1;
+    if (family == AF_INET) {
+        unsigned char mapped[16] = {0};
+        mapped[10] = mapped[11] = 0xff;
+        memcpy(mapped + 12, wanted, 4);
+        if (dump_family(fd, AF_INET6, protocol, mapped, port, pid, sequence, &count)) return -1;
+    }
+    printf("{\"event\":\"snapshot_end\",\"sequence\":%" PRIu32
+           ",\"boottime_ns\":%" PRIu64 ",\"sockets\":%u,\"complete\":true}\n",
+           sequence, boot_ns(), count);
+    return fflush(stdout) ? -1 : 0;
 }
 
 int main(int argc, char **argv) {

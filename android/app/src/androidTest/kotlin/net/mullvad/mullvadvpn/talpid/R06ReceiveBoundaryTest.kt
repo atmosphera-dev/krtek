@@ -33,11 +33,14 @@ internal object R06ReceiveBoundaryTest {
                     putString("krtek_r06_pre_connect", request.toString())
                 },
             )
-            val deadline = SystemClock.elapsedRealtime() + 30_000
+            val deadline = started + 30_000_000_000L
             while (!acknowledgement.exists()) {
-                check(SystemClock.elapsedRealtime() < deadline) { "Receive-boundary ACK deadline" }
+                check(SystemClock.elapsedRealtimeNanos() < deadline) {
+                    "Receive-boundary ACK deadline"
+                }
                 SystemClock.sleep(20)
             }
+            check(SystemClock.elapsedRealtimeNanos() < deadline) { "Receive-boundary ACK deadline" }
             val ack =
                 JSONObject(
                     acknowledgement.reader(Charsets.UTF_8).use {
@@ -52,6 +55,7 @@ internal object R06ReceiveBoundaryTest {
             ) {
                 "Receive-boundary ACK identity differs"
             }
+            check(SystemClock.elapsedRealtimeNanos() < deadline) { "Receive-boundary ACK deadline" }
             instrumentation.sendStatus(
                 0,
                 Bundle().apply {

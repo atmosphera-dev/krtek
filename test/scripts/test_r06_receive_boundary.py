@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from r06_receive_boundary import COMMANDS, preconnect, snapshot, summarize
 
@@ -21,11 +22,14 @@ TRAFFIC = '''TrafficController
 class Android:
     def __init__(self, missing=None, traffic=TRAFFIC):
         self.missing, self.traffic, self.acks = missing, traffic, []
+        self.ack_timeouts = []
 
     def boottime_ns(self):
         return {'android_boottime_s': '2.00'}
 
     def su(self, command, **kwargs):
+        if command == 'cat /proc/uptime':
+            return b'2.00 1.00\n'
         if self.missing == command:
             raise RuntimeError('PRIVATE_ERROR')
         if command == COMMANDS['trafficcontroller']:
@@ -34,13 +38,15 @@ class Android:
             return b'66: tun1: <UP> mtu 1280\n'
         return b'PRIVATE_RAW_KERNEL_STATE\n'
 
-    def run_as(self, command, data):
+    def run_as(self, command, data, **kwargs):
         self.acks.append((command, json.loads(data)))
+        self.ack_timeouts.append(kwargs.get('timeout'))
 
 
 class ReceiveBoundaryTests(unittest.TestCase):
     def request(self):
-        return dict(token='fixture-token', index=7, nonce='krtek-m3-fixture', consumer_uid=10182)
+        return dict(token='fixture-token', index=7, nonce='krtek-m3-fixture', consumer_uid=10182,
+                    elapsed_ns=2_000_000_000)
 
     def spec(self):
         return dict(token='fixture-token', arguments={'krtek_r06_receive_boundary': 'true'})
@@ -70,6 +76,9 @@ class ReceiveBoundaryTests(unittest.TestCase):
             p = Path(root)
             value = snapshot(Android(), p/'private/token', p/'collected/call/snapshot', self.request())
             self.assertEqual(len(value['private_files']), len(COMMANDS))
+            self.assertTrue(all(clock['begin']['android_boottime_s'] == '2.00' and
+                                clock['end']['android_boottime_s'] == '2.00'
+                                for clock in value['clocks'].values()))
             self.assertIn('PRIVATE', (p/'private/token/connectivity.txt').read_text())
             self.assertNotIn('PRIVATE', (p/'collected/call/snapshot/receive-boundary.json').read_text())
 
@@ -93,10 +102,13 @@ class ReceiveBoundaryTests(unittest.TestCase):
             command, ack = android.acks[0]
             self.assertEqual(ack, dict(token='fixture-token', index=7, nonce='krtek-m3-fixture', snapshot_sealed=True))
             self.assertIn('mv files/krtek-r06/fixture-token/receive-7.ack.next files/krtek-r06/fixture-token/receive-7.ack', command)
+            self.assertGreater(android.ack_timeouts[0], 0)
+            self.assertLessEqual(android.ack_timeouts[0], 30)
 
     def test_invalid_request_refused_before_android_io(self):
         for key, wrong in [('token', 'other'), ('index', -1), ('index', True), ('nonce', '../bad'),
-                           ('consumer_uid', '10182'), ('consumer_uid', -1)]:
+                           ('consumer_uid', '10182'), ('consumer_uid', -1),
+                           ('elapsed_ns', 0), ('elapsed_ns', True), ('elapsed_ns', '2000000000')]:
             with self.subTest(key=key, wrong=wrong), tempfile.TemporaryDirectory() as root:
                 p, android, request = Path(root), Android(), self.request()
                 request[key] = wrong
@@ -104,6 +116,15 @@ class ReceiveBoundaryTests(unittest.TestCase):
                     preconnect(android, p/'private', p/'collected/call', self.spec(), request)
                 self.assertEqual(android.acks, [])
                 self.assertFalse((p/'private').exists())
+
+    def test_shell_metacharacter_spec_token_is_rejected_before_android_io(self):
+        with tempfile.TemporaryDirectory() as root:
+            p, android, spec, request = Path(root), Android(), self.spec(), self.request()
+            spec['token'] = request['token'] = 'fixture;echo-unsafe'
+            with self.assertRaises(RuntimeError):
+                preconnect(android, p/'private', p/'collected/call', spec, request)
+            self.assertEqual(android.acks, [])
+            self.assertFalse((p/'private').exists())
 
     def test_default_off_refuses_snapshot_and_ack(self):
         with tempfile.TemporaryDirectory() as root:
@@ -126,6 +147,63 @@ class ReceiveBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             p, android = Path(root), Android(traffic='unavailable')
             with self.assertRaises(RuntimeError):
+                preconnect(android, p/'private', p/'collected/call', self.spec(), self.request())
+            self.assertEqual(android.acks, [])
+
+    def test_timeout_marker_is_private_but_never_acknowledged(self):
+        class Partial(Android):
+            def su(self, command, **kwargs):
+                if command == COMMANDS['netd']:
+                    return b"PRIVATE partial\n*** SERVICE 'netd' DUMP TIMEOUT (10000ms) EXPIRED ***\n"
+                return super().su(command, **kwargs)
+        with tempfile.TemporaryDirectory() as root:
+            p, android = Path(root), Partial()
+            with self.assertRaisesRegex(RuntimeError, 'incomplete'):
+                preconnect(android, p/'private', p/'collected/call', self.spec(), self.request())
+            value = json.loads((p/'collected/call/receive-7/receive-boundary.json').read_text())
+            self.assertEqual(value['unavailable']['netd'], 'TimeoutError')
+            self.assertIn(b'PRIVATE partial', (p/'private/receive-7/netd.txt').read_bytes())
+            self.assertNotIn('PRIVATE partial', json.dumps(value))
+            self.assertEqual(android.acks, [])
+
+    def test_one_deadline_covers_serial_commands_and_retains_incomplete_receipt(self):
+        now, timeouts = [0.0], []
+        class Slow(Android):
+            def su(self, command, **kwargs):
+                if command in COMMANDS.values():
+                    timeouts.append(kwargs['timeout'])
+                    now[0] += 7.9
+                return super().su(command, **kwargs)
+        with tempfile.TemporaryDirectory() as root, patch('r06_receive_boundary.time.monotonic', side_effect=lambda: now[0]):
+            p, android = Path(root), Slow()
+            with self.assertRaisesRegex(RuntimeError, 'incomplete'):
+                preconnect(android, p/'private', p/'collected/call', self.spec(), self.request())
+            self.assertLessEqual(len(timeouts), 4)
+            self.assertLess(timeouts[-1], 7)
+            value = json.loads((p/'collected/call/receive-7/receive-boundary.json').read_text())
+            self.assertIn('deadline', value['unavailable'])
+            self.assertEqual(android.acks, [])
+
+    def test_file_write_expiry_withholds_ack(self):
+        now = [0.0]
+        def slow_fsync(_fd):
+            now[0] = 31.0
+        with tempfile.TemporaryDirectory() as root, patch('r06_receive_boundary.time.monotonic', side_effect=lambda: now[0]), \
+                patch('r06_receive_boundary.os.fsync', side_effect=slow_fsync):
+            p, android = Path(root), Android()
+            with self.assertRaisesRegex(RuntimeError, 'incomplete'):
+                preconnect(android, p/'private', p/'collected/call', self.spec(), self.request())
+            self.assertEqual(android.acks, [])
+
+    def test_stale_request_gets_no_ack(self):
+        class Late(Android):
+            def su(self, command, **kwargs):
+                if command == 'cat /proc/uptime':
+                    return b'33.00 1.00\n'
+                return super().su(command, **kwargs)
+        with tempfile.TemporaryDirectory() as root:
+            p, android = Path(root), Late()
+            with self.assertRaisesRegex(RuntimeError, 'incomplete'):
                 preconnect(android, p/'private', p/'collected/call', self.spec(), self.request())
             self.assertEqual(android.acks, [])
 

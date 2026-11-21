@@ -16,6 +16,11 @@ import subprocess
 import threading
 import time
 
+if __package__:
+    from .r06_receive_boundary import dumpsys_timed_out
+else:
+    from r06_receive_boundary import dumpsys_timed_out
+
 KINDS = {'ingress4', 'ingress6', 'uid_owner', 'rules4', 'rules6', 'links', 'addresses', 'snmp', 'netstat'}
 FIXED = {ipaddress.ip_address(address) for address in ('172.27.1.1', 'fdf0:ce4a:801d::172:27:1:1')}
 
@@ -226,7 +231,7 @@ def framework_summary(data):
     if len(lines) < 3 or not lines[0].isdigit() or not lines[-1].isdigit():
         raise ValueError('Framework BOOTTIME brackets unavailable')
     begin, end = int(lines[0]), int(lines[-1])
-    if end < begin or not any('Network' in line for line in lines[1:-1]):
+    if end < begin or dumpsys_timed_out(data) or not any('Network' in line for line in lines[1:-1]):
         raise ValueError('Framework dump incomplete')
     vpns = []
     for line in lines[1:-1]:
@@ -262,7 +267,7 @@ class AsyncSampler:
         try:
             with (self.private / 'framework.jsonl').open('x') as raw:
                 while not self.stop_event.is_set():
-                    command = '{0}/sampler --boottime; dumpsys connectivity; {0}/sampler --boottime'.format(self.remote)
+                    command = 'set -e; {0}/sampler --boottime; dumpsys connectivity; {0}/sampler --boottime'.format(self.remote)
                     data = self.android.su(command, timeout=15)
                     raw.write(json.dumps(dict(raw=data.decode())) + '\n')
                     raw.flush()
@@ -305,18 +310,44 @@ class AsyncSampler:
         if hasattr(self, 'result'):
             return self.result
         self.stop_event.set()
-        if self.proc is not None and self.proc.poll() is None:
-            command = ('p=$(cat {0}/pid); test "$(readlink /proc/$p/exe)" = {0}/sampler && kill -TERM "$p"').format(self.remote)
-            self.android.su(command)
-        if self.proc is not None:
-            self.proc.wait(timeout=20)
-        if self.thread is not None:
-            self.thread.join(timeout=20)
-            if self.thread.is_alive():
-                raise ValueError('Framework worker did not join')
+        failures = []
+        def attempt(action):
+            try:
+                action()
+            except BaseException as error:
+                failures.append(error)
+                self.errors.append(type(error).__name__ + ': ' + str(error))
+
+        def stop_remote():
+            if self.proc is not None and self.proc.poll() is None:
+                command = ('p=$(cat {0}/pid); test "$(readlink /proc/$p/exe)" = {0}/sampler && kill -TERM "$p"').format(self.remote)
+                self.android.su(command, timeout=20)
+
+        def wait_native():
+            if self.proc is not None:
+                try:
+                    self.proc.wait(timeout=20)
+                except BaseException as error:
+                    # Only our ADB child is terminated here, never an unverified
+                    # Android PID. The remote failure remains a failed run.
+                    failures.append(error)
+                    self.errors.append(type(error).__name__ + ': ' + str(error))
+                    attempt(self.proc.terminate)
+                    attempt(lambda: self.proc.wait(timeout=5))
+
+        def join_framework():
+            if self.thread is not None:
+                self.thread.join(timeout=20)
+                if self.thread.is_alive():
+                    raise ValueError('Framework worker did not join')
+
+        for action in (stop_remote, wait_native, join_framework):
+            attempt(action)
         for stream in (self.raw, getattr(self, 'error_log', None)):
             if stream:
-                stream.close()
+                attempt(stream.close)
+        if failures:
+            raise failures[0]
         if self.proc is None or self.proc.returncode != 0 or self.errors or not self.framework:
             raise ValueError('Async observer incomplete: ' + repr(self.errors))
         result = summarize(self.private / 'native.jsonl', self.public / 'samples.jsonl', self.uid)
