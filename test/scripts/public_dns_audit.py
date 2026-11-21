@@ -133,8 +133,12 @@ def audit(directory, receipt_bytes):
     else:
         need(receipt.get('received', 0) == 0 and not receipt['semantic_usable_a'],
              'Received bytes/success without a saved response')
+        need(not (directory / 'response-000.bin').exists()
+             and not (directory / 'response-000.bin').is_symlink(), 'Unreported first response')
         result['classification'] = receipt['classification']
-    need(not (directory / 'response-001.bin').exists(), 'Unreported extra response')
+    expected_responses = {'response-000.bin'} if 'response' in receipt else set()
+    need({path.name for path in directory.glob('response-*.bin')} == expected_responses,
+         'Unreported extra response')
     # This verdict proves byte custody and independent analysis, never Cloudflare delivery.
     result['custody_status'] = 'PASS'
     return result

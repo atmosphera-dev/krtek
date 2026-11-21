@@ -16,7 +16,7 @@ def audit_call_owner(text, receipt):
     start, finish = (int(receipt[key]) for key in ('call_started_ns', 'call_finished_ns'))
     need(all(value > 0 for value in expected.values()) and 0 < start <= finish,
          'Invalid call owner/window')
-    opened, closed = [], []
+    opened, closed, lifetimes = [], [], {}
     for line in text.splitlines():
         if 'KRTEK_PUBLIC_DNS ' not in line:
             continue
@@ -27,6 +27,11 @@ def audit_call_owner(text, receipt):
              'Missing durable carrier owner schema')
         stamp = int(fields['boot_ns'])
         owner = {key: int(fields[key]) for key in keys}
+        lifetime = lifetimes.setdefault(tuple(owner[key] for key in keys), dict(open=[], close=[]))
+        if fields.get('boundary') == 'observer-open':
+            lifetime['open'].append(stamp)
+        if fields.get('boundary') == 'observer-close':
+            lifetime['close'].append(stamp)
         need(not (start <= stamp <= finish and owner != expected),
              'Observation gap: owner changed during call')
         if owner == expected:
@@ -36,6 +41,15 @@ def audit_call_owner(text, receipt):
                 closed.append(stamp)
     need(len(opened) == len(closed) == 1 and opened[0] <= start <= finish <= closed[0],
          'Observation gap: owner does not seal the complete call')
+    for owner, lifetime in lifetimes.items():
+        if owner == tuple(expected[key] for key in keys):
+            continue
+        need(len(lifetime['open']) <= 1 and len(lifetime['close']) <= 1,
+             'Observation gap: ambiguous foreign owner lifetime')
+        first = lifetime['open'][0] if lifetime['open'] else 0
+        last = lifetime['close'][0] if lifetime['close'] else float('inf')
+        need(first <= last, 'Observation gap: invalid foreign owner lifetime')
+        need(last < start or first > finish, 'Observation gap: foreign owner changed during call')
 
 
 def read_carrier(text, receipt):

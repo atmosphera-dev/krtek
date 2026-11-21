@@ -23,7 +23,7 @@ def padding_only(small, large):
     return dict(padding_is_only_variable=True, small_sha256=sha(small), large_sha256=sha(large))
 
 
-def compare_pair(krtek, stock, krtek_query, stock_query):
+def compare_pair(krtek, stock, krtek_query, stock_query, krtek_receipt, stock_receipt):
     need(krtek['app'] == 'krtek' and stock['app'] == 'stock', 'Independent app labels required')
     need(stock['source_commit'] == STOCK_SOURCE and stock['source_unmodified'] is True,
          'Stock source must be the pinned unmodified commit')
@@ -55,6 +55,8 @@ def compare_pair(krtek, stock, krtek_query, stock_query):
     right = stock['dns_audit']
     need(left['custody_status'] == right['custody_status'] == 'PASS', 'Unverified private byte custody')
     need(left['query_sha256'] == right['query_sha256'] == sha(krtek_query), 'Audit query binding differs')
+    for audit, receipt in ((left, krtek_receipt), (right, stock_receipt)):
+        need(audit['receipt_sha256'] == sha(receipt), 'Audit selected receipt binding differs')
     usable = (left['usable_a'], right['usable_a'])
     observation = {(True, True): 'both-usable', (True, False): 'stock-no-usable-answer',
                    (False, True): 'krtek-no-usable-answer', (False, False): 'neither-usable'}[usable]

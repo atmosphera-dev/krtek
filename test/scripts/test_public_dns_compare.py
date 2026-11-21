@@ -23,9 +23,13 @@ class PublicDnsCompareTest(unittest.TestCase):
         self.krtek.update(app='krtek', instance='krtek-d-krtek', source_commit='7c610b', version_name='krtek-test')
         self.stock = copy.deepcopy(common)
         self.stock.update(app='stock', instance='krtek-d-stock', source_commit=STOCK_SOURCE, version_name='stock-test')
+        self.krtek_receipt, self.stock_receipt = b'krtek attempt', b'stock attempt'
+        self.krtek['dns_audit']['receipt_sha256'] = sha(self.krtek_receipt)
+        self.stock['dns_audit']['receipt_sha256'] = sha(self.stock_receipt)
 
     def result(self):
-        return compare_pair(self.krtek, self.stock, SMALL, SMALL)
+        return compare_pair(self.krtek, self.stock, SMALL, SMALL,
+                            self.krtek_receipt, self.stock_receipt)
 
     def test_matched_inputs_are_not_a_cause_claim(self):
         result = self.result()
@@ -76,7 +80,16 @@ class PublicDnsCompareTest(unittest.TestCase):
             self.result()
         self.stock['peer'] = '1.1.1.1'
         with self.assertRaisesRegex(AuditError, 'query bytes differ'):
-            compare_pair(self.krtek, self.stock, SMALL, b'wrong')
+            compare_pair(self.krtek, self.stock, SMALL, b'wrong',
+                         self.krtek_receipt, self.stock_receipt)
+
+    def test_rejects_same_query_audit_from_another_attempt(self):
+        for call in (self.krtek, self.stock):
+            original = call['dns_audit']['receipt_sha256']
+            call['dns_audit']['receipt_sha256'] = sha(b'earlier usable attempt')
+            with self.assertRaisesRegex(AuditError, 'selected receipt binding'):
+                self.result()
+            call['dns_audit']['receipt_sha256'] = original
 
     def test_rejects_false_byte_custody_or_query_binding(self):
         self.stock['dns_audit']['custody_status'] = 'FAIL'

@@ -72,6 +72,17 @@ class PublicDnsAuditTest(unittest.TestCase):
         self.assertEqual('malformed', result['classification'])
         self.assertEqual(b'bad', (self.directory / 'response-000.bin').read_bytes())
 
+    def test_rejects_unreported_first_response_on_timeout(self):
+        del self.receipt['response']
+        self.receipt.update(received=0, classification='receive-timeout', semantic_usable_a=False)
+        with self.assertRaisesRegex(audit.AuditError, 'Unreported first response'):
+            self.result()
+
+    def test_rejects_any_unreported_response_artifact(self):
+        (self.directory / 'response-002.bin').write_bytes(GOOD)
+        with self.assertRaisesRegex(audit.AuditError, 'Unreported extra response'):
+            self.result()
+
     def test_wrong_source_and_port(self):
         self.receipt.update(reply_source='1.0.0.1', semantic_usable_a=False)
         self.assertEqual('wrong-source', self.result()['classification'])

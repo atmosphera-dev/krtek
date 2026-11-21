@@ -41,6 +41,7 @@ def capture_records(data):
 def decode(packet):
     need(packet and len(packet) <= 65575, 'Invalid IP packet extent')
     family = packet[0] >> 4
+    extent_headers = 0
     if family == 4:
         need(len(packet) >= 20, 'Truncated IPv4 header')
         start = (packet[0] & 15) * 4
@@ -53,6 +54,7 @@ def decode(packet):
         source, destination = packet[12:16], packet[16:20]
         identifier = int.from_bytes(packet[4:6], 'big') if offset or more else None
         protocol = packet[9]
+        extent_headers = start
     elif family == 6:
         need(len(packet) >= 40 and int.from_bytes(packet[4:6], 'big') + 40 == len(packet),
              'IPv6 payload length')
@@ -64,6 +66,7 @@ def decode(packet):
             length = (packet[start + 1] + 1) * 8
             need(start + length <= len(packet), 'IPv6 extension extent')
             protocol, start = packet[start], start + length
+        extent_headers = start - 40
         if protocol == 44:
             need(start + 8 <= len(packet) and packet[start + 1] == 0, 'IPv6 Fragment extent')
             field = int.from_bytes(packet[start + 2:start + 4], 'big')
@@ -78,24 +81,43 @@ def decode(packet):
     need(offset + len(payload) <= (65515 if family == 4 else 65535), 'IP complete protocol extent')
     return dict(family=family, source=str(ipaddress.ip_address(source)),
                 destination=str(ipaddress.ip_address(destination)), protocol=protocol,
-                identifier=identifier, offset=offset, more=more, payload=payload)
+                identifier=identifier, offset=offset, more=more, payload=payload,
+                extent_headers=extent_headers)
 
 
-def audit_datagram(packets, source, destination, source_port, destination_port, payload):
-    need(packets, 'No matching IP packets')
-    rows = [decode(packet) for packet in packets]
-    source, destination = str(ipaddress.ip_address(source)), str(ipaddress.ip_address(destination))
-    key = (rows[0]['family'], source, destination, 17, rows[0]['identifier'])
-    need(all((row['family'], row['source'], row['destination'], row['protocol'], row['identifier']) == key
-             for row in rows), 'Mixed packet tuple/protocol/fragment ID')
-    need(rows[0]['identifier'] is not None or len(rows) == 1, 'Multiple unfragmented datagrams')
+def udp_segment(protocol, payload):
+    """Walk fragmentable extensions only at offset zero or after reassembly."""
+    start = 0
+    while protocol in (0, 43, 60):
+        need(start + 2 <= len(payload), 'Truncated fragmentable IPv6 extension')
+        length = (payload[start + 1] + 1) * 8
+        need(start + length <= len(payload), 'Fragmentable IPv6 extension extent')
+        protocol, start = payload[start], start + length
+    return payload[start:] if protocol == 17 else None
+
+
+def reassemble(rows):
     ordered = sorted(rows, key=lambda row: row['offset'])
     segment = bytearray()
     for index, row in enumerate(ordered):
         need(row['offset'] == len(segment), 'Missing, duplicate or overlapping fragment')
         need(row['more'] == (index != len(ordered) - 1), 'Missing/conflicting terminal fragment')
         segment.extend(row['payload'])
-    need(len(segment) >= 8, 'Truncated UDP header')
+    need(ordered[0]['extent_headers'] + len(segment) <= 65535, 'IP complete protocol extent')
+    return udp_segment(ordered[0]['protocol'], bytes(segment))
+
+
+def audit_datagram(packets, source, destination, source_port, destination_port, payload):
+    need(packets, 'No matching IP packets')
+    rows = [decode(packet) for packet in packets]
+    need(all(row['family'] == 6 or row['protocol'] == 17 for row in rows), 'Not UDP protocol')
+    source, destination = str(ipaddress.ip_address(source)), str(ipaddress.ip_address(destination))
+    key = (rows[0]['family'], source, destination, rows[0]['protocol'], rows[0]['identifier'])
+    need(all((row['family'], row['source'], row['destination'], row['protocol'], row['identifier']) == key
+             for row in rows), 'Mixed packet tuple/protocol/fragment ID')
+    need(rows[0]['identifier'] is not None or len(rows) == 1, 'Multiple unfragmented datagrams')
+    segment = reassemble(rows)
+    need(segment is not None and len(segment) >= 8, 'Truncated/non-UDP header')
     sport, dport, length, check = struct.unpack_from('!4H', segment)
     need((sport, dport, length) == (source_port, destination_port, len(segment)), 'UDP tuple/length differs')
     need(bytes(segment[8:]) == payload, 'Complete UDP bytes differ from saved app bytes')
@@ -124,7 +146,8 @@ def audit_tun(records, probe, query, response, observer):
         if not begin <= record['timestamp_ns'] <= end:
             continue
         row = decode(record['packet'])
-        if row['family'] != probe['family'] or row['protocol'] != 17:
+        if (row['family'] != probe['family'] or row['protocol'] not in (17, 0, 43, 60)
+                or (row['family'] == 4 and row['protocol'] != 17)):
             continue
         pair = (ipaddress.ip_address(row['source']), ipaddress.ip_address(row['destination']))
         expected = (ipaddress.ip_address(probe['local_address']), ipaddress.ip_address(probe['remote_address']))
@@ -133,21 +156,47 @@ def audit_tun(records, probe, query, response, observer):
         elif pair == tuple(reversed(expected)):
             incoming.append((record, row))
 
+    def candidates(rows, sport, dport, dns_id):
+        matches, attributed = [], set()
+        for record, first in rows:
+            if first['offset'] != 0:
+                continue
+            segment = udp_segment(first['protocol'], first['payload'])
+            if segment is None or len(segment) < 8:
+                continue
+            group = [(record, first)] if first['identifier'] is None else [
+                (r, row) for r, row in rows if (row['protocol'], row['identifier']) ==
+                (first['protocol'], first['identifier'])]
+            need(sum(row['offset'] == 0 for _, row in group) == 1,
+                 'Missing/duplicate DNS first packet')
+            if struct.unpack_from('!HH', segment) == (sport, dport):
+                if len(segment) < 10:
+                    # IPv4 can put only the UDP header in its first fragment.
+                    try:
+                        segment = reassemble([row for _, row in group])
+                    except AuditError:
+                        continue
+                if segment is None or len(segment) < 10:
+                    continue
+                if segment[8:10] == dns_id:
+                    matches.append([r['packet'] for r, _ in group])
+            attributed.update(id(r) for r, _ in group)
+        matching = sum(len(group) for group in matches)
+        return matches, matching, len(rows) - len(attributed)
+
     def select(rows, sport, dport, data):
-        firsts = [(record, row) for record, row in rows if row['offset'] == 0
-                  and len(row['payload']) >= 10
-                  and struct.unpack_from('!HH', row['payload']) == (sport, dport)
-                  and row['payload'][8:10] == data[:2]]
-        need(len(firsts) == 1, 'Missing/duplicate DNS first packet')
-        identifier = firsts[0][1]['identifier']
-        if identifier is None:
-            return [firsts[0][0]['packet']]
-        return [record['packet'] for record, row in rows if row['identifier'] == identifier]
+        matches, _, _ = candidates(rows, sport, dport, data[:2])
+        need(len(matches) == 1, 'Missing/duplicate DNS first packet')
+        return matches[0]
 
     request = audit_datagram(select(outgoing, probe['local_port'], 53, query),
         probe['local_address'], probe['remote_address'], probe['local_port'], 53, query)
+    _, matching, unattributed = candidates(incoming, 53, probe['local_port'], query[:2])
     result = dict(request=request, response_observed=response is not None,
-                  return_window_complete=True, matching_return_packet_count=len(incoming))
+                  return_window_complete=True, matching_return_packet_count=matching,
+                  reverse_address_packet_count=len(incoming),
+                  unattributed_return_packet_count=unattributed,
+                  unrelated_return_packet_count=len(incoming) - matching - unattributed)
     if response is not None:
         result['response'] = audit_datagram(select(incoming, 53, probe['local_port'], response),
             probe['remote_address'], probe['local_address'], 53, probe['local_port'], response)

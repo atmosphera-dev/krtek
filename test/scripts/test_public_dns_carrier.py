@@ -54,9 +54,12 @@ class PublicDnsCarrierTest(unittest.TestCase):
 
     def test_rejects_orphan_and_duplicate_success_markers(self):
         _, lines = self.lines()
-        for extra in (lines[-2], lines[-2].replace('packet=1', 'packet=999')):
-            with self.assertRaises(AuditError):
-                read_carrier('\n'.join(lines + [extra]), self.receipt)
+        with self.assertRaisesRegex(AuditError, 'Duplicate carrier success marker'):
+            read_carrier('\n'.join([*lines, lines[-2]]), self.receipt)
+        orphan = [line.replace('completions=1', 'completions=2') for line in lines]
+        orphan.append(lines[-2].replace('packet=1', 'packet=999'))
+        with self.assertRaisesRegex(AuditError, 'Orphan carrier success marker'):
+            read_carrier('\n'.join(orphan), self.receipt)
 
     def test_rejects_wrong_epoch_clock_and_unsealed_lifetime(self):
         _, lines = self.lines()
@@ -112,6 +115,23 @@ class PublicDnsCarrierTest(unittest.TestCase):
         _, lines, receipt = self.durable()
         replacement = lines[0].replace('pid=123', 'pid=124').replace('boot_ns=75', 'boot_ns=180')
         audit_call_owner('\n'.join(lines + [replacement]), receipt)
+
+    def test_rejects_foreign_lifetime_enclosing_call_without_packets(self):
+        _, lines, receipt = self.durable()
+        foreign = [lines[0].replace('pid=123', 'pid=124').replace('boot_ns=75', 'boot_ns=80'),
+                   lines[-1].replace('pid=123', 'pid=124').replace('boot_ns=150', 'boot_ns=140')]
+        with self.assertRaisesRegex(AuditError, 'foreign owner changed'):
+            read_carrier('\n'.join([*lines, *foreign]), receipt)
+
+    def test_foreign_open_lifetime_and_missing_open_are_not_silence(self):
+        _, lines, receipt = self.durable()
+        for foreign in (lines[0].replace('pid=123', 'pid=124'),
+                        lines[-1].replace('pid=123', 'pid=124')):
+            with self.assertRaisesRegex(AuditError, 'foreign owner changed'):
+                read_carrier('\n'.join([*lines, foreign]), receipt)
+        prior = [lines[0].replace('pid=123', 'pid=124').replace('boot_ns=75', 'boot_ns=60'),
+                 lines[-1].replace('pid=123', 'pid=124').replace('boot_ns=150', 'boot_ns=80')]
+        audit_call_owner('\n'.join([*lines, *prior]), receipt)
 
 
 if __name__ == '__main__':
