@@ -61,7 +61,7 @@ fn runtime_regions_share_one_root_and_local_exhaustion_preserves_control() {
     assert_eq!(root.used(), 0);
 }
 
-pub(super) fn policy() -> LocalNetworkAccess {
+pub(crate) fn policy() -> LocalNetworkAccess {
     LocalNetworkAccess {
         enabled: true,
         skip_local_rules_for_excluded_apps: true,
@@ -76,7 +76,7 @@ pub(super) fn policy() -> LocalNetworkAccess {
     }
 }
 
-pub(super) fn observation() -> NetworkObservation {
+pub(crate) fn observation() -> NetworkObservation {
     NetworkObservation {
         sequence: 9,
         permissions: Some(PermissionState {

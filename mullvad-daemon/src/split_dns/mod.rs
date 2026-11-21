@@ -4,6 +4,9 @@
 mod transport;
 mod udp;
 
+mod home_path;
+mod local_path;
+
 #[cfg(test)]
 pub(crate) mod home_io;
 

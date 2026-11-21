@@ -42,6 +42,34 @@ impl HomeDnsGrant {
 }
 
 impl DeliveryAuthority {
+    /// Resolver selection belongs to the Local Home path, never to the DNS
+    /// message consumer. The normal authorization below rechecks the selected
+    /// address and policy, so a concurrent policy replacement cannot grant the
+    /// old address under the new policy.
+    pub(crate) fn home_dns_authorize_configured(
+        &self,
+        source: SocketAddr,
+        transport: talpid_lan_forwarder::Transport,
+        buffers: &dyn RelayBufferAllocator,
+    ) -> Result<HomeDnsGrant, Refused> {
+        let destination = self
+            .inputs
+            .read()
+            .unwrap()
+            .policy
+            .split_dns
+            .home_resolver
+            .ok_or(Refused::Denied)?;
+        self.home_dns_authorize(
+            Flow {
+                transport,
+                source,
+                destination: SocketAddr::new(destination, 53),
+            },
+            buffers,
+        )
+    }
+
     /// Observe authority changes as well as explicit per-query retirement. A
     /// blocked socket does not have to become readable to notice revocation.
     pub(crate) async fn home_dns_retired(&self, query: &HomeDnsGrant) {

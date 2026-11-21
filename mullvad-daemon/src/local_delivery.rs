@@ -1451,4 +1451,4 @@ mod platform {
 pub use platform::{PlatformFactory, preparer};
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

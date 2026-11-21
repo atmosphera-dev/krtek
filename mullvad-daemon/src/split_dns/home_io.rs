@@ -84,6 +84,7 @@ struct Preparations {
 pub(crate) struct HomeIoOwner {
     preparations: Arc<Mutex<Preparations>>,
     buffers: Arc<dyn RelayBufferAllocator>,
+    closed: tokio::sync::watch::Sender<bool>,
 }
 
 impl HomeIoOwner {
@@ -91,6 +92,7 @@ impl HomeIoOwner {
         Self {
             preparations: Arc::default(),
             buffers,
+            closed: tokio::sync::watch::channel(false).0,
         }
     }
 
@@ -145,6 +147,7 @@ impl HomeIoOwner {
 
     pub(crate) async fn close(&self) -> io::Result<()> {
         self.preparations.lock().unwrap().closed = true;
+        self.closed.send_replace(true);
         while let Some(result) =
             poll_fn(|cx| self.preparations.lock().unwrap().tasks.poll_join_next(cx)).await
         {
@@ -154,6 +157,15 @@ impl HomeIoOwner {
             Err(io::Error::other("Home DNS preparation panicked"))
         } else {
             Ok(())
+        }
+    }
+
+    pub(crate) async fn closed(&self) {
+        let mut closed = self.closed.subscribe();
+        while !*closed.borrow_and_update() {
+            if closed.changed().await.is_err() {
+                break;
+            }
         }
     }
 
@@ -219,6 +231,10 @@ pub(crate) struct HomeRuntime {
 }
 
 impl HomeRuntime {
+    pub(crate) fn current(&self) -> bool {
+        self.check(self.capability.destination()).is_ok()
+    }
+
     fn check(&self, server: SocketAddr) -> io::Result<()> {
         if self.capability.current()
             && !self.owner.preparations.lock().unwrap().closed
