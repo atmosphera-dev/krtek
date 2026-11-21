@@ -5,6 +5,8 @@ use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 mod android_config;
+#[cfg(test)]
+pub mod split_dns;
 pub mod transport;
 pub use android_config::AndroidTunConfig;
 mod configuration;
