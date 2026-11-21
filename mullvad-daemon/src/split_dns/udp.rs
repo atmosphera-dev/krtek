@@ -159,6 +159,13 @@ pub(super) struct HomeUdpOutput {
 }
 
 impl HomeUdpOutput {
+    pub(super) fn current(&self) -> bool {
+        self.capture.current()
+            && self.output.as_ref().is_some_and(|(authority, output)| {
+                authority.with_current(|_, _, _| ()).is_ok() && output.current()
+            })
+    }
+
     pub(super) fn has_output(&self) -> bool {
         self.output.is_some()
     }
@@ -203,6 +210,17 @@ impl HomeUdpOutput {
 }
 
 impl UdpQuery {
+    pub(super) fn check_input(&self, input: &CompletedDatagram) -> Result<(), IpError> {
+        let packet = input.packet()?;
+        if packet.flow.source != self.client
+            || packet.flow.destination != self.resolver
+            || decode_message(packet.payload).map_err(|_| IpError::Malformed)? != self.request
+        {
+            return Err(IpError::Malformed);
+        }
+        Ok(())
+    }
+
     /// Acquire through the selected Home path only. Preserve every acquired
     /// lease, including the UDP lease when Home TC requires a TCP exchange.
     /// Denied/unavailable paths produce SERVFAIL; retirement suppresses the whole

@@ -110,6 +110,13 @@ struct DatagramOutput {
 }
 
 impl DatagramReply {
+    /// Lifetime only, never permission to emit into a capture sink.
+    pub fn current(&self) -> bool {
+        self.output
+            .as_ref()
+            .is_some_and(|output| output.input.current())
+    }
+
     pub fn has_output(&self) -> bool {
         self.output.is_some()
     }

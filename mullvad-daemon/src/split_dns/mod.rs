@@ -3,6 +3,7 @@
 
 mod transport;
 mod udp;
+mod udp_work;
 
 mod home_path;
 mod local_path;
