@@ -9,6 +9,8 @@
 use std::{
     future::Future,
     net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
 };
 
 use hickory_proto::{
@@ -16,8 +18,12 @@ use hickory_proto::{
     serialize::binary::{BinEncodable, BinEncoder},
 };
 use mullvad_types::settings::local_network_access::split_dns::{DnsLane, SuffixMatcher};
+use talpid_types::relay_flow::{BUFFER_OVERHEAD, RelayBufferAllocator, RelayBufferReservation};
 
-use super::transport::{ExchangeError, Protocol, decode_message};
+use super::{
+    home_path::{HomeDnsPath, HomeDnsQuery},
+    transport::{ExchangeError, Protocol, decode_message},
+};
 
 pub(super) enum UdpDecision<'a> {
     PassThrough(&'a [u8]),
@@ -85,7 +91,98 @@ pub(super) struct UdpReply {
     pub bytes: Vec<u8>,
 }
 
+/// Owns Home authority until the last client-facing fragment or retry is gone.
+/// No raw reply extraction: a native output job retains this guard and invokes
+/// `with_current` for every packet, inside its existing capture/sink check.
+/// This guard checks Home lifetime only; it does not grant capture authority.
+pub(super) struct HomeUdpReply {
+    reply: UdpReply,
+    leases: [Option<Arc<dyn HomeDnsQuery>>; 2],
+    _storage: Arc<dyn RelayBufferReservation>,
+}
+
+impl HomeUdpReply {
+    pub(super) fn with_current<T>(
+        &self,
+        emit: impl FnOnce(SocketAddr, SocketAddr, &[u8]) -> T,
+    ) -> Result<T, ExchangeError> {
+        if !self.leases.iter().flatten().all(|lease| lease.current()) {
+            return Err(ExchangeError::Closed);
+        }
+        Ok(emit(
+            self.reply.source,
+            self.reply.destination,
+            &self.reply.bytes,
+        ))
+    }
+}
+
 impl UdpQuery {
+    /// Acquire through the selected Home path only. Preserve every acquired
+    /// lease, including the UDP lease when Home TC requires a TCP exchange.
+    /// Denied/unavailable paths produce SERVFAIL; retirement suppresses the whole
+    /// result rather than allowing a successor path to revive this query.
+    pub(super) async fn answer(
+        self,
+        path: Option<&dyn HomeDnsPath>,
+        timeout: Duration,
+        tcp_retry: bool,
+        injection_limit: u16,
+        buffers: &dyn RelayBufferAllocator,
+    ) -> Result<HomeUdpReply, ExchangeError> {
+        // Complete wire response plus library-produced truncation may coexist.
+        // Keep this wire-storage peak charged before exchange through final use.
+        let storage = buffers
+            .try_reserve(2 * (usize::from(u16::MAX) + 1) + BUFFER_OVERHEAD)
+            .map_err(|_| ExchangeError::Io(std::io::ErrorKind::OutOfMemory.into()))?;
+        let client = self.client;
+        let mut leases: [Option<Arc<dyn HomeDnsQuery>>; 2] = [None, None];
+        let reply = self
+            .answer_with(
+                |protocol, message| {
+                    let previous = leases[0].clone();
+                    let query = if leases.iter().flatten().all(|lease| lease.current()) {
+                        path.ok_or(ExchangeError::Closed)
+                            .and_then(|path| path.authorize(client, protocol))
+                            .map(Arc::<dyn HomeDnsQuery>::from)
+                    } else {
+                        Err(ExchangeError::Closed)
+                    };
+                    if let Ok(query) = &query {
+                        let index = match protocol {
+                            Protocol::Udp => 0,
+                            Protocol::Tcp => 1,
+                        };
+                        leases[index] = Some(query.clone());
+                    }
+                    async move {
+                        let query = query?;
+                        tokio::select! {
+                            biased;
+                            _ = async {
+                                match previous {
+                                    Some(query) => query.retired().await,
+                                    None => std::future::pending().await,
+                                }
+                            } => Err(ExchangeError::Closed),
+                            _ = query.retired() => Err(ExchangeError::Closed),
+                            result = query.exchange(timeout, message) => result,
+                        }
+                    }
+                },
+                tcp_retry,
+                injection_limit,
+            )
+            .await?;
+        let reply = HomeUdpReply {
+            reply,
+            leases,
+            _storage: storage,
+        };
+        reply.with_current(|_, _, _| ())?;
+        Ok(reply)
+    }
+
     /// `home` is scoped to one Home resolver/policy. Each protocol invocation
     /// needs its own matching Home grant. It must cancel on revocation; it must
     /// never protect/bind a different resolver as a recovery action.
@@ -94,7 +191,7 @@ impl UdpQuery {
     /// retry, not merely that Home accepts TCP. Until that frontend exists it is
     /// false, and an oversized answer becomes SERVFAIL rather than a leaked retry.
     /// `injection_limit` is the actual complete-datagram output capability, not MTU.
-    pub(super) async fn answer<F, Fut>(
+    async fn answer_with<F, Fut>(
         self,
         mut home: F,
         tcp_retry: bool,
@@ -190,3 +287,7 @@ impl UdpQuery {
 #[cfg(test)]
 #[path = "udp_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "udp_path_tests.rs"]
+mod path_tests;

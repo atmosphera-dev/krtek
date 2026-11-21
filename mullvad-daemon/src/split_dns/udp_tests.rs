@@ -148,7 +148,7 @@ async fn split_dns_udp_all_types_retain_original_resolver_tuple_and_full_home_by
             let expected = answer(original.clone(), 100);
             let wire = expected.as_buffer().to_vec();
             let reply = intercepted(&original, ipv6)
-                .answer(
+                .answer_with(
                     |protocol, question| {
                         assert_eq!(protocol, Protocol::Udp);
                         assert_eq!(question, original);
@@ -176,7 +176,7 @@ async fn split_dns_udp_home_failure_or_ineligibility_is_servfail_not_passthrough
         let calls = Arc::new(Mutex::new(Vec::new()));
         let observed = calls.clone();
         let reply = intercepted(&original, false)
-            .answer(
+            .answer_with(
                 move |protocol, _| {
                     observed.lock().unwrap().push(protocol);
                     std::future::ready(Err(io::Error::from(kind).into()))
@@ -211,7 +211,7 @@ async fn split_dns_udp_home_negative_and_protocol_errors_do_not_try_tcp_or_fallb
         expected.metadata.response_code = code;
         let wire = expected.to_vec().unwrap();
         let reply = intercepted(&original, false)
-            .answer(
+            .answer_with(
                 |protocol, _| {
                     assert_eq!(protocol, Protocol::Udp);
                     std::future::ready(Ok(DnsResponse::from_buffer(wire.clone()).unwrap()))
@@ -253,7 +253,7 @@ async fn split_dns_udp_ambiguous_and_unsupported_listed_messages_never_dispatch(
     ] {
         let mut calls = 0;
         let reply = intercepted(&request, false)
-            .answer(
+            .answer_with(
                 |_, _| {
                     calls += 1;
                     std::future::ready(Err(ExchangeError::Malformed))
@@ -304,7 +304,7 @@ async fn split_dns_udp_edns_and_actual_emission_limit_require_tcp_before_tc() {
             for injection in [1280, 65487] {
                 let original = request("large.home.", RecordType::TXT, allowance);
                 let reply = intercepted(&original, false)
-                    .answer(
+                    .answer_with(
                         |_, q| std::future::ready(Ok(answer(q, 8192))),
                         tcp_retry,
                         injection,
@@ -332,7 +332,7 @@ async fn split_dns_udp_home_tc_fetches_complete_tcp_answer_before_client_sizing(
             let original = request("large.home.", RecordType::TXT, Some(4096));
             let mut calls = Vec::new();
             let reply = intercepted(&original, true)
-                .answer(
+                .answer_with(
                     |protocol, q| {
                         calls.push(protocol);
                         let mut response =
@@ -366,7 +366,7 @@ async fn split_dns_udp_wrong_home_identity_and_failed_tcp_recovery_fail_closed()
     for case in 0..4 {
         let original = request("nas.home.", RecordType::A, Some(4096));
         let reply = intercepted(&original, false)
-            .answer(
+            .answer_with(
                 |protocol, q| {
                     if case == 3 && protocol == Protocol::Tcp {
                         return std::future::ready(Err(ExchangeError::Closed));
@@ -427,7 +427,7 @@ async fn split_dns_udp_real_home_transport_both_families_and_tcp_recovery() {
         });
         let original = request("nonce.home.", RecordType::TXT, Some(8192));
         let reply = intercepted(&original, peer.is_ipv6())
-            .answer(
+            .answer_with(
                 |protocol, q| {
                     exchange(
                         TokioRuntimeProvider::default(),

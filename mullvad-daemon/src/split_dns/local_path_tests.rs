@@ -220,21 +220,21 @@ async fn split_dns_home_path_udp_message_consumer_accepts_a_nonlocal_injected_pa
     let path = path.as_ref();
     let reply = query
         .answer(
-            |protocol, request| async move {
-                let query = path.authorize(client(), protocol)?;
-                query.exchange(Duration::from_secs(1), request).await
-            },
+            Some(path),
+            Duration::from_secs(1),
             false,
             65507,
+            &BufferBudget::new(256 * 1024),
         )
         .await
         .unwrap();
-    assert_eq!(reply.source, resolver);
-    assert_eq!(reply.destination, client());
-    assert_eq!(
-        Message::from_vec(&reply.bytes).unwrap(),
-        request.into_response()
-    );
+    reply
+        .with_current(|source, destination, bytes| {
+            assert_eq!(source, resolver);
+            assert_eq!(destination, client());
+            assert_eq!(Message::from_vec(bytes).unwrap(), request.into_response());
+        })
+        .unwrap();
     path.close().await.unwrap();
 }
 
@@ -274,23 +274,26 @@ async fn split_dns_home_path_unavailable_path_is_servfail_without_an_ordinary_ca
     let path = path.as_ref();
     let reply = query
         .answer(
-            |protocol, request| async move {
-                let query = path.authorize(client(), protocol)?;
-                query.exchange(Duration::from_secs(1), request).await
-            },
+            Some(path),
+            Duration::from_secs(1),
             false,
             65507,
+            &BufferBudget::new(256 * 1024),
         )
         .await
         .unwrap();
-    let response = Message::from_vec(&reply.bytes).unwrap();
+    let response = reply
+        .with_current(|source, destination, bytes| {
+            assert_eq!(source, resolver);
+            assert_eq!(destination, client());
+            Message::from_vec(bytes).unwrap()
+        })
+        .unwrap();
     assert_eq!(
         response.metadata.response_code,
         hickory_proto::op::ResponseCode::ServFail
     );
     assert_eq!(response.metadata.id, request.metadata.id);
     assert_eq!(response.queries, request.queries);
-    assert_eq!(reply.source, resolver);
-    assert_eq!(reply.destination, client());
     path.close().await.unwrap();
 }
