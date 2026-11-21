@@ -24,7 +24,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -145,6 +147,7 @@ private fun LocalPermissionExplanation(
             text = { Text(stringResource(help, stringResource(R.string.app_name))) },
             confirmButton = {
                 PrimaryTextButton(
+                    modifier = Modifier.testTag("local_access_permission_confirm"),
                     onClick = onConfirm,
                     text = stringResource(action),
                 )
@@ -223,7 +226,11 @@ private fun LocalPermissionRecovery(
             )
         },
         dismissButton = {
-            PrimaryTextButton(onClick = onRetry, text = stringResource(R.string.local_access_retry))
+            PrimaryTextButton(
+                modifier = Modifier.testTag("local_access_permission_retry"),
+                onClick = onRetry,
+                text = stringResource(R.string.local_access_retry),
+            )
         },
     )
 }

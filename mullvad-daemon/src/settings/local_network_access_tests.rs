@@ -6,6 +6,7 @@ use mullvad_types::settings::local_network_access::{
 fn policy() -> LocalNetworkAccess {
     LocalNetworkAccess {
         enabled: true,
+        skip_local_rules_for_excluded_apps: false,
         rules: vec![LocalBypassRule {
             id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
             name: "private-rule-marker".into(),
@@ -48,6 +49,11 @@ fn archive_format_settings_keep_unrelated_values_and_exact_conditions() {
     let settings = SettingsPersister::load_from_bytes(bytes).unwrap();
     assert!(settings.allow_lan && settings.show_beta_releases);
     assert!(settings.local_network_access.enabled);
+    assert!(
+        settings
+            .local_network_access
+            .skip_local_rules_for_excluded_apps
+    );
     assert_eq!(
         settings.local_network_access.rules[0].ssid_ids[0].bytes(),
         &[0, 255, 65, 32]
@@ -59,6 +65,7 @@ fn archive_format_settings_keep_unrelated_values_and_exact_conditions() {
     let old = SettingsPersister::load_from_bytes(br#"{"allow_lan":true}"#).unwrap();
     assert!(old.allow_lan);
     assert_eq!(old.local_network_access, LocalNetworkAccess::default());
+    assert!(old.local_network_access.skip_local_rules_for_excluded_apps);
 }
 
 #[tokio::test]
@@ -190,8 +197,10 @@ async fn invalid_policy_and_failed_write_preserve_memory_disk_and_notifications(
     let forbidden = scratch.0.join("existing-directory");
     std::fs::create_dir(&forbidden).unwrap();
     settings.path = forbidden.clone();
+    let mut toggled = policy();
+    toggled.skip_local_rules_for_excluded_apps = true;
     let error = settings
-        .set_local_network_access(LocalNetworkAccess::default(), None)
+        .set_local_network_access(toggled, None)
         .await
         .unwrap_err();
     let status: mullvad_management_interface::Status = error.into();
@@ -246,6 +255,73 @@ async fn stale_expected_cannot_overwrite_concurrent_policy_but_current_expected_
         LocalNetworkAccess::default()
     );
     assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn excluded_apps_toggle_and_rule_edits_share_one_exact_disk_compare_token() {
+    let scratch = Scratch::new();
+    let mut settings = scratch.settings();
+    settings
+        .set_local_network_access(policy(), None)
+        .await
+        .unwrap();
+    let off = settings.local_network_access.clone();
+    let mut on = off.clone();
+    on.skip_local_rules_for_excluded_apps = true;
+    let mut edited = off.clone();
+    edited.rules[0].name = "edited-rule".into();
+    settings
+        .set_local_network_access(on.clone(), Some(off.clone()))
+        .await
+        .unwrap();
+    assert!(
+        settings
+            .set_local_network_access(edited.clone(), Some(off.clone()))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        SettingsPersister::load_from_file(&settings.path)
+            .await
+            .unwrap()
+            .local_network_access,
+        on
+    );
+    settings
+        .set_local_network_access(edited.clone(), Some(on.clone()))
+        .await
+        .unwrap();
+    assert!(
+        settings
+            .set_local_network_access(on, Some(off))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        SettingsPersister::load_from_file(&settings.path)
+            .await
+            .unwrap()
+            .local_network_access,
+        edited
+    );
+    // A present legacy expected token has ON semantics, and cannot overwrite OFF.
+    let mut wire = mullvad_management_interface::types::LocalNetworkAccess::from(&edited);
+    wire.skip_local_rules_for_excluded_apps = None;
+    let expected = mullvad_management_interface::types::local_policy_for_compare_set(wire).unwrap();
+    assert!(
+        settings
+            .set_local_network_access(LocalNetworkAccess::default(), Some(expected))
+            .await
+            .is_err()
+    );
+    assert_eq!(settings.local_network_access, edited);
+    // The existing unconditional RPC remains unconditional.
+    assert!(
+        settings
+            .set_local_network_access(LocalNetworkAccess::default(), None)
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]

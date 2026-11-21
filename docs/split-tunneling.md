@@ -2,6 +2,10 @@
 
 Split tunneling allows excluding selected apps from the VPN tunnel. These apps will communicate with the network as if Mullvad VPN was disconnected or not even running.
 
+On Krtek Android, optional disconnected Local capture is an exception to that
+description; see the Android section below. Ordinary full-tunnel exclusion is
+unchanged.
+
 ## Vocabulary
 
 * **Split tunneling** - The name of the feature.
@@ -70,7 +74,24 @@ possible to exclude public custom DNS in that case.
 *: The "Local network sharing" option must be enabled to actually allow access to these IPs.
 Otherwise DNS won't work.
 
-In other words: Excluded apps behave as if there was no VPN tunnel running at all.
+For ordinary full-tunnel traffic, excluded apps behave as if there was no VPN
+tunnel running at all, subject to Android's block-without-VPN setting.
+
+Krtek's `Excluded apps skip local rules` switch defaults to ON, including old
+settings without the field. ON also excludes those apps from Partial Local
+capture; this skips Krtek's handling, not all direct LAN access. Explicit OFF
+includes them in Partial so eligible destinations can use Local's protected,
+physical-network-bound path. A retained Partial before target parameters follows
+the same preference. Full Connecting/Connected and Error/safe capture still use
+Mullvad's exclusions in either position. Turning split tunneling off makes its
+effective exclusion list empty, regardless of stored package names.
+
+The switch saves immediately with a connection-drop warning. Changing Partial
+coverage, or moving between full and Partial with different coverage, can make
+Android close existing sockets. The preference alone neither creates capture
+without enabled Local routes nor forces a reconnect for an unchanged full
+profile. It adds no DNS resolver or name-routing behavior; the connected DNS
+table above is unchanged.
 
 ## Other limitations
 

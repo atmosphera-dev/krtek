@@ -6,6 +6,7 @@ echo, then an echo row records the actual send. No ACK, truncation or retry path
 """
 
 import argparse
+from contextlib import ExitStack
 import errno
 import ipaddress
 import json
@@ -17,6 +18,7 @@ import struct
 import time
 
 from local_udp_vectors import payload
+from local_tcp_peer import TcpPeer
 
 
 def bind_peer(address, port):
@@ -42,6 +44,39 @@ def append(ledger, row):
     os.fsync(ledger.fileno())
 
 
+class TcpLedger:
+    """Commit every TCP service's complete observations with one durable flush.
+
+    Per-nonce fsync inside TcpPeer's frame loop delays the next echo by the
+    number of frames in a burst. UDP keeps its existing per-event append path.
+    A failed commit is terminal: replaying a possibly written batch duplicates
+    evidence and cannot establish a receive watermark.
+    """
+    def __init__(self, ledger):
+        self.ledger = ledger
+        self.pending = []
+        self.failure = None
+
+    def append(self, row):
+        if self.failure is not None:
+            raise self.failure
+        self.pending.append(row)
+
+    def flush(self):
+        if self.failure is not None:
+            raise self.failure
+        if not self.pending:
+            return
+        try:
+            self.ledger.write("".join(json.dumps(row, sort_keys=True) + "\n" for row in self.pending))
+            self.ledger.flush()
+            os.fsync(self.ledger.fileno())
+        except OSError as error:
+            self.failure = error
+            raise
+        self.pending.clear()
+
+
 def bind_dual(ipv4, ipv6, port):
     """Allocate and retain both families before publishing the selected port."""
     deadline = time.monotonic() + 5
@@ -62,26 +97,30 @@ def serve(ipv4, ipv6, port, ledger_path, ready_path, duration, max_requests=0, r
     if ipaddress.ip_address(ipv4).version != 4 or ipaddress.ip_address(ipv6).version != 6:
         raise ValueError("One numeric address per family required")
     sockets = []
-    clients = set()
     try:
         sockets = bind_dual(ipv4, ipv6, port)
         port = sockets[0].getsockname()[1]
-        with selectors.DefaultSelector() as selector, Path(ledger_path).open("x") as ledger:
+        with selectors.DefaultSelector() as selector, Path(ledger_path).open("x") as ledger, ExitStack() as cleanup:
             for sock in sockets:
                 sock.setblocking(False)
                 selector.register(sock, selectors.EVENT_READ, "udp")
+            tcp_ledger = TcpLedger(ledger)
+            tcp = TcpPeer(selector, tcp_ledger.append)
+            def finish_tcp():
+                try:
+                    return tcp.finish()
+                finally:
+                    tcp_ledger.flush()
+            cleanup.callback(finish_tcp)
             if tcp_port is not None:
-                tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sockets.append(tcp)
-                tcp.bind((ipv4, tcp_port))
-                tcp.listen()
-                selector.register(tcp, selectors.EVENT_READ, "listen")
+                tcp_port = tcp.listen(ipv4, ipv6, tcp_port)
             ready = {"schema": 1, "pid": os.getpid(), "port": port,
                      "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
                      "listening_monotonic_ns": time.monotonic_ns(),
                      "addresses": [str(ipaddress.ip_address(ipv4)), str(ipaddress.ip_address(ipv6))]}
             if tcp_port is not None:
-                ready["tcp_port"] = tcp.getsockname()[1]
+                ready["tcp_port"] = tcp_port
+                ready["tcp_addresses"] = ready["addresses"]
             append(ledger, dict(ready, event="listening"))
             pending = Path(str(ready_path) + ".pending")
             with pending.open("x") as output:
@@ -104,35 +143,23 @@ def serve(ipv4, ipv6, port, ledger_path, ready_path, duration, max_requests=0, r
                             or not ready["listening_monotonic_ns"] <= finish["finish_seen_monotonic_ns"] <= time.monotonic_ns()):
                         raise ValueError("Finish receipt does not identify this peer lifetime")
                 poll_ns = time.monotonic_ns()
-                wait = 0 if finish else max(0, deadline - time.monotonic())
+                wait = 0 if finish and not tcp.clients else max(0, deadline - time.monotonic())
                 if finish_path:
                     wait = min(wait, .05)
                 events = selector.select(wait)
-                if finish and not any(key.data == "udp" for key, _ in events):
-                    # The finish barrier was observed BEFORE this empty poll.
-                    # A late stopped write cannot extend this receive watermark.
+                if finish and not events and not tcp.clients:
+                    # Every registered source (both UDP sockets, TCP listeners,
+                    # and clients) was serviced before this empty poll. This is
+                    # a receive watermark, not proof against future arrivals.
                     coverage_complete, coverage_ns = True, poll_ns
                     break
-                for key, _ in events:
+                for key, mask in events:
                     sock = key.fileobj
-                    if key.data == "listen":
-                        client, source = sock.accept()
-                        client.settimeout(5)
-                        clients.add(client)
-                        selector.register(client, selectors.EVENT_READ, "tcp")
-                        append(ledger, {"event": "tcp_accept", "fd": client.fileno(),
-                                        "source": source[0], "source_port": source[1]})
-                        continue
-                    if key.data == "tcp":
-                        data = sock.recv(65535)
-                        append(ledger, {"event": "tcp_request", "fd": sock.fileno(),
-                                        "payload_hex": data.hex(), "size": len(data)})
-                        if not data:
-                            selector.unregister(sock); clients.remove(sock); sock.close()
-                        else:
-                            sock.sendall(data)
-                            append(ledger, {"event": "tcp_echo", "fd": sock.fileno(),
-                                            "payload_hex": data.hex(), "size": len(data)})
+                    if key.data != "udp":
+                        try:
+                            tcp.service(sock, key.data[1], mask)
+                        finally:
+                            tcp_ledger.flush()
                         continue
                     data, ancillary, flags, source = sock.recvmsg(65535, 256)
                     if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
@@ -181,14 +208,13 @@ def serve(ipv4, ipv6, port, ledger_path, ready_path, duration, max_requests=0, r
                                     "size": sent, "sent_monotonic_ns": time.monotonic_ns()})
                     if not finish_path and max_requests and count >= max_requests:
                         break
+            tcp_summary = finish_tcp()
             append(ledger, {"schema": 1, "event": "stopped", "requests": count,
-                            "pid": ready["pid"], "boot_id": ready["boot_id"],
-                            "coverage_complete": coverage_complete,
-                            "coverage_monotonic_ns": coverage_ns, "finish": finish,
-                            "stopped_monotonic_ns": time.monotonic_ns()})
+                             "pid": ready["pid"], "boot_id": ready["boot_id"],
+                             "coverage_complete": coverage_complete and not tcp_summary["tcp_errors"],
+                             "coverage_monotonic_ns": coverage_ns, "finish": finish,
+                             "stopped_monotonic_ns": time.monotonic_ns(), **tcp_summary})
     finally:
-        for client in clients:
-            client.close()
         for sock in sockets:
             sock.close()
 
@@ -204,7 +230,7 @@ def main():
     parser.add_argument("--max-requests", type=int, default=0)
     parser.add_argument("--reply-size", type=int, choices=(65488, 65508),
                         help="Reply-limit control only: receive 32-byte nonce, attempt family maximum+1")
-    parser.add_argument("--tcp-port", type=int, help="Continuity fixture: explicit IPv4 TCP stream echo")
+    parser.add_argument("--tcp-port", type=int, help="Continuity fixture: dual-family TCP stream echo")
     parser.add_argument("--finish", type=Path,
                         help="Runner atomically publishes the peer-clock finish receipt here; required for audit coverage")
     args = parser.parse_args()

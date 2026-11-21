@@ -43,6 +43,13 @@ class LocalNetworkSharingViewModel(
     private val effects = Channel<LocalNetworkSharingSideEffect>(Channel.BUFFERED)
     val uiSideEffect = effects.receiveAsFlow()
     private var wifiRequests = 0L
+    private val policyChanges =
+        LocalPolicyChanges(settingsRepository, viewModelScope, saving, error, editor) {
+            closeEditor,
+            requestWifi ->
+            if (closeEditor) setEditor(LocalEditorState())
+            requestWifi?.let { effects.send(LocalNetworkSharingSideEffect(it)) }
+        }
 
     init {
         viewModelScope.launch {
@@ -179,7 +186,8 @@ class LocalNetworkSharingViewModel(
             error.value = R.string.local_access_invalid_rule
             return
         }
-        changePolicy(closeEditor = true, requestWifi = rule.ssidIds.isNotEmpty()) { current ->
+        policyChanges.change(closeEditor = true, requestWifi = rule.ssidIds.isNotEmpty()) { current
+            ->
             current.copy(
                 rules =
                     if (current.rules.any { it.id == rule.id })
@@ -189,7 +197,11 @@ class LocalNetworkSharingViewModel(
         }
     }
 
-    fun setPolicyEnabled(enabled: Boolean) = changePolicy { it.copy(enabled = enabled) }
+    fun setPolicyEnabled(enabled: Boolean) = policyChanges.change { it.copy(enabled = enabled) }
+
+    fun setExcludedAppsSkipLocalRules(skip: Boolean) = policyChanges.change {
+        it.copy(skipLocalRulesForExcludedApps = skip)
+    }
 
     fun requestDelete(rule: LocalBypassRule?) {
         if (saving.value || editor.value.draft != null) return
@@ -202,42 +214,9 @@ class LocalNetworkSharingViewModel(
         }
     }
 
-    fun delete(id: UUID) = changePolicy {
+    fun delete(id: UUID) = policyChanges.change {
         requestDelete(null)
         it.copy(rules = it.rules.filterNot { rule -> rule.id == id })
-    }
-
-    private fun changePolicy(
-        closeEditor: Boolean = false,
-        requestWifi: Boolean? = null,
-        update: (LocalNetworkAccess) -> LocalNetworkAccess,
-    ) {
-        val current = settingsRepository.settingsUpdates.value?.localNetworkAccess
-        if (saving.value || current == null || current.validationError() != null) return
-        val replacement = update(current)
-        if (replacement.validationError() != null) {
-            error.value = R.string.local_access_invalid_rule
-            return
-        }
-        saving.value = true
-        error.value = null
-        viewModelScope.launch {
-            try {
-                settingsRepository
-                    .setLocalNetworkAccess(replacement, expected = current)
-                    .fold(
-                        { error.value = it.message() },
-                        {
-                            if (closeEditor) setEditor(LocalEditorState())
-                            requestWifi?.let { needsWifi ->
-                                effects.send(LocalNetworkSharingSideEffect(needsWifi))
-                            }
-                        },
-                    )
-            } finally {
-                saving.value = false
-            }
-        }
     }
 
     private fun setEditor(value: LocalEditorState) {

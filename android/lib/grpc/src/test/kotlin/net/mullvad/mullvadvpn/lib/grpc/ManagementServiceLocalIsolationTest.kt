@@ -15,6 +15,7 @@ import kotlin.coroutines.Continuation
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -530,6 +531,16 @@ class ManagementServiceLocalIsolationTest {
     }
 
     @Test
+    fun `should default a missing whole Local policy to disabled empty and excluded apps on`() {
+        val read = wireSettings(LocalNetworkAccess()).copy(local_network_access = null).toDomain()
+        assertEquals(
+            net.mullvad.mullvadvpn.lib.model.LocalNetworkAccess(),
+            read.localNetworkAccess,
+        )
+        assertTrue(checkNotNull(read.localNetworkAccess).skipLocalRulesForExcludedApps)
+    }
+
+    @Test
     fun `should expose unrelated settings when Local policy is unreadable`() = runTest {
         val rpc = mockk<ManagementServiceClient>(relaxed = true)
         val setter = rpc.SetLocalNetworkAccess()
@@ -549,7 +560,8 @@ class ManagementServiceLocalIsolationTest {
                 LocalNetworkAccess(rules = listOf(rule, rule)),
                 LocalNetworkAccess(rules = listOf(rule.copy(id = "not-a-uuid"))),
             )) {
-            val wire = wireSettings(policy)
+            val canonicalPolicy = policy.copy(skip_local_rules_for_excluded_apps = false)
+            val wire = wireSettings(canonicalPolicy)
             events.send(DaemonEvent(event = DaemonEvent.Event.Settings(wire)))
             runCurrent()
             val read = reads.last()
@@ -559,6 +571,7 @@ class ManagementServiceLocalIsolationTest {
             else {
                 val typed = checkNotNull(read.localNetworkAccess)
                 assertEquals(policy.enabled, typed.enabled)
+                assertFalse(typed.skipLocalRulesForExcludedApps)
                 assertEquals(policy.rules.map { it.name }, typed.rules.map { it.name })
                 assertTrue(typed.validationError() != null)
             }
@@ -582,7 +595,11 @@ class ManagementServiceLocalIsolationTest {
                 )
                 coVerify(exactly = 1) {
                     setter.execute(
-                        match { it.expected == policy && it.policy == LocalNetworkAccess() }
+                        match {
+                            it.expected == canonicalPolicy &&
+                                it.policy ==
+                                    LocalNetworkAccess(skip_local_rules_for_excluded_apps = true)
+                        }
                     )
                 }
             }

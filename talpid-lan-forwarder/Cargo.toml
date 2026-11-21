@@ -6,6 +6,10 @@ description = "Bounded local TCP and UDP delivery through an injected socket aut
 repository.workspace = true
 license.workspace = true
 
+[features]
+# Private test APKs only: records endpoint/socket metadata; never enable by default.
+r06-diagnostics = ["dep:libc"]
+
 [dependencies]
 log = { workspace = true }
 socket2 = { workspace = true }
@@ -18,6 +22,9 @@ smoltcp = { version = "0.13", default-features = false, features = [
   "socket-tcp",
   "std",
 ] }
+
+[target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
+libc = { version = "0.2", optional = true }
 
 [build-dependencies]
 cc = "1.2"

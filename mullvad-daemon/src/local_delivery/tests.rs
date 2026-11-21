@@ -61,6 +61,7 @@ fn runtime_regions_share_one_root_and_local_exhaustion_preserves_control() {
 fn policy() -> LocalNetworkAccess {
     LocalNetworkAccess {
         enabled: true,
+        skip_local_rules_for_excluded_apps: true,
         rules: vec![LocalBypassRule {
             id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
             name: "synthetic".into(),
@@ -1340,6 +1341,130 @@ async fn partial_capture_carries_current_stored_exclusions_through_open_and_hand
     );
     assert_eq!(control.starts.load(SeqCst), 1);
     runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn excluded_apps_preference_projects_only_effective_partial_coverage() {
+    let control = Arc::new(Control::default());
+    let mut runtime = make_runtime(None, control.clone());
+    let mut configured = policy();
+    let packages = vec!["com.android.deskclock".to_owned()];
+    runtime.set_excluded_packages(packages.clone());
+    runtime
+        .update(&configured, TargetState::Unsecured, true)
+        .await;
+    assert_eq!(*control.exclusions.lock().unwrap(), vec![packages.clone()]);
+    configured.skip_local_rules_for_excluded_apps = false;
+    runtime
+        .update(&configured, TargetState::Unsecured, true)
+        .await;
+    assert_eq!(control.exclusions.lock().unwrap().last(), Some(&vec![]));
+    configured.skip_local_rules_for_excluded_apps = true;
+    runtime
+        .update(&configured, TargetState::Unsecured, true)
+        .await;
+    assert_eq!(control.exclusions.lock().unwrap().last(), Some(&packages));
+    let count = control.exclusions.lock().unwrap().len();
+    runtime.set_excluded_packages(vec![packages[0].clone(), packages[0].clone()]);
+    runtime
+        .update(&configured, TargetState::Unsecured, true)
+        .await;
+    assert_eq!(
+        control.exclusions.lock().unwrap().len(),
+        count,
+        "normalized package equality"
+    );
+    // Daemon supplies effective empty exclusions when split tunneling is off,
+    // even if names remain stored in the independent split-tunnel settings.
+    runtime.set_excluded_packages(vec![]);
+    runtime
+        .update(&configured, TargetState::Unsecured, true)
+        .await;
+    let count = control.exclusions.lock().unwrap().len();
+    configured.skip_local_rules_for_excluded_apps = false;
+    runtime
+        .update(&configured, TargetState::Unsecured, true)
+        .await;
+    assert_eq!(control.exclusions.lock().unwrap().len(), count);
+    assert_eq!(
+        control.starts.load(SeqCst),
+        1,
+        "one owner, normal handovers"
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn excluded_apps_latest_partial_policy_wins_before_target_during_pending_handover() {
+    use crate::local_network::TunnelPhase;
+    let control = Arc::new(Control::default());
+    let mut runtime = make_runtime(None, control.clone());
+    let mut configured = policy();
+    let packages = vec!["com.android.deskclock".to_owned()];
+    runtime.set_excluded_packages(packages.clone());
+    runtime
+        .update(
+            &configured,
+            TargetState::Unsecured,
+            TunnelPhase::Disconnected,
+        )
+        .await;
+    control.hold_ready.store(true, SeqCst);
+    configured.skip_local_rules_for_excluded_apps = false;
+    runtime
+        .update(&configured, TargetState::Secured, TunnelPhase::Connecting)
+        .await;
+    assert_eq!(control.exclusions.lock().unwrap().last(), Some(&vec![]));
+    configured.rules[0]
+        .cidrs
+        .push("172.16.0.0/16".parse().unwrap());
+    configured.skip_local_rules_for_excluded_apps = true;
+    runtime
+        .update(&configured, TargetState::Secured, TunnelPhase::Connecting)
+        .await;
+    control.hold_ready.store(false, SeqCst);
+    bounded(async {
+        while !runtime.capture_configuration_ready() {
+            runtime.notifications().1.await;
+            runtime
+                .internal_update(&configured, TargetState::Secured, TunnelPhase::Connecting)
+                .await;
+        }
+    })
+    .await;
+    assert_eq!(control.exclusions.lock().unwrap().last(), Some(&packages));
+    assert!(
+        control
+            .routes
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .contains(&"172.16.0.0/16".to_owned())
+    );
+    assert_eq!(control.starts.load(SeqCst), 1);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn excluded_apps_preference_cannot_create_capture_without_local_routes() {
+    for skip in [false, true] {
+        for mut configured in [LocalNetworkAccess::default(), policy()] {
+            configured.skip_local_rules_for_excluded_apps = skip;
+            if configured.enabled {
+                configured.rules[0].enabled = false;
+            }
+            let control = Arc::new(Control::default());
+            let mut runtime = make_runtime(None, control.clone());
+            runtime.set_excluded_packages(vec!["com.android.deskclock".to_owned()]);
+            runtime
+                .update(&configured, TargetState::Unsecured, true)
+                .await;
+            assert_eq!(control.starts.load(SeqCst), 0);
+            assert!(!runtime.has_owner());
+            runtime.shutdown().await.unwrap();
+        }
+    }
 }
 
 #[tokio::test]

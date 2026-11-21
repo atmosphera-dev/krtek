@@ -6,6 +6,7 @@ import net.mullvad.mullvadvpn.lib.model.LocalBypassRule
 /** Callbacks are supplied by the consumer; controls never access repositories or navigation. */
 data class LocalPolicyActions(
     val onEnabled: (Boolean) -> Unit = {},
+    val onExcludedAppsSkipLocalRules: (Boolean) -> Unit = {},
     val onEdit: (LocalBypassRule?) -> Unit = {},
     val onUpdate: ((LocalRuleDraft) -> LocalRuleDraft) -> Unit = {},
     val onSave: () -> Unit = {},

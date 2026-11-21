@@ -50,7 +50,19 @@ Each issue in this document should provide, at least, the following:
   is briefly no route, typically 10-30 ms in testing. Open local TCP connections
   continue, but a UDP packet can be lost or fail to send in that moment. The same
   UDP socket can send again afterward.
-* Changing the list of excluded apps also rebuilds the interface. Android closes
+* Static inventory found 0 demonstrated avoidable replacements. Equal normalized
+  full/Partial profiles already reuse; this is not a measured runtime reduction.
+  Necessary profile/UID changes and forced or actual-loss recovery remain, along
+  with the route gap above. No atomic handover or missing-package/shared-UID
+  optimization is claimed.
+* `Excluded apps skip local rules` defaults to ON for fresh and old settings.
+  ON skips Krtek Local handling, not all direct LAN access: Android may still
+  allow an excluded app to use the physical network without Krtek. OFF includes
+  those apps only in Partial Local capture, not full Connecting/Connected or
+  Error capture. Android still controls traffic outside capture and OS lockdown.
+* Changing the list of excluded apps or the preference's effective Partial UID
+  coverage rebuilds the interface. OFF can also change UID coverage on a
+  full/Partial transition. Android closes
   connections that are open at that moment; new connections normally work right
   away. In one test run, a new local TCP connection failed once right after local
   rules were turned off and on and the app list was restored. This has not been
