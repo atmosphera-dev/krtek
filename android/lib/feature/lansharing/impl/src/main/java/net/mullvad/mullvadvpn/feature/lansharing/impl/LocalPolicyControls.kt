@@ -15,6 +15,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import java.util.UUID
 import net.mullvad.mullvadvpn.lib.model.ForwardingAvailability
@@ -42,7 +43,11 @@ internal fun LocalPolicyControls(state: LocalNetworkSharingUiState, actions: Loc
                 color = MaterialTheme.colorScheme.error,
             )
         } else {
-            LocalPolicyHeader(state) { if (it) confirmEnable = true else actions.onEnabled(false) }
+            LocalPolicyHeader(
+                state,
+                onEnabled = { if (it) confirmEnable = true else actions.onEnabled(false) },
+                onExcludedAppsSkipLocalRules = actions.onExcludedAppsSkipLocalRules,
+            )
             if (state.saving) {
                 Text(stringResource(R.string.local_access_saving))
             } else if (state.editor.draft == null) {
@@ -61,6 +66,7 @@ internal fun LocalPolicyControls(state: LocalNetworkSharingUiState, actions: Loc
                     HorizontalDivider()
                 }
                 PrimaryButton(
+                    modifier = Modifier.testTag("local_access_add_rule"),
                     text = stringResource(R.string.local_access_add_rule),
                     onClick = { actions.onEdit(null) },
                 )
@@ -119,7 +125,11 @@ private fun LocalPolicyEditConfirmations(
 }
 
 @Composable
-private fun LocalPolicyHeader(state: LocalNetworkSharingUiState, onEnabled: (Boolean) -> Unit) {
+private fun LocalPolicyHeader(
+    state: LocalNetworkSharingUiState,
+    onEnabled: (Boolean) -> Unit,
+    onExcludedAppsSkipLocalRules: (Boolean) -> Unit,
+) {
     Text(stringResource(R.string.local_access_title), style = MaterialTheme.typography.titleMedium)
     Text(
         stringResource(R.string.local_access_scope_help),
@@ -129,7 +139,18 @@ private fun LocalPolicyHeader(state: LocalNetworkSharingUiState, onEnabled: (Boo
         SwitchListItem(
             title = stringResource(R.string.local_access_enable),
             isToggled = state.policy.enabled,
+            testTag = "local_policy_enabled",
             onCellClicked = onEnabled,
+        )
+        SwitchListItem(
+            title = stringResource(R.string.local_access_excluded_apps_skip),
+            isToggled = state.policy.skipLocalRulesForExcludedApps,
+            testTag = "local_excluded_apps_skip",
+            onCellClicked = onExcludedAppsSkipLocalRules,
+        )
+        Text(
+            stringResource(R.string.local_access_excluded_apps_description),
+            style = MaterialTheme.typography.bodyMedium,
         )
     } else if (state.editor.draft != null) {
         Text(
@@ -179,10 +200,12 @@ private fun LocalRuleRow(
         Text(stringResource(condition.message()), style = MaterialTheme.typography.bodyMedium)
         FlowRow {
             PrimaryTextButton(
+                modifier = Modifier.testTag("local_access_edit_${rule.id}"),
                 onClick = onEdit,
                 text = stringResource(R.string.local_access_edit),
             )
             PrimaryTextButton(
+                modifier = Modifier.testTag("local_access_delete_${rule.id}"),
                 onClick = onDelete,
                 text = stringResource(R.string.local_access_delete),
             )
@@ -214,8 +237,20 @@ private fun LocalPolicyConfirmation(
         onDismissRequest = onCancel,
         title = { Text(stringResource(title)) },
         text = description?.let { { Text(it) } },
-        confirmButton = { PrimaryTextButton(onClick = onConfirm, text = stringResource(confirm)) },
-        dismissButton = { PrimaryTextButton(onClick = onCancel, text = stringResource(cancel)) },
+        confirmButton = {
+            PrimaryTextButton(
+                modifier = Modifier.testTag("local_access_dialog_confirm"),
+                onClick = onConfirm,
+                text = stringResource(confirm),
+            )
+        },
+        dismissButton = {
+            PrimaryTextButton(
+                modifier = Modifier.testTag("local_access_dialog_cancel"),
+                onClick = onCancel,
+                text = stringResource(cancel),
+            )
+        },
     )
 }
 

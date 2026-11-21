@@ -14,7 +14,9 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import net.mullvad.mullvadvpn.app.MullvadApplication
+import net.mullvad.mullvadvpn.feature.lansharing.impl.R
 import net.mullvad.mullvadvpn.lib.model.ForwardingAvailability
+import net.mullvad.mullvadvpn.lib.model.LocalNetworkAccess
 import net.mullvad.mullvadvpn.lib.model.LocalRuleState
 import net.mullvad.mullvadvpn.lib.model.PackageName
 import net.mullvad.mullvadvpn.lib.model.TunnelState
@@ -341,4 +343,127 @@ class ExcludedAppsLocalRulesInstrumentedTest {
                 )
             }
         }
+
+    /** The runner stages the real install/restart/upgrade before this assertion process. */
+    @Test
+    fun excludedPreferenceLifecycle() {
+        val case = checkNotNull(args.getString("case"))
+        check(case in setOf("fresh", "legacy-policy-absent", "legacy-field-absent", "off-upgrade"))
+        val expected = case != "off-upgrade"
+        val permissions =
+            listOf("ACCESS_LOCAL_NETWORK", "ACCESS_FINE_LOCATION", "ACCESS_BACKGROUND_LOCATION")
+                .associateWith { target.checkSelfPermission("android.permission.$it") }
+        val editor = LocalNetworkEditorInstrumentedTest()
+        // The live Activity owns service binding for both the snapshot and restoration.
+        editor.withLocalAccessScreen(testTimeout = 2.minutes) { ui ->
+            runBlocking {
+                val repository =
+                    (target.applicationContext as MullvadApplication)
+                        .getKoin()
+                        .get<SettingsRepository>()
+                var snapshot: LocalNetworkAccess? = null
+                var bodyFailure: Throwable? = null
+                try {
+                    val before =
+                        checkNotNull(
+                            withTimeout(10_000) { repository.settingsUpdates.first { it != null } }
+                                ?.localNetworkAccess
+                        )
+                    snapshot = before
+                    assertEquals(
+                        expected,
+                        before.skipLocalRulesForExcludedApps,
+                        "Real persisted lifecycle value",
+                    )
+                    val label = ui.copy(R.string.local_access_excluded_apps_skip)
+                    ui.requireToggle("local_excluded_apps_skip", expected)
+                    ui.requireSingleLineText(label)
+                    ui.requireRenderedText(ui.copy(R.string.local_access_excluded_apps_description))
+                    for (value in listOf(!expected, expected)) {
+                        ui.clickTag("local_excluded_apps_skip", label)
+                        withTimeout(10_000) {
+                            repository.settingsUpdates.first {
+                                it?.localNetworkAccess ==
+                                    before.copy(skipLocalRulesForExcludedApps = value)
+                            }
+                        }
+                        ui.requireToggle("local_excluded_apps_skip", value)
+                    }
+                    ui.clickTag("local_access_add_rule", ui.copy(R.string.local_access_add_rule))
+                    val name = "Krtek unsaved exclusion fixture"
+                    ui.enter("local_access_name", name)
+                    ui.requireAbsentControl("local_policy_enabled")
+                    ui.requireAbsentControl("local_excluded_apps_skip")
+                    ui.back()
+                    ui.clickTag(
+                        "local_access_dialog_cancel",
+                        ui.copy(R.string.local_access_keep_editing),
+                    )
+                    ui.requireFieldText("local_access_name", name)
+                    assertEquals(before, repository.settingsUpdates.value?.localNetworkAccess)
+                    ui.back()
+                    ui.clickTag(
+                        "local_access_dialog_confirm",
+                        ui.copy(R.string.local_access_discard),
+                    )
+                    ui.requireToggle("local_excluded_apps_skip", expected)
+                    assertEquals(before, repository.settingsUpdates.value?.localNetworkAccess)
+                    assertEquals(
+                        permissions,
+                        permissions.keys.associateWith {
+                            target.checkSelfPermission("android.permission.$it")
+                        },
+                    )
+                    harness.report("excluded_preference_lifecycle_case", case)
+                    harness.report("excluded_preference_lifecycle_value", expected)
+                    harness.report("excluded_preference_real_ui_save_and_draft", "PASS")
+                } catch (failure: Throwable) {
+                    bodyFailure = failure
+                    harness.report(
+                        "excluded_preference_lifecycle_body_failure",
+                        failure.javaClass.name,
+                    )
+                    throw failure
+                } finally {
+                    try {
+                        // No policy mutation is possible until the snapshot has been acquired.
+                        val before = snapshot
+                        if (before == null) {
+                            harness.report(
+                                "excluded_preference_lifecycle_snapshot_unavailable",
+                                true,
+                            )
+                        } else {
+                            val current =
+                                checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
+                            check(
+                                current.copy(skipLocalRulesForExcludedApps = expected) == before
+                            ) {
+                                "Preserve concurrent non-preference changes for investigation"
+                            }
+                            if (current != before) {
+                                assertTrue(
+                                    repository.setLocalNetworkAccess(before, current).isRight()
+                                )
+                                withTimeout(10_000) {
+                                    repository.settingsUpdates.first {
+                                        it?.localNetworkAccess == before
+                                    }
+                                }
+                            }
+                            harness.report("excluded_preference_lifecycle_restored", true)
+                        }
+                    } catch (restorationFailure: Throwable) {
+                        harness.report(
+                            "excluded_preference_lifecycle_restoration_failure",
+                            restorationFailure.javaClass.name,
+                        )
+                        val primary = bodyFailure
+                        if (primary == null) throw restorationFailure
+                        primary.addSuppressed(restorationFailure)
+                    }
+                }
+            }
+        }
+    }
 }

@@ -318,10 +318,26 @@ Tunnel targets translate to their own assigned addresses; Local uses protected,
 physical-network-bound sockets. Private networks can still collide with this
 fixed pair; private-use addressing does not guarantee collision-free routing.
 
+`Excluded apps skip local rules` defaults to ON, including absent old disk/wire
+fields; explicit OFF is retained. It belongs to the canonical Local policy and
+its whole-policy compare-and-set token, not a separate preference store. ON
+projects Mullvad's effective exclusions into Partial capture. OFF includes those
+apps in Partial only, including the retained Partial before target parameters
+exist. Full Connecting/Connected, safe blocking and Error retain Mullvad's
+exclusions. Disabled split tunneling contributes no exclusions even when names
+remain stored. This preference never creates capture without enabled Local routes
+and does not itself request a tunnel reconnect.
+
 Descriptor MTU and exposed-family configuration belong to the checked sink epoch,
 not the immutable logical session. Necessary sink handovers retain eligible Local
 connections; old receipts never authorize writes to a successor. Equal effective
 Builder fields reuse the observed sink, including redundant/covered Local routes.
+Static inventory found 0 demonstrated avoidable replacements. This is a source
+finding, not a measured runtime reduction: equal normalized full and Partial
+profiles already reuse. Real route, ordered DNS, MTU, family or UID coverage
+changes, forced refresh and actual capture-loss recovery still require their
+existing replacement paths. Requested package names do not attest applied UID
+coverage; no missing-package/shared-UID optimization or atomic handover is implied.
 Local updates its IP-device MTU metadata in place, retaining TCP socket state,
 physical sockets, grants and queued output. Its protocol-sized ingress scratch
 and byte-credited egress arena already fund maximum-sized packet peaks; a change
@@ -338,6 +354,9 @@ they neither pause target admission nor wait for a blocking capture. A pending
 target request owns capture configuration/readiness. Explicit Disconnect and
 shutdown still revoke Mullvad admission, with exact-request cleanup and joined
 descriptor release; eligible Local sessions remain independent.
+Changing Android UID coverage can destroy open sockets, including when the new
+preference changes a live Partial or OFF makes full/Partial coverage differ.
+Local session retention does not override that platform behavior.
 Android system Connect follows the same upstream keyguard and command order even
 while a Partial, full or failed capture is retained. Capture ownership extends
 foreground service lifetime only; it never substitutes for dispatching Connect.
@@ -371,6 +390,9 @@ are exposed as a Local read error, never as an OFF/empty replacement. Local
 replacements still require valid input and a representable read. The expected
 snapshot is an exact comparison token, including representable invalid policy,
 so a valid replacement can repair it without changing unrelated settings.
+The exclusion preference participates in that token: a legacy expected policy
+with an absent field means ON and conflicts with current OFF. Omitting the whole
+expected token retains the existing unconditional update semantics.
 Unrepresentable reads remain unavailable. Upstream disk loading, defaults and
 malformed-file recovery are unchanged.
 

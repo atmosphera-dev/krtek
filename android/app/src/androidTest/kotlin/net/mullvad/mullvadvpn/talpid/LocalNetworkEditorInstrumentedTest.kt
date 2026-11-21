@@ -9,15 +9,36 @@ import android.graphics.Rect
 import android.os.Bundle
 import android.os.Looper
 import android.view.accessibility.AccessibilityNodeInfo
+import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.semantics.SemanticsNode
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
+import androidx.compose.ui.test.ComposeTimeoutException
 import androidx.compose.ui.test.ComposeUiTest
 import androidx.compose.ui.test.ExperimentalTestApi
+import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.SemanticsNodeInteraction
+import androidx.compose.ui.test.assertHasClickAction
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsOff
+import androidx.compose.ui.test.assertIsOn
+import androidx.compose.ui.test.hasAnyAncestor
+import androidx.compose.ui.test.hasAnyDescendant
+import androidx.compose.ui.test.hasContentDescription
+import androidx.compose.ui.test.hasScrollToIndexAction
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.hasTestTag
+import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.isToggleable
+import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performScrollToNode
+import androidx.compose.ui.test.performSemanticsAction
+import androidx.compose.ui.test.performTextReplacement
 import androidx.compose.ui.test.v2.AndroidComposeUiTestEnvironment
 import androidx.compose.ui.test.v2.runEmptyComposeUiTest
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.runner.lifecycle.ActivityLifecycleCallback
 import androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry
@@ -29,6 +50,7 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.minutes
@@ -47,6 +69,13 @@ import net.mullvad.mullvadvpn.lib.usecase.SupportIssueUseCase
 import org.json.JSONObject
 import org.junit.jupiter.api.Test
 import org.koin.android.ext.android.getKoin
+
+private fun SemanticsNode.editorInteractionDescription(): String =
+    "id=$id, enabled=${!config.contains(SemanticsProperties.Disabled)}, " +
+        "OnClick=${config.getOrNull(SemanticsActions.OnClick)?.action != null}, " +
+        "Toggleable=${config.contains(SemanticsProperties.ToggleableState)}, " +
+        "SetText=${config.getOrNull(SemanticsActions.SetText)?.action != null}, " +
+        "boundsInRoot=$boundsInRoot, boundsInWindow=$boundsInWindow"
 
 /** Drives the real feature navigation. Never retains raw trees or account-screen values. */
 @OptIn(ExperimentalTestApi::class)
@@ -128,64 +157,117 @@ class LocalNetworkEditorInstrumentedTest {
 
     internal fun copy(id: Int, vararg args: Any): String = target.getString(id, *args)
 
-    internal fun click(text: String, scroll: Boolean = true) {
-        val selected =
-            awaitNode(scroll) {
-                it.isEnabled &&
-                    (it.text?.toString() == text || it.contentDescription?.toString() == text)
+    /** Select live Compose ownership, never an Android accessibility snapshot/ancestor. */
+    private fun interact(
+        matcher: SemanticsMatcher,
+        name: String,
+        unmerged: Boolean = true,
+        action: SemanticsNodeInteraction.((String) -> Unit) -> Unit,
+    ) {
+        var diagnostic = "node=$name, semantics=unavailable, bounds=unavailable"
+        var phase = "await-node"
+        try {
+            compose.waitForIdle()
+            // Lazy settings lists may not have composed the requested entry yet.
+            if (compose.onAllNodes(matcher, unmerged).fetchSemanticsNodes().isEmpty()) {
+                val lists = compose.onAllNodes(hasScrollToIndexAction())
+                if (lists.fetchSemanticsNodes().size == 1) lists[0].performScrollToNode(matcher)
             }
-        var node: AccessibilityNodeInfo? = selected
-        while (node != null && !node.isClickable) node = node.parent
-        assertTrue(
-            node?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true,
-            "Rendered editor action was not clickable",
-        )
-        ExternalUiActionCompletion.settle(instrumentation::waitForIdleSync, compose::waitForIdle)
+            compose.waitUntil(timeoutMillis = 15_000) {
+                compose.onAllNodes(matcher, unmerged).fetchSemanticsNodes().isNotEmpty()
+            }
+            val matches = compose.onAllNodes(matcher, unmerged).fetchSemanticsNodes()
+            diagnostic =
+                "node=$name, matches=${matches.joinToString { it.editorInteractionDescription() }}"
+            assertEquals(1, matches.size, "Expected exactly one tagged node")
+            val node = compose.onNode(matcher, useUnmergedTree = unmerged)
+            fun describe() {
+                val current = node.fetchSemanticsNode()
+                diagnostic = "node=$name, ${current.editorInteractionDescription()}"
+            }
+            describe()
+            phase = "scroll"
+            val parents = generateSequence(node.fetchSemanticsNode().parent) { it.parent }
+            if (parents.any { it.config.contains(SemanticsActions.ScrollBy) }) {
+                node.performScrollTo()
+            }
+            compose.waitForIdle()
+            describe()
+            phase = "enabled-displayed-action"
+            node.assertIsDisplayed().assertIsEnabled().action { diagnostic += ", $it" }
+            ExternalUiActionCompletion.settle(
+                instrumentation::waitForIdleSync,
+                compose::waitForIdle,
+            )
+        } catch (failure: Throwable) {
+            if (failure !is AssertionError && failure !is ComposeTimeoutException) throw failure
+            // Compose assertion causes can dump an account screen. Retain only allowlisted facts.
+            throw AssertionError(
+                "Rendered editor interaction failed: phase=$phase, $diagnostic, " +
+                    "failure=${failure.javaClass.simpleName}"
+            )
+        }
     }
 
-    private fun field(tag: String): AccessibilityNodeInfo {
-        try {
-            compose
-                .onNode(hasTestTag(tag) and hasSetTextAction(), useUnmergedTree = true)
-                .performScrollTo()
-        } catch (_: AssertionError) {
-            error("Owned editor field could not be scrolled into view")
+    internal fun clickTag(tag: String, text: String) =
+        interact(hasTestTag(tag), "tag=$tag, label=$text") { record ->
+            val tagged = fetchSemanticsNode()
+            fun describe(node: SemanticsNode): String {
+                val facts = node.editorInteractionDescription()
+                record(facts)
+                return facts
+            }
+            val owner =
+                TaggedActionResolver.resolve(
+                    tagged,
+                    { it.children },
+                    { it.parent },
+                    {
+                        it.config.getOrNull(SemanticsActions.OnClick)?.action != null
+                    },
+                    { it.config.contains(SemanticsProperties.ToggleableState) },
+                    ::describe,
+                )
+            describe(owner)
+            val action =
+                compose.onNode(
+                    SemanticsMatcher("resolved action for tag=$tag") { it.id == owner.id },
+                    useUnmergedTree = true,
+                )
+            val label = hasText(text) or hasContentDescription(text)
+            val labelledControl = label or hasAnyDescendant(label)
+            // A wrapper can own the label next to its only toggle; a tagged icon
+            // can instead inherit its label from the clickable button around it.
+            assertTrue(
+                labelledControl.matches(tagged) || labelledControl.matches(owner),
+                "Expected label inside the tagged control or its resolved action owner",
+            )
+            action.assertIsDisplayed().assertIsEnabled()
+            assertTrue(
+                action.fetchSemanticsNode().config.getOrNull(SemanticsActions.OnClick)?.action !=
+                    null,
+                "Expected a live OnClick semantics action for tag=$tag, id=${owner.id}",
+            )
+            action.assertHasClickAction().performClick()
         }
+
+    private fun field(tag: String): AccessibilityNodeInfo {
+        interact(hasTestTag(tag) and hasSetTextAction(), "field=$tag", unmerged = true) {}
         return awaitNode { it.viewIdResourceName == tag && it.isEditable }
     }
 
     internal fun enter(tag: String, value: String) {
-        val semantics =
-            compose.onAllNodes(hasTestTag(tag) and hasSetTextAction(), useUnmergedTree = true)
-        fun liveEditable() =
-            try {
-                semantics
-                    .fetchSemanticsNodes()
-                    .singleOrNull()
-                    ?.config
-                    ?.getOrNull(SemanticsProperties.EditableText)
-                    ?.text
-            } catch (_: AssertionError) {
-                error("Live tagged editor semantics unavailable")
-            }
-        assertTrue(liveEditable() != null, "Expected unique tagged editable field")
-        assertTrue(
-            field(tag)
-                .performAction(
-                    AccessibilityNodeInfo.ACTION_SET_TEXT,
-                    Bundle().apply {
-                        putCharSequence(
-                            AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                            value,
-                        )
-                    },
-                )
-        )
+        val matcher = hasTestTag(tag) and hasSetTextAction()
+        interact(matcher, "field=$tag", unmerged = true) { performTextReplacement(value) }
         compose.waitForIdle()
         assertEquals(
             value,
-            liveEditable(),
-            "Actual editable semantics did not consume the platform action",
+            compose
+                .onNode(matcher, useUnmergedTree = true)
+                .fetchSemanticsNode()
+                .config[SemanticsProperties.EditableText]
+                .text,
+            "Actual editable semantics did not consume the Compose action: tag=$tag",
         )
         val rendered = awaitNode {
             it.viewIdResourceName == tag && it.isEditable && it.text?.toString() == value
@@ -193,14 +275,7 @@ class LocalNetworkEditorInstrumentedTest {
         assertEquals(value, rendered.text?.toString())
     }
 
-    internal fun back() {
-        instrumentation.uiAutomation.executeShellCommand("input keyevent KEYCODE_BACK").use {
-            descriptor ->
-            android.os.ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { it.readBytes() }
-        }
-        instrumentation.uiAutomation.waitForIdle(500, 5_000)
-        instrumentation.waitForIdleSync()
-    }
+    internal fun back() = EditorBackNavigationTest.toDiscardDialog(instrumentation, compose)
 
     private fun mainActivityResumed(): Boolean {
         var resumed = false
@@ -255,7 +330,7 @@ class LocalNetworkEditorInstrumentedTest {
                     departingWindow?.let { record("ack", it) }
                     departingWindow = root.windowId
                     record("back", root.windowId)
-                    back()
+                    EditorBackNavigationTest.systemBack(instrumentation)
                 }
             }
             Thread.sleep(25)
@@ -271,14 +346,19 @@ class LocalNetworkEditorInstrumentedTest {
         val body: ComposeUiTest.() -> Unit = {
             compose = this
             withLiveActivity {
-                click(target.getString(net.mullvad.mullvadvpn.lib.ui.resource.R.string.settings))
-                click(
-                    target.getString(net.mullvad.mullvadvpn.lib.ui.resource.R.string.settings_vpn)
+                clickTag(
+                    "top_bar_settings_button_test_tag",
+                    copy(CommonR.string.settings),
                 )
-                click(
+                clickTag(
+                    "vpn_settings_cell_test_tag",
+                    target.getString(net.mullvad.mullvadvpn.lib.ui.resource.R.string.settings_vpn),
+                )
+                clickTag(
+                    "local_network_sharing_entry",
                     target.getString(
                         net.mullvad.mullvadvpn.lib.ui.resource.R.string.local_network_sharing
-                    )
+                    ),
                 )
                 block(this@LocalNetworkEditorInstrumentedTest)
             }
@@ -321,6 +401,67 @@ class LocalNetworkEditorInstrumentedTest {
 
     internal fun requireRenderedText(expected: String) {
         awaitNode(true) { it.text?.toString() == expected }
+    }
+
+    internal fun requireToggle(tag: String, expected: Boolean) =
+        interact(hasTestTag(tag), "toggle=$tag") {
+            val toggle =
+                compose.onNode(
+                    isToggleable() and hasAnyAncestor(hasTestTag(tag)),
+                    useUnmergedTree = true,
+                )
+            if (expected) toggle.assertIsOn() else toggle.assertIsOff()
+        }
+
+    internal fun requireAbsentControl(tag: String) {
+        assertTrue(
+            compose
+                .onAllNodes(hasTestTag(tag), useUnmergedTree = true)
+                .fetchSemanticsNodes()
+                .isEmpty()
+        )
+    }
+
+    internal fun requireFieldText(tag: String, expected: String) {
+        assertEquals(expected, field(tag).text?.toString())
+    }
+
+    internal fun requireSingleLineText(text: String) {
+        compose.waitForIdle()
+        val result = mutableListOf<TextLayoutResult>()
+        compose.onNode(hasText(text), useUnmergedTree = true).performSemanticsAction(
+            SemanticsActions.GetTextLayoutResult
+        ) { action ->
+            assertTrue(action(result))
+        }
+        val layout = result.single()
+        val diagnostics = buildString {
+            append("didOverflowWidth=${layout.didOverflowWidth}, ")
+            append("didOverflowHeight=${layout.didOverflowHeight}, size=${layout.size}, ")
+            append("constraints=${layout.layoutInput.constraints}, ")
+            append("paragraph=${layout.multiParagraph.width}x${layout.multiParagraph.height}, ")
+            append("lineCount=${layout.lineCount}, ")
+            for (line in 0 until layout.lineCount) {
+                append("line[$line]=(${layout.getLineLeft(line)},${layout.getLineTop(line)},")
+                append("${layout.getLineRight(line)},${layout.getLineBottom(line)}), ")
+                append("end=${layout.getLineEnd(line, visibleEnd = true)}, ")
+                append("ellipsis=${layout.isLineEllipsized(line)}; ")
+            }
+        }
+        assertEquals(1, layout.lineCount, diagnostics)
+        assertFalse(
+            layout.didOverflowHeight,
+            "The full preference label must fit the native row height: $diagnostics",
+        )
+        assertTrue(
+            layout.getLineRight(0) <= layout.size.width,
+            "The full preference label must fit the measured row width: $diagnostics",
+        )
+        assertFalse(
+            layout.isLineEllipsized(0),
+            "The full label must not be ellipsized: $diagnostics",
+        )
+        assertEquals(text.length, layout.getLineEnd(0, visibleEnd = true), diagnostics)
     }
 
     /** B7 only: real shipped UI and intercepted Android intents, never a public request. */
@@ -618,26 +759,29 @@ class LocalNetworkEditorInstrumentedTest {
                             .associateWith { target.checkSelfPermission("android.permission.$it") }
                     val name = "Krtek editor fixture"
                     try {
-                        click(
+                        clickTag(
+                            "top_bar_settings_button_test_tag",
                             target.getString(
                                 net.mullvad.mullvadvpn.lib.ui.resource.R.string.settings
-                            )
+                            ),
                         )
-                        click(
+                        clickTag(
+                            "vpn_settings_cell_test_tag",
                             target.getString(
                                 net.mullvad.mullvadvpn.lib.ui.resource.R.string.settings_vpn
-                            )
+                            ),
                         )
-                        click(
+                        clickTag(
+                            "local_network_sharing_entry",
                             target.getString(
                                 net.mullvad.mullvadvpn.lib.ui.resource.R.string
                                     .local_network_sharing
-                            )
+                            ),
                         )
-                        click(copy(R.string.local_access_add_rule))
+                        clickTag("local_access_add_rule", copy(R.string.local_access_add_rule))
                         enter("local_access_name", name)
                         enter("local_access_addresses", "192.168.240.11/28")
-                        click(copy(R.string.local_access_save))
+                        clickTag("local_access_save", copy(R.string.local_access_save))
                         // The noncanonical prefix is rejected in place, with the canonical
                         // suggestion rendered under the addresses field.
                         val feedback = awaitNode {
@@ -665,10 +809,13 @@ class LocalNetworkEditorInstrumentedTest {
                         )
                         assertEquals(original, repository.settingsUpdates.value?.localNetworkAccess)
                         back()
-                        click(copy(R.string.local_access_keep_editing), false)
+                        clickTag(
+                            "local_access_dialog_cancel",
+                            copy(R.string.local_access_keep_editing),
+                        )
                         assertEquals(name, field("local_access_name").text?.toString())
                         enter("local_access_addresses", "192.168.240.10/32")
-                        click(copy(R.string.local_access_save))
+                        clickTag("local_access_save", copy(R.string.local_access_save))
                         val saved =
                             withTimeout(10_000) {
                                     repository.settingsUpdates.first {
@@ -682,18 +829,27 @@ class LocalNetworkEditorInstrumentedTest {
                             saved.rules.single().cidrs.map { it.toString() },
                         )
                         awaitNode(true) { it.text?.toString() == name }
-                        click(copy(R.string.local_access_edit))
+                        clickTag(
+                            "local_access_edit_${saved.rules.single().id}",
+                            copy(R.string.local_access_edit),
+                        )
                         enter("local_access_name", "Krtek unsaved fixture")
                         back()
-                        click(copy(R.string.local_access_discard), false)
+                        clickTag("local_access_dialog_confirm", copy(R.string.local_access_discard))
                         assertEquals(saved, repository.settingsUpdates.value?.localNetworkAccess)
-                        click(copy(R.string.local_access_delete))
+                        clickTag(
+                            "local_access_delete_${saved.rules.single().id}",
+                            copy(R.string.local_access_delete),
+                        )
                         requireRenderedText(copy(R.string.local_access_delete_description, name))
-                        click(copy(android.R.string.cancel), false)
+                        clickTag("local_access_dialog_cancel", copy(android.R.string.cancel))
                         assertEquals(saved, repository.settingsUpdates.value?.localNetworkAccess)
-                        click(copy(R.string.local_access_delete))
+                        clickTag(
+                            "local_access_delete_${saved.rules.single().id}",
+                            copy(R.string.local_access_delete),
+                        )
                         requireRenderedText(copy(R.string.local_access_delete_description, name))
-                        click(copy(R.string.local_access_delete), false)
+                        clickTag("local_access_dialog_confirm", copy(R.string.local_access_delete))
                         withTimeout(10_000) {
                             repository.settingsUpdates.first { it?.localNetworkAccess == original }
                         }

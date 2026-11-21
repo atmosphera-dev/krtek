@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <application android:allowBackup="false"
+                 android:fullBackupContent="@xml/full_backup_content"
+                 android:dataExtractionRules="@xml/data_extraction_rules"
+                 android:icon="@drawable/ic_public_dns"
+                 android:label="Public DNS diagnostic" />
+</manifest>

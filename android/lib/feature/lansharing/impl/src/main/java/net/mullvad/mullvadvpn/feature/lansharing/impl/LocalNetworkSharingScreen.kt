@@ -82,6 +82,7 @@ fun SharedTransitionScope.LocalNetworkSharing(
     val actions =
         LocalPolicyActions(
             onEnabled = viewModel::setPolicyEnabled,
+            onExcludedAppsSkipLocalRules = viewModel::setExcludedAppsSkipLocalRules,
             onEdit = viewModel::edit,
             onUpdate = viewModel::updateDraft,
             onSave = viewModel::save,

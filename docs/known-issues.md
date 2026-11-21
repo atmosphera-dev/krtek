@@ -50,7 +50,19 @@ Each issue in this document should provide, at least, the following:
   is briefly no route, typically 10-30 ms in testing. Open local TCP connections
   continue, but a UDP packet can be lost or fail to send in that moment. The same
   UDP socket can send again afterward.
-* Changing the list of excluded apps also rebuilds the interface. Android closes
+* Static inventory found 0 demonstrated avoidable replacements. Equal normalized
+  full/Partial profiles already reuse; this is not a measured runtime reduction.
+  Necessary profile/UID changes and forced or actual-loss recovery remain, along
+  with the route gap above. No atomic handover or missing-package/shared-UID
+  optimization is claimed.
+* `Excluded apps skip local rules` defaults to ON for fresh and old settings.
+  ON skips Krtek Local handling, not all direct LAN access: Android may still
+  allow an excluded app to use the physical network without Krtek. OFF includes
+  those apps only in Partial Local capture, not full Connecting/Connected or
+  Error capture. Android still controls traffic outside capture and OS lockdown.
+* Changing the list of excluded apps or the preference's effective Partial UID
+  coverage rebuilds the interface. OFF can also change UID coverage on a
+  full/Partial transition. Android closes
   connections that are open at that moment; new connections normally work right
   away. In one test run, a new local TCP connection failed once right after local
   rules were turned off and on and the app list was restored. This has not been
@@ -75,9 +87,26 @@ Each issue in this document should provide, at least, the following:
 * The capture uses `172.27.1.1/32` and `fdf0:ce4a:801d::172:27:1:1/128`
   independently of Mullvad's assignment. These private addresses can still
   collide with a real private network.
-* Fragmented large public DNS queries to Cloudflare have no validated response
-  in the retained emulator evidence. The path/filtering cause remains unknown;
-  successful Local echoes do not explain or resolve it.
+* The November 20, 2026 emulator comparison does not identify a Krtek-specific
+  defect in large public DNS delivery: unmodified, independently source-built
+  Mullvad at `8fcbcd553ebf514f854fd835fe1bd37c8551b56a` behaves the same as
+  Krtek diagnostic source `5c442be2546b04c43b8fc86705b5c8ceeac4bd8a`.
+  Both receive usable A answers for 76-byte UDP queries to Cloudflare
+  (`1.1.1.1:53` and `[2606:4700:4700::1111]:53`); both time out receiving
+  answers for 4096-byte queries, over IPv4 and IPv6. The eight once-only calls
+  use identical consumer APKs and query bytes per pair; only EDNS padding
+  length changes between request sizes. All ten defined network inputs match,
+  including relay/UDP endpoint and observed MTU 1280. Krtek's sealed native
+  journals show complete large-query fragment handoff and no matching return
+  during the observed consumer windows. This does not locate loss at the relay,
+  intervening network or Cloudflare, or establish remote filtering policy.
+  Stock has no Krtek-internal observation hooks; diagnostic timing, assigned
+  versus fixed addresses and separate Android boots/UIDs remain limitations.
+  This is not an official Mullvad release-signature comparison, a public DNS
+  delivery fix or proof for the final integrated feature candidate. Further
+  attribution needs separately authorized observations beyond the client,
+  such as a controlled Internet DNS receiver. Successful Local echoes do not
+  explain this result.
 * Mullvad capture uses its upstream-selected MTU and families. When an IPv4-only
   target uses MTU below 1280 and a Local rule needs IPv6, Android requires a
   capture-only 1280 floor. This does not raise the target MTU or enable IPv6

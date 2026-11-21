@@ -6,6 +6,9 @@ description = "Library for creating tunnel devices and interfacing with various 
 repository.workspace = true
 license.workspace = true
 
+[features]
+r06-diagnostics = ["talpid-lan-forwarder/r06-diagnostics"]
+
 [dependencies]
 cfg-if = "1.0"
 futures = { workspace = true }

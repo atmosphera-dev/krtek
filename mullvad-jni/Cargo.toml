@@ -25,6 +25,8 @@ tokio = { workspace = true, features = ["rt"] }
 [features]
 # Allow the API server to use to be configured
 api-override = ["mullvad-api/api-override", "mullvad-daemon/api-override"]
+public-dns-diagnostics = ["mullvad-daemon/public-dns-diagnostics"]
+r06-diagnostics = ["mullvad-daemon/r06-diagnostics"]
 
 [lints]
 workspace = true

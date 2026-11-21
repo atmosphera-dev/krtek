@@ -6138,6 +6138,7 @@ name = "talpid-lan-forwarder"
 version = "0.0.0"
 dependencies = [
  "cc",
+ "libc",
  "log",
  "smoltcp",
  "socket2",

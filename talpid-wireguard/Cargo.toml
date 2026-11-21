@@ -61,6 +61,7 @@ windows-sys = { workspace = true }
 
 [features]
 multihop-pcap = ["gotatun/pcap"]
+public-dns-diagnostics = []
 
 [lints]
 workspace = true

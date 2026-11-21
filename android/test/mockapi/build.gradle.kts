@@ -39,6 +39,7 @@ android {
     // The same neutral platform-only consumer runs under a second ordinary UID.
     // Keep one implementation shared with the app instrumentation APK.
     sourceSets.getByName("main").java.srcDir("../../app/src/androidTest/java")
+    sourceSets.getByName("main").java.srcDir("../publicdns/src/shared/java")
 
     kotlin { compilerOptions { allWarningsAsErrors = true } }
 

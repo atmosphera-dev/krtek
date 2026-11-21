@@ -43,6 +43,9 @@ const REQUEST_LIFETIME: Duration = Duration::from_secs(15);
 const CONTROL_STORAGE: usize = 4 * 1024 * 1024;
 const CONTROL_MTU: u16 = 1280;
 
+#[cfg(feature = "public-dns-diagnostics")]
+use crate::public_dns_diagnostics;
+
 pub(super) fn unavailable() -> io::Error {
     // GotaTun retries nonfatal receive errors synchronously. Retirement is
     // terminal, including setup failure: never turn it into a hot retry loop.
@@ -265,6 +268,12 @@ impl PendingManaged {
         let (send_dropped, send_joined) = tokio::sync::oneshot::channel();
         let (receive_dropped, receive_joined) = tokio::sync::oneshot::channel();
         let owner = Arc::new(ManagedControl {
+            #[cfg(feature = "public-dns-diagnostics")]
+            dns_observer: public_dns_diagnostics::Observer::new(
+                control.capability().identity().generation.get(),
+                control.capability().target().get(),
+                self.request.as_ref().expect("request owner").id(),
+            ),
             control,
             receipt,
             request: self.request.take().expect("request owner"),
@@ -317,6 +326,8 @@ struct Ledger {
 }
 
 pub(crate) struct ManagedControl {
+    #[cfg(feature = "public-dns-diagnostics")]
+    dns_observer: public_dns_diagnostics::Observer,
     control: AttemptControl,
     receipt: CaptureReceipt,
     request: ConfigurationRequest,
@@ -381,6 +392,8 @@ impl ManagedControl {
         self.installed.store(true, Ordering::Release);
     }
     pub(crate) fn revoke(&self) {
+        #[cfg(feature = "public-dns-diagnostics")]
+        self.dns_observer.retire();
         self.control.detach();
         self.request.cancel();
     }
@@ -392,6 +405,8 @@ impl ManagedControl {
         if let Some(guard) = self.guard.lock().await.as_mut() {
             guard.stop().await;
         }
+        #[cfg(feature = "public-dns-diagnostics")]
+        self.dns_observer.seal();
         // Every production caller has already joined create_devices failure or
         // devices.stop(). The control guard is the final transport task owner.
         self.request.transport_joined();
@@ -580,6 +595,8 @@ impl IpRecv for ManagedReceive {
                     packet = Self::private(&mut self.receive, pool) => Selected::Private(packet?),
                 }
             };
+            #[cfg(feature = "public-dns-diagnostics")]
+            let mut dns_handoff = None;
             let packet = match packet {
                 Selected::Private(Some(packet)) => {
                     let bytes = packet.into_bytes();
@@ -589,20 +606,38 @@ impl IpRecv for ManagedReceive {
                     bytes.try_into_ip().map_err(|_| unavailable())?
                 }
                 Selected::Private(_) => continue,
-                Selected::Application(packet) => match talpid_netstack::raw_packet::handoff(
-                    packet,
-                    self.owner.application.as_ref(),
-                    |packet| packet,
-                ) {
-                    Ok(packet) => packet,
-                    Err(error) => {
-                        self.owner.handoff_refused(error);
-                        continue;
+                Selected::Application(packet) => {
+                    #[cfg(feature = "public-dns-diagnostics")]
+                    {
+                        dns_handoff = self.owner.dns_observer.packet(
+                            "handoff-input",
+                            true,
+                            packet.view().bytes(),
+                        );
                     }
-                },
+                    match talpid_netstack::raw_packet::handoff(
+                        packet,
+                        self.owner.application.as_ref(),
+                        |packet| packet,
+                    ) {
+                        Ok(packet) => packet,
+                        Err(error) => {
+                            self.owner.handoff_refused(error);
+                            continue;
+                        }
+                    }
+                }
             };
             if !self.owner.live() {
                 return Err(unavailable());
+            }
+            #[cfg(feature = "public-dns-diagnostics")]
+            if dns_handoff.is_some() {
+                // raw_packet::handoff is a checked, byte-preserving ownership cast.
+                // This marker means IpRecv returned; encryption/departure is separate.
+                self.owner
+                    .dns_observer
+                    .event("handoff-return", dns_handoff.as_ref());
             }
             return Ok(std::iter::once(packet));
         }
@@ -634,6 +669,13 @@ impl IpSend for ManagedSend {
             }
             Reply::Discard => Ok(()),
             Reply::Application => {
+                #[cfg(feature = "public-dns-diagnostics")]
+                let _dns_send = self.owner.dns_observer.send_guard(&bytes);
+                #[cfg(feature = "public-dns-diagnostics")]
+                let dns_return = self
+                    .owner
+                    .dns_observer
+                    .packet("decrypted-return", false, &bytes);
                 self.owner
                     .control
                     .ready()
@@ -641,6 +683,12 @@ impl IpSend for ManagedSend {
                     .map_err(|_| unavailable())?;
                 match self.owner.translate(&bytes, Direction::Inbound) {
                     Ok(packet) => {
+                        #[cfg(feature = "public-dns-diagnostics")]
+                        let dns_queue = self.owner.dns_observer.packet(
+                            "translated-return",
+                            false,
+                            packet.view().bytes(),
+                        );
                         drop(bytes);
                         let send = self.owner.ordinary_send.send_packet(packet);
                         tokio::pin!(send);
@@ -660,6 +708,13 @@ impl IpSend for ManagedSend {
                             result
                         });
                         send.await.map_err(|_| unavailable())?;
+                        #[cfg(feature = "public-dns-diagnostics")]
+                        if dns_queue.is_some() {
+                            self.owner.dns_observer.events(&[
+                                ("return-queued", dns_queue.as_ref()),
+                                ("decrypted-return-queued", dns_return.as_ref()),
+                            ]);
+                        }
                     }
                     Err(TranslationError::Stale) => return Err(unavailable()),
                     // Pre-ownership validation/budget refusals are counted by

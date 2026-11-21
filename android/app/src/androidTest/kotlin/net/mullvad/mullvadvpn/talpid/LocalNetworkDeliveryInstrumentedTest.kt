@@ -91,16 +91,25 @@ import org.junit.jupiter.api.Test
 import org.koin.android.ext.android.getKoin
 import org.koin.core.qualifier.named
 
+internal val R06_SEQUENCE_TEST_TIMEOUT: Duration = 4.minutes
+
 /** Restart-safe observations and ordinary-app probes; consumerProbe never writes policy. */
 class LocalNetworkDeliveryInstrumentedTest {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
     private val target = instrumentation.targetContext
     private val testPackage = instrumentation.context.packageName
     private val args = InstrumentationRegistry.getArguments()
+    private val receiveBoundary by lazy { R06ReceiveBoundaryTest.Observer(instrumentation, args) }
+    internal val r06Custody by lazy {
+        if (args.getString("krtek_r06_custody", "false") == "true")
+            R06FirstFailureCustody.Custody(instrumentation, args)
+        else null
+    }
     private val peer
         get() = args.getString("krtek_peer", "10.0.2.2")
 
     private var probeIndex = 0
+    private val publicDnsObserver = PublicDnsObserverTest()
     private val continuityIntents = mutableListOf<LocalContinuityWindows.Intent>()
 
     private fun continuityIntent(kind: String) {
@@ -143,96 +152,119 @@ class LocalNetworkDeliveryInstrumentedTest {
         after: (LocalNetworkEditorInstrumentedTest) -> Unit = {},
         block: (Consumer, SettingsRepository, ConnectionProxy) -> Unit,
     ) {
-        LocalNetworkEditorInstrumentedTest().withLocalAccessScreen(testTimeout = testTimeout) {
-            editor ->
-            val koin = (target.applicationContext as MullvadApplication).getKoin()
-            val repository = koin.get<SettingsRepository>()
-            val connection = koin.get<ConnectionProxy>()
-            runBlocking {
-                withTimeout(30_000) { repository.settingsUpdates.filterNotNull().first() }
-                val expectedTunnel = args.getString("krtek_expect_tunnel", "Disconnected")
-                check(expectedTunnel in setOf("Disconnected", "Connected"))
-                val initial = withTimeout(30_000) { connection.tunnelState.first() }
-                report("initial_tunnel", initial.javaClass.simpleName)
-                val autoConnected =
-                    expectedTunnel == "Disconnected" &&
-                        (initial is TunnelState.Connecting || initial is TunnelState.Connected)
-                report("auto_connected", autoConnected)
-                if (autoConnected)
-                    assertTrue(
-                        connection
-                            .disconnect(DisconnectReason.USER_INITIATED_DISCONNECT_BUTTON)
-                            .isRight()
-                    )
-                val tunnel =
-                    withTimeout(if (expectedTunnel == "Connected") 60_000 else 30_000) {
-                        connection.tunnelState.first {
-                            if (expectedTunnel == "Connected") it is TunnelState.Connected
-                            else it is TunnelState.Disconnected
+        withR06Failures {
+            LocalNetworkEditorInstrumentedTest().withLocalAccessScreen(testTimeout = testTimeout) {
+                editor ->
+                val koin = (target.applicationContext as MullvadApplication).getKoin()
+                val repository = koin.get<SettingsRepository>()
+                val connection = koin.get<ConnectionProxy>()
+                runBlocking {
+                    withTimeout(30_000) { repository.settingsUpdates.filterNotNull().first() }
+                    val expectedTunnel = args.getString("krtek_expect_tunnel", "Disconnected")
+                    check(expectedTunnel in setOf("Disconnected", "Connected"))
+                    val initial = withTimeout(30_000) { connection.tunnelState.first() }
+                    report("initial_tunnel", initial.javaClass.simpleName)
+                    val autoConnected =
+                        expectedTunnel == "Disconnected" &&
+                            (initial is TunnelState.Connecting || initial is TunnelState.Connected)
+                    report("auto_connected", autoConnected)
+                    if (autoConnected)
+                        assertTrue(
+                            connection
+                                .disconnect(DisconnectReason.USER_INITIATED_DISCONNECT_BUTTON)
+                                .isRight()
+                        )
+                    val tunnel =
+                        withTimeout(if (expectedTunnel == "Connected") 60_000 else 30_000) {
+                            connection.tunnelState.first {
+                                if (expectedTunnel == "Connected") it is TunnelState.Connected
+                                else it is TunnelState.Disconnected
+                            }
                         }
-                    }
-                report("tunnel", tunnel.javaClass.simpleName)
-            }
-            val lockdown = args.getString("krtek_expect_lockdown", "1")
-            check(lockdown in setOf("0", "1"))
-            val alwaysOn = shell("settings get secure always_on_vpn_app")
-            val observedLockdown = shell("settings get secure always_on_vpn_lockdown")
-            report("always_on", alwaysOn)
-            report("lockdown", observedLockdown)
-            assertEquals(target.packageName, alwaysOn)
-            assertEquals(lockdown, observedLockdown)
-            val required =
-                listOf(target.packageName to LOCAL_PERMISSION) +
-                    LocalNetworkConsumerService.requiredPermissions().map { testPackage to it }
-            val before = required.associateWith { (name, permission) ->
-                permissionState(name, permission)
-            }
-            before.forEach { (key, value) ->
-                val (name, permission) = key
-                report("permission_before_${name}_$permission", value)
-                if (permission == LOCAL_PERMISSION) report("grant_before_$name", value.first)
-            }
-            assertTrue(before.values.all { it.first }, "Guest runner must stage permissions")
-            try {
-                before.keys.forEach { (name, permission) ->
-                    assertTrue(grant(name, permission))
-                    report("permission_granted_${name}_$permission", true)
-                    if (permission == LOCAL_PERMISSION) report("grant_$name", true)
+                    report("tunnel", tunnel.javaClass.simpleName)
                 }
-                Consumer().use { consumer ->
-                    consumer.identity()
-                    val configured =
-                        checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
-                    val forwarding =
-                        expectation
-                            ?: if (
-                                configured.enabled &&
-                                    configured.rules.any { it.enabled && it.cidrs.isNotEmpty() }
-                            )
-                                ForwardingAvailability.Active
-                            else ForwardingAvailability.Off
-                    // Answer r02: observe the daemon's consequence, not a fabricated target read.
-                    awaitState(repository, connection, forwarding, null)
-                    block(consumer, repository, connection)
+                val lockdown = args.getString("krtek_expect_lockdown", "1")
+                check(lockdown in setOf("0", "1"))
+                val alwaysOn = shell("settings get secure always_on_vpn_app")
+                val observedLockdown = shell("settings get secure always_on_vpn_lockdown")
+                report("always_on", alwaysOn)
+                report("lockdown", observedLockdown)
+                assertEquals(target.packageName, alwaysOn)
+                assertEquals(lockdown, observedLockdown)
+                val required =
+                    listOf(target.packageName to LOCAL_PERMISSION) +
+                        LocalNetworkConsumerService.requiredPermissions().map { testPackage to it }
+                val before = required.associateWith { (name, permission) ->
+                    permissionState(name, permission)
                 }
-                after(editor)
-            } finally {
-                before.forEach { (key, _) ->
+                before.forEach { (key, value) ->
                     val (name, permission) = key
-                    report(
-                        "permission_after_${name}_$permission",
-                        permissionState(name, permission),
-                    )
-                    if (permission == LOCAL_PERMISSION) report("grant_after_$name", grant(name))
+                    report("permission_before_${name}_$permission", value)
+                    if (permission == LOCAL_PERMISSION) report("grant_before_$name", value.first)
                 }
-                assertEquals(
-                    before,
-                    before.keys.associateWith { (name, permission) ->
-                        permissionState(name, permission)
-                    },
-                    "Restore every staged grant and preserve its permission flags",
-                )
+                assertTrue(before.values.all { it.first }, "Guest runner must stage permissions")
+                try {
+                    before.keys.forEach { (name, permission) ->
+                        assertTrue(grant(name, permission))
+                        report("permission_granted_${name}_$permission", true)
+                        if (permission == LOCAL_PERMISSION) report("grant_$name", true)
+                    }
+                    Consumer().use { consumer ->
+                        consumer.identity()
+                        val configured =
+                            checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
+                        val forwarding =
+                            expectation
+                                ?: if (
+                                    configured.enabled &&
+                                        configured.rules.any { it.enabled && it.cidrs.isNotEmpty() }
+                                )
+                                    ForwardingAvailability.Active
+                                else ForwardingAvailability.Off
+                        // Answer r02: observe the daemon's consequence, not a fabricated target
+                        // read.
+                        awaitState(repository, connection, forwarding, null)
+                        block(consumer, repository, connection)
+                    }
+                    after(editor)
+                } catch (error: Throwable) {
+                    r06Custody?.recordFailure("consumer-body", error)
+                    throw error
+                } finally {
+                    r06Checked("permission-restoration") {
+                        before.forEach { (key, _) ->
+                            val (name, permission) = key
+                            report(
+                                "permission_after_${name}_$permission",
+                                permissionState(name, permission),
+                            )
+                            if (permission == LOCAL_PERMISSION)
+                                report("grant_after_$name", grant(name))
+                        }
+                        assertEquals(
+                            before,
+                            before.keys.associateWith { (name, permission) ->
+                                permissionState(name, permission)
+                            },
+                            "Restore every staged grant and preserve its permission flags",
+                        )
+                    }
+                }
             }
+        }
+    }
+
+    private fun withR06Failures(body: () -> Unit) {
+        val custody = r06Custody
+        if (custody == null) body() else custody.ledger.run(body, {})
+    }
+
+    private fun r06Checked(phase: String, body: () -> Unit) {
+        try {
+            body()
+        } catch (error: Throwable) {
+            r06Custody?.recordFailure(phase, error)
+            throw error
         }
     }
 
@@ -1125,23 +1157,22 @@ class LocalNetworkDeliveryInstrumentedTest {
             withPolicy(repository, peerPolicy()) {
                 try {
                     if (state == "Connected") connect(connection)
-                    awaitState(
-                        repository,
-                        connection,
-                        ForwardingAvailability.Active,
-                        LocalRuleState.Forwarding,
-                        state,
-                    )
-                    appliedConfiguration(peerPolicy(), ForwardingAvailability.Active, state)
-                    LocalSession(consumer, expectedPublic = state == "Connected").use { session ->
-                        session.dwell(state)
-                        session.burst()
-                        session.dwell("${state}-large-write")
-                        if (state == "Connected") {
-                            probeExit(consumer, "mullvad")
-                            probeIcmp(consumer, "echo")
+                    LocalSession(
+                            consumer,
+                            repository,
+                            connection,
+                            state,
+                            expectedPublic = state == "Connected",
+                        )
+                        .use { session ->
+                            session.dwell(state)
+                            session.burst()
+                            session.dwell("${state}-large-write")
+                            if (state == "Connected") {
+                                probeExit(consumer, "mullvad")
+                                probeIcmp(consumer, "echo")
+                            }
                         }
-                    }
                 } finally {
                     disconnect(connection)
                 }
@@ -1211,7 +1242,7 @@ class LocalNetworkDeliveryInstrumentedTest {
             assertTrue(excluded !in original.excludedApps)
             assertTrue(PackageName(testPackage) !in original.excludedApps)
             try {
-                LocalSession(consumer).use { session ->
+                LocalSession(consumer, repository, connection, "Connected").use { session ->
                     session.dwell("before-app-list-change")
                     // Upstream applies the app list through the reconnect's new
                     // interface; the old capture stays until then. Require that
@@ -1274,7 +1305,8 @@ class LocalNetworkDeliveryInstrumentedTest {
                     configs +=
                         appliedConfiguration(policy, ForwardingAvailability.Active, "Disconnected")
                     // These are explicitly new sockets, with the original deadlines.
-                    LocalSession(consumer).use { recovered ->
+                    LocalSession(consumer, repository, connection, "Disconnected").use { recovered
+                        ->
                         recovered.dwell("initial-partial-with-exclusion")
                         connect(connection)
                         configs +=
@@ -1315,15 +1347,22 @@ class LocalNetworkDeliveryInstrumentedTest {
                     )
                     report("static_exclusion_cycle_end_ns", end)
                 } else {
-                    LocalSession(consumer, expectedPublic = true).use { recovered ->
-                        continuityConnected(
+                    LocalSession(
                             consumer,
                             repository,
                             connection,
-                            recovered,
-                            "fresh-after-app-list-change",
+                            "Connected",
+                            expectedPublic = true,
                         )
-                    }
+                        .use { recovered ->
+                            continuityConnected(
+                                consumer,
+                                repository,
+                                connection,
+                                recovered,
+                                "fresh-after-app-list-change",
+                            )
+                        }
                 }
             } finally {
                 runBlocking {
@@ -1470,7 +1509,7 @@ class LocalNetworkDeliveryInstrumentedTest {
             val policy = peerPolicy()
             try {
                 setPolicy(repository, policy)
-                LocalSession(consumer).use { session ->
+                LocalSession(consumer, repository, connection, "Disconnected").use { session ->
                     session.dwell("initial-local")
                     connect(connection)
                     continuityConnected(
@@ -1513,7 +1552,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                     probeExit(consumer, "mullvad")
                 }
                 setPolicy(repository, policy)
-                LocalSession(consumer).use { recovery ->
+                LocalSession(consumer, repository, connection, "Connected").use { recovery ->
                     recovery.dwell("new-session-after-revocation")
                     probeExit(consumer, "mullvad")
                 }
@@ -1548,38 +1587,13 @@ class LocalNetworkDeliveryInstrumentedTest {
                 }
             try {
                 setPolicy(repository, policy)
-                awaitState(
-                    repository,
-                    connection,
-                    ForwardingAvailability.Active,
-                    LocalRuleState.Forwarding,
-                    "Disconnected",
-                )
-                appliedConfiguration(
-                    policy,
-                    ForwardingAvailability.Active,
-                    "Disconnected",
-                    fixedCapture = true,
-                )
-                LocalSession(consumer).use { session ->
+                LocalSession(consumer, repository, connection, "Disconnected").use { session ->
                     session.dwell("initial-disconnected")
                     session.burst()
                     session.dwell("large-write-before-handover")
                     block(consumer, repository, connection, session)
                     disconnect(connection)
-                    awaitState(
-                        repository,
-                        connection,
-                        ForwardingAvailability.Active,
-                        LocalRuleState.Forwarding,
-                        "Disconnected",
-                    )
-                    appliedConfiguration(
-                        policy,
-                        ForwardingAvailability.Active,
-                        "Disconnected",
-                        fixedCapture = true,
-                    )
+                    awaitAppliedState(repository, connection, "Disconnected")
                     session.burst()
                     session.dwell("final-disconnected")
                 }
@@ -1603,20 +1617,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         session: LocalSession,
         stage: String,
     ): AppliedCapture {
-        awaitState(
-            repository,
-            connection,
-            ForwardingAvailability.Active,
-            LocalRuleState.Forwarding,
-            "Connected",
-        )
-        val config =
-            appliedConfiguration(
-                checkNotNull(repository.settingsUpdates.value?.localNetworkAccess),
-                ForwardingAvailability.Active,
-                "Connected",
-                fixedCapture = true,
-            )
+        val config = awaitAppliedState(repository, connection, "Connected")
         session.burst()
         session.dwell(stage)
         probeExit(consumer, "mullvad")
@@ -1720,6 +1721,9 @@ class LocalNetworkDeliveryInstrumentedTest {
 
     private inner class LocalSession(
         private val consumer: Consumer,
+        repository: SettingsRepository,
+        connection: ConnectionProxy,
+        expectedTunnel: String,
         private val expectedPublic: Boolean? = null,
     ) : AutoCloseable {
         val id: String
@@ -1776,6 +1780,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         }
 
         init {
+            awaitAppliedState(repository, connection, expectedTunnel)
             clockMark("begin")
             val response =
                 consumer.request(
@@ -1811,11 +1816,14 @@ class LocalNetworkDeliveryInstrumentedTest {
                 assertEquals(id, it.getString("session_id"))
                 assertEquals("CLOCK_BOOTTIME", it.getString("clock"))
                 assertEquals(consumerPid, it.getInt("pid"))
-                assertEquals(
-                    "",
-                    it.getString("failure"),
-                    "Session failure must not become a blocking pass",
-                )
+                r06Custody?.observeSession(it)
+                r06Checked("session-command") {
+                    assertEquals(
+                        "",
+                        it.getString("failure"),
+                        "Session failure must not become a blocking pass",
+                    )
+                }
             }
         }
 
@@ -1934,32 +1942,39 @@ class LocalNetworkDeliveryInstrumentedTest {
                     )
                 }
             val usedRebuilds = mutableSetOf<Int>()
-            if (appListChangeAt != null) {
-                assertTrue(stop.getString("failure") in setOf("", "tcp-exchange"))
-                if (stop.getString("failure") == "tcp-exchange") {
-                    assertTrue(
-                        local.any {
-                            it.getString("transport") == "tcp" &&
-                                it.getString("outcome") in setOf("error", "cancelled") &&
-                                it.optString("error_class") == "java.net.SocketException" &&
-                                it.getLong("return_ns") >= checkNotNull(appListChangeAt)
-                        },
-                        "Only Android's post-app-list socket destruction is expected",
-                    )
+            r06Checked("session-stop") {
+                try {
+                    if (appListChangeAt != null) {
+                        assertTrue(stop.getString("failure") in setOf("", "tcp-exchange"))
+                        if (stop.getString("failure") == "tcp-exchange") {
+                            assertTrue(
+                                local.any {
+                                    it.getString("transport") == "tcp" &&
+                                        it.getString("outcome") in setOf("error", "cancelled") &&
+                                        it.optString("error_class") == "java.net.SocketException" &&
+                                        it.getLong("return_ns") >= checkNotNull(appListChangeAt)
+                                },
+                                "Only Android's post-app-list socket destruction is expected",
+                            )
+                        }
+                        report("app_list_existing_socket_failure", stop.getString("failure"))
+                    } else if (revokedAt == null) assertEquals("", stop.getString("failure"))
+                    else
+                        assertTrue(
+                            stop.getString("failure") in
+                                setOf(
+                                    "tcp-exchange",
+                                    "udp-exchange",
+                                    "tcp-frame-watchdog",
+                                    "udp-frame-watchdog",
+                                ),
+                            "Only the intentional Local retirement may fail",
+                        )
+                } catch (error: Throwable) {
+                    r06Custody?.observeSession(stop)
+                    throw error
                 }
-                report("app_list_existing_socket_failure", stop.getString("failure"))
-            } else if (revokedAt == null) assertEquals("", stop.getString("failure"))
-            else
-                assertTrue(
-                    stop.getString("failure") in
-                        setOf(
-                            "tcp-exchange",
-                            "udp-exchange",
-                            "tcp-frame-watchdog",
-                            "udp-frame-watchdog",
-                        ),
-                    "Only the intentional Local retirement may fail",
-                )
+            }
             assertEquals("requested", stop.getString("stop_reason"))
             assertTrue(stop.getLong("stopped_ns") > stop.getLong("started_ns"))
             assertEquals(stop.getInt("local_count"), local.size)
@@ -2422,8 +2437,14 @@ class LocalNetworkDeliveryInstrumentedTest {
             probeExit(consumer, "mullvad")
             val token = checkNotNull(args.getString("krtek_capture_token"))
             check(token.matches(Regex("[a-z0-9-]{1,64}")))
-            captureBarrier(token, "start", capture)
-            try {
+            publicDnsObserver.capture(
+                { captureBarrier(token, "start", capture) },
+                {
+                    val finalCapture = appliedConfiguration(policy, forwarding, "Connected")
+                    assertEquals(capture, finalCapture, "Capture epoch changed during probes")
+                },
+                { captureBarrier(token, "finish", capture) },
+            ) {
                 // Both small controls precede either large echo. Failure is a
                 // real observation, never silently retried with another peer.
                 listOf(32, 3072).forEach { size ->
@@ -2470,7 +2491,10 @@ class LocalNetworkDeliveryInstrumentedTest {
                     if (result.getString("outcome") == "fragmented-udp") {
                         assertTrue(decoded.getBoolean("validated"))
                         assertEquals(4096, decoded.getInt("sent"))
-                        assertEquals(8192, decoded.getString("query_hex").length)
+                        val queryFile = decoded.getJSONObject("query")
+                        assertEquals(4096, queryFile.getInt("size"))
+                        assertEquals(64, queryFile.getString("sha256").length)
+                        assertTrue(queryFile.getString("path").endsWith("/query.bin"))
                         assertEquals(0, decoded.getInt("option_value"))
                         assertTrue(decoded.getBoolean("option_set"))
                     }
@@ -2480,10 +2504,6 @@ class LocalNetworkDeliveryInstrumentedTest {
                     }
                 }
                 probeExit(consumer, "mullvad")
-            } finally {
-                val finalCapture = appliedConfiguration(policy, forwarding, "Connected")
-                assertEquals(capture, finalCapture, "Capture epoch changed during probes")
-                captureBarrier(token, "finish", finalCapture)
             }
         }
 
@@ -2580,8 +2600,19 @@ class LocalNetworkDeliveryInstrumentedTest {
                     withTimeout(10_000) { rpc.GetLocalNetworkStatus().execute(Unit) }
                 }
                 assertTrue(eligible(start), "Unexpected Local status before UDP probe")
-                captureBarrier(token, "start", capture)
-                try {
+                publicDnsObserver.capture(
+                    { captureBarrier(token, "start", capture) },
+                    {
+                        val finalCapture =
+                            appliedConfiguration(policy, ForwardingAvailability.Active)
+                        assertEquals(
+                            capture,
+                            finalCapture,
+                            "Capture epoch changed during Local UDP probe",
+                        )
+                    },
+                    { captureBarrier(token, "finish", capture) },
+                ) {
                     val result = runBlocking {
                         withContext(Dispatchers.IO) {
                             consumer
@@ -2689,14 +2720,6 @@ class LocalNetworkDeliveryInstrumentedTest {
                             true,
                         )
                     }
-                } finally {
-                    val finalCapture = appliedConfiguration(policy, ForwardingAvailability.Active)
-                    assertEquals(
-                        capture,
-                        finalCapture,
-                        "Capture epoch changed during Local UDP probe",
-                    )
-                    captureBarrier(token, "finish", finalCapture)
                 }
             }
         }
@@ -2714,6 +2737,12 @@ class LocalNetworkDeliveryInstrumentedTest {
 
     private fun captureBarrier(token: String, phase: String, capture: AppliedCapture) =
         runBlocking {
+            // Use the start-bound owner even when final capture lookup fails.
+            // Seal before filesystem/interface checks can fail independently.
+            val dnsOwner =
+                if (args.getString("krtek_public_dns_diagnostics") == "true")
+                    publicDnsObserver.observe(phase)
+                else null
             val folder = File(target.filesDir, "krtek-probes")
             val ready = File(folder, "$token-$phase.json")
             val ack = File(folder, "$token-$phase.ack")
@@ -2732,6 +2761,11 @@ class LocalNetworkDeliveryInstrumentedTest {
                             "ifindex",
                             java.net.NetworkInterface.getByName(capture.interfaceName).index,
                         )
+                        if (dnsOwner != null) {
+                            // Seal and fsync the actual native owner before finish
+                            // becomes visible, not after instrumentation exits.
+                            put("public_dns_owner", dnsOwner)
+                        }
                         put("ready_ns", SystemClock.elapsedRealtimeNanos())
                     }
                     .toString()
@@ -2847,7 +2881,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         report("cycle_tunnel", "Disconnected")
     }
 
-    private fun connectedCase(
+    internal fun connectedCase(
         testTimeout: Duration = 1.minutes,
         block: (Consumer, SettingsRepository, ConnectionProxy, LocalNetworkAccess) -> Unit,
     ) =
@@ -2863,56 +2897,47 @@ class LocalNetworkDeliveryInstrumentedTest {
                     }
                 }
                 report("cycle_tunnel", "Connected")
-                awaitState(
-                    repository,
-                    connection,
-                    ForwardingAvailability.Active,
-                    LocalRuleState.Forwarding,
-                    "Connected",
-                )
+                awaitAppliedState(repository, connection, "Connected")
                 block(consumer, repository, connection, policy)
+            } catch (error: Throwable) {
+                r06Custody?.recordFailure("connected-body", error)
+                throw error
             } finally {
-                // Disconnect first so restoration never reconnects after instrumentation exits.
-                disconnect(connection)
-                setPolicy(repository, original)
-                awaitState(
-                    repository,
-                    connection,
-                    if (
-                        original.enabled &&
-                            original.rules.any { it.enabled && it.cidrs.isNotEmpty() }
+                r06Checked("policy-restoration") {
+                    // Disconnect first so restoration never reconnects after instrumentation exits.
+                    disconnect(connection)
+                    setPolicy(repository, original)
+                    awaitState(
+                        repository,
+                        connection,
+                        if (
+                            original.enabled &&
+                                original.rules.any { it.enabled && it.cidrs.isNotEmpty() }
+                        )
+                            ForwardingAvailability.Active
+                        else ForwardingAvailability.Off,
+                        null,
+                        "Disconnected",
                     )
-                        ForwardingAvailability.Active
-                    else ForwardingAvailability.Off,
-                    null,
-                    "Disconnected",
-                )
-                report("policy_restored", true)
+                    report("policy_restored", true)
+                }
             }
         }
 
-    private fun connectedProof(
+    internal fun connectedProof(
         consumer: Consumer,
         repository: SettingsRepository,
         connection: ConnectionProxy,
         previousGeneration: String? = null,
     ): AppliedCapture {
-        val policy = checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
-        awaitState(
-            repository,
-            connection,
-            ForwardingAvailability.Active,
-            LocalRuleState.Forwarding,
-            "Connected",
-        )
-        consumer.identity()
         val config =
-            appliedConfiguration(
-                policy,
-                ForwardingAvailability.Active,
+            awaitAppliedState(
+                repository,
+                connection,
                 "Connected",
-                previousGeneration,
+                previousGeneration = previousGeneration,
             )
+        consumer.identity()
         listOf("tcp", "udp").forEach { probeSocket(consumer, it, "reply") }
         probeExit(consumer, "mullvad")
         return config
@@ -2923,12 +2948,37 @@ class LocalNetworkDeliveryInstrumentedTest {
         repository: SettingsRepository,
         connection: ConnectionProxy,
     ): AppliedCapture {
-        val policy = checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
-        awaitState(repository, connection, ForwardingAvailability.Off, null, "Connected")
+        val config =
+            awaitAppliedState(repository, connection, "Connected", ForwardingAvailability.Off, null)
         consumer.identity()
-        val config = appliedConfiguration(policy, ForwardingAvailability.Off, "Connected")
         probeExit(consumer, "mullvad")
         return config
+    }
+
+    private fun awaitAppliedState(
+        repository: SettingsRepository,
+        connection: ConnectionProxy,
+        expectedTunnel: String,
+        forwarding: ForwardingAvailability = ForwardingAvailability.Active,
+        ruleState: LocalRuleState? = LocalRuleState.Forwarding,
+        previousGeneration: String? = null,
+    ): AppliedCapture {
+        val policy = checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
+        awaitState(repository, connection, forwarding, ruleState, expectedTunnel)
+        val capture = appliedConfiguration(policy, forwarding, expectedTunnel, previousGeneration)
+        val uid = target.packageManager.getApplicationInfo(testPackage, 0).uid
+        assertTrue(uidIncluded(capture.uids, uid), "Applied capture must include the consumer UID")
+        report(
+            "applied_state",
+            JSONObject()
+                .put("elapsed_ns", SystemClock.elapsedRealtimeNanos())
+                .put("tunnel", expectedTunnel)
+                .put("forwarding", forwarding.toString())
+                .put("capture_generation", capture.generation)
+                .put("net_id", capture.netId)
+                .put("consumer_uid", uid),
+        )
+        return capture
     }
 
     private fun normalConfiguration(
@@ -2955,7 +3005,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         report("normal_configuration_equal", true)
     }
 
-    private fun withNativeControl(
+    internal fun withNativeControl(
         consumer: Consumer,
         repository: SettingsRepository,
         connection: ConnectionProxy,
@@ -3066,7 +3116,11 @@ class LocalNetworkDeliveryInstrumentedTest {
 
     @Test
     fun connectedConfigurationChangesReconcileBeforeDelivery() =
-        connectedCase { consumer, repository, connection, policy ->
+        connectedCase(testTimeout = R06_SEQUENCE_TEST_TIMEOUT) {
+            consumer,
+            repository,
+            connection,
+            policy ->
             val original = checkNotNull(repository.settingsUpdates.value)
             val split =
                 (target.applicationContext as MullvadApplication)
@@ -3231,25 +3285,32 @@ class LocalNetworkDeliveryInstrumentedTest {
                 report("consumer_included", true)
                 val exclusionControl = withNativeControl(consumer, repository, connection, policy)
                 assertEquals(exclusions.uids, exclusionControl.uids)
+            } catch (error: Throwable) {
+                r06Custody?.recordFailure("settings-body", error)
+                throw error
             } finally {
-                runBlocking {
-                    assertTrue(split.includeApp(excluded).isRight())
-                    assertTrue(
-                        split.enableSplitTunneling(original.splitTunnelSettings.enabled).isRight()
-                    )
-                    assertTrue(repository.setLocalNetworkSharing(original.allowLan).isRight())
-                    withTimeout(10_000) {
-                        repository.settingsUpdates.first {
-                            it?.allowLan == original.allowLan &&
-                                it.splitTunnelSettings == original.splitTunnelSettings
+                r06Checked("settings-restoration") {
+                    runBlocking {
+                        assertTrue(split.includeApp(excluded).isRight())
+                        assertTrue(
+                            split
+                                .enableSplitTunneling(original.splitTunnelSettings.enabled)
+                                .isRight()
+                        )
+                        assertTrue(repository.setLocalNetworkSharing(original.allowLan).isRight())
+                        withTimeout(10_000) {
+                            repository.settingsUpdates.first {
+                                it?.allowLan == original.allowLan &&
+                                    it.splitTunnelSettings == original.splitTunnelSettings
+                            }
                         }
                     }
+                    setPolicy(repository, policy)
+                    val restored = connectedProof(consumer, repository, connection)
+                    assertEquals(before.routes, restored.routes)
+                    assertEquals(before.uids, restored.uids)
+                    report("settings_restored", true)
                 }
-                setPolicy(repository, policy)
-                val restored = connectedProof(consumer, repository, connection)
-                assertEquals(before.routes, restored.routes)
-                assertEquals(before.uids, restored.uids)
-                report("settings_restored", true)
             }
         }
 
@@ -3406,6 +3467,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                         if (transport == "tcp") "18080" else "18081",
                     )
                     .toInt()
+        receiveBoundary.beforeConnect(index, transport, expect, nonce)
         val result =
             consumer.request(
                 Bundle().apply {
@@ -3423,21 +3485,27 @@ class LocalNetworkDeliveryInstrumentedTest {
         report("probe_outcome", checkNotNull(result.getString("outcome")))
         result.getString("error_class")?.let { report("probe_error_class", it) }
         result.getString("socket_report")?.let { report("socket_report", it) }
-        assertEquals(
-            when (expect) {
-                "reply" -> "reply"
-                "connected" -> "connected"
-                else -> "failed"
-            },
-            result.getString("outcome"),
-        )
-        if (expect == "reply")
-            assertContentEquals(
-                nonce.toByteArray(Charsets.US_ASCII),
-                result.getByteArray("reply"),
+        try {
+            if (expect in setOf("reply", "connected")) r06Custody?.observe(transport, result)
+            assertEquals(
+                when (expect) {
+                    "reply" -> "reply"
+                    "connected" -> "connected"
+                    else -> "failed"
+                },
+                result.getString("outcome"),
             )
-        if (expect == "blocked")
-            assertTrue(checkNotNull(result.getString("error_class")).contains('.'))
+            if (expect == "reply")
+                assertContentEquals(
+                    nonce.toByteArray(Charsets.US_ASCII),
+                    result.getByteArray("reply"),
+                )
+            if (expect == "blocked")
+                assertTrue(checkNotNull(result.getString("error_class")).contains('.'))
+        } catch (error: Throwable) {
+            r06Custody?.recordFailure("socket-probe-$index", error)
+            throw error
+        }
         return result
     }
 
@@ -3786,6 +3854,11 @@ class LocalNetworkDeliveryInstrumentedTest {
                         it.getInt("uid"),
                     )
                     assertNotEquals(Process.myUid(), it.getInt("uid"))
+                    assertNotEquals(
+                        "harness-failure",
+                        it.getString("outcome"),
+                        "Consumer harness failure: ${it.getString("error_kind")}: ${it.getString("error_class")}",
+                    )
                     LocalNetworkConsumerService.requiredPermissions().forEach { permission ->
                         val granted = it.getBoolean("permission_$permission")
                         report("consumer_permission_$permission", granted)

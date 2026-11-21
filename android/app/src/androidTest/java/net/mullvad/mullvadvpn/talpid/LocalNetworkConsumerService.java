@@ -160,7 +160,13 @@ public final class LocalNetworkConsumerService extends Service {
     FutureTask<Void> task =
         new FutureTask<>(
             () -> {
-               Bundle result = execute(command, ownedResources);
+              long started = SystemClock.elapsedRealtime();
+              Bundle result;
+              try {
+                result = execute(command, ownedResources);
+              } catch (Exception error) {
+                result = probeFailure("request-execution", error, started);
+              }
               if (completed.compareAndSet(false, true)) send(reply, command, result);
               return null;
             });
@@ -245,7 +251,7 @@ public final class LocalNetworkConsumerService extends Service {
       activeProbe = resources;
       try {
         if (Thread.currentThread().isInterrupted()) return outcome("deadline");
-        return FragmentedUdpProbe.run(family, resources::icmpSocket);
+        return FragmentedUdpProbe.run(getFilesDir(), family, resources::icmpSocket);
       } finally {
         resources.close();
         activeProbe = null;
@@ -279,6 +285,14 @@ public final class LocalNetworkConsumerService extends Service {
       return outcome("invalid");
     }
     SocketReport report = new SocketReport();
+    SocketReport.put(report.root, "request_id", command.getString("request_id"));
+    SocketReport.put(report.root, "nonce", nonce);
+    SocketReport.put(report.root, "transport", transport);
+    SocketReport.put(report.root, "requested_destination", destination);
+    SocketReport.put(report.root, "requested_port", port);
+    SocketReport.put(report.root, "requested_timeout_ms", timeout);
+    SocketReport.put(report.root, "uid", Process.myUid());
+    SocketReport.put(report.root, "pid", Process.myPid());
     try {
       InetAddress address = InetAddresses.parseNumericAddress(destination);
       if ("tcp-connect".equals(transport)) {
@@ -977,8 +991,12 @@ public final class LocalNetworkConsumerService extends Service {
     try {
       report.begin("create");
       socket = new Socket();
+      SocketReport.put(report.root, "socket_object_id", System.identityHashCode(socket));
       report.ok(0);
       report.begin("connect");
+      // Request metadata only, not a claim about the kernel's timeout or errno.
+      SocketReport.put(
+          report.root, "requested_connect_deadline_elapsed_ns", report.stepAt + timeout * 1000000L);
       socket.connect(new InetSocketAddress(address, port), timeout);
       report.connectedAt = SystemClock.elapsedRealtimeNanos();
       SocketReport.put(report.root, "local_port", socket.getLocalPort());
@@ -1011,6 +1029,30 @@ public final class LocalNetworkConsumerService extends Service {
     } catch (Exception error) {
       primary = error;
       report.failed(error);
+      if (socket != null && "connect".equals(report.operation)) {
+        JSONObject snapshot = new JSONObject();
+        SocketReport.put(snapshot, "phase", "after-java-connect-exception");
+        SocketReport.put(snapshot, "elapsed_ns", SystemClock.elapsedRealtimeNanos());
+        // Java may already have closed/reset its native fd before this catch.
+        // The read-only syscall/netlink collector owns actual pre-close evidence.
+        SocketReport.put(snapshot, "native_fd_still_open_proven", false);
+        try {
+          InetAddress local = socket.getLocalAddress();
+          int localPort = socket.getLocalPort();
+          SocketReport.put(snapshot, "java_socket_closed", socket.isClosed());
+          SocketReport.put(snapshot, "local_port", localPort);
+          SocketReport.put(snapshot, "local_address", local == null ? null : local.getHostAddress());
+          SocketReport.put(
+              snapshot,
+              "assigned_tuple_available",
+              localPort > 0 && local != null && !local.isAnyLocalAddress());
+        } catch (RuntimeException observationError) {
+          // Observation must not replace the original connect exception.
+          SocketReport.put(
+              snapshot, "observation_error_class", observationError.getClass().getName());
+        }
+        SocketReport.put(report.root, "failed_connect_java_snapshot", snapshot);
+      }
       throw error;
     } finally {
       if (socket != null) {
@@ -1097,6 +1139,9 @@ public final class LocalNetworkConsumerService extends Service {
       JSONObject event = new JSONObject();
       long now = SystemClock.elapsedRealtimeNanos();
       put(event, "operation", operation);
+      put(event, "uid", Process.myUid());
+      put(event, "pid", Process.myPid());
+      put(event, "tid", Process.myTid());
       put(event, "phase", phase);
       put(event, "wall_ms", System.currentTimeMillis());
       put(event, "elapsed_ns", now);
