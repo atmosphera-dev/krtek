@@ -146,22 +146,8 @@ pub trait LocalIpEngine {
     )]
     fn poll_time(&mut self, now: MonotonicMillis) -> Result<(), IpError>;
     /// Relative next wake; None maps to native UINT32_MAX. Drive even idle.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the production core schedules its own idle maintenance; fixtures query the logical engine"
-        )
-    )]
     fn next_timeout_ms(&self) -> Option<u32>;
     /// Retained tagged nodes, queryable after close until zero.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "production scope retirement is atomic under the global core lock; fixtures inspect per-handle references"
-        )
-    )]
     fn scope_refs(&self, scope: ReceiveScopeId) -> usize;
     /// Idempotent retirement. Must not reset the global clock or free funding
     /// still backing retained nodes. Later mutating operations return Stale.

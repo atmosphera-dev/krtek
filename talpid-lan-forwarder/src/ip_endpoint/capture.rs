@@ -154,6 +154,10 @@ pub(crate) struct OwnedTransport {
 }
 
 impl OwnedTransport {
+    pub(crate) fn segment(&self) -> &[u8] {
+        &self.segment
+    }
+
     pub(crate) fn validated(&self) -> Result<packet::Packet<'_>, IpError> {
         packet::parse_complete_transport(
             self.source,

@@ -1606,4 +1606,4 @@ impl<A: LocalAuthority> Forwarder<A> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

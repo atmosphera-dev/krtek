@@ -120,6 +120,41 @@ fn wait_for_refund(budget: &BufferBudget) {
 }
 
 #[test]
+fn stock_lwip_wrapper_custody_continuation_cannot_restart_after_expiry() {
+    let api = Api::default();
+    api.0.lock().unwrap().expires = u32::MAX;
+    let core = NativeCore::scripted(api.clone());
+    let budget = Arc::new(BufferBudget::new(NATIVE_RESERVATION + 4096));
+    let mut engine = core.open(budget.clone(), 1280).unwrap();
+    let flow = flow(false, Transport::Udp);
+    let scope = ReceiveScope::new(flow.source.ip(), flow.destination.ip(), &*budget).unwrap();
+    let id = ReceiveScopeId(scope.id());
+    engine.register(&scope).unwrap();
+    assert_eq!(
+        engine.ingest(id, &[0; 20], &mut |_| panic!("pending")),
+        Ok(Ingress::Pending)
+    );
+    engine.register_retained(&scope).unwrap();
+    assert_eq!(
+        engine.ingest(id, &[0; 20], &mut |_| panic!("pending")),
+        Ok(Ingress::Pending)
+    );
+    // Expiry happens after caller registration. Ingress's locked timer tick
+    // must reject the continuation before the native port can retain new input.
+    engine.register_retained(&scope).unwrap();
+    api.0.lock().unwrap().expires = 0;
+    assert_eq!(
+        engine.ingest(id, &[0; 20], &mut |_| panic!("expired")),
+        Err(IpError::Stale)
+    );
+    assert_eq!(engine.scope_refs(id), 0);
+    assert!(api.0.lock().unwrap().retained.is_empty());
+    engine.close();
+    drop(scope);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
 fn stock_lwip_wrapper_funds_before_init_and_retires_on_idle_timer_after_close() {
     let api = Api::default();
     api.0.lock().unwrap().expires = 30;
