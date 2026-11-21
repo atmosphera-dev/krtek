@@ -16,4 +16,20 @@ class PublicDnsObserverTest {
     }
 
     private external fun barrier(expected: String): String
+
+    fun finish(checkCapture: () -> Unit, finishBarrier: () -> Unit) {
+        var failure: Throwable? = null
+        try {
+            checkCapture()
+        } catch (error: Throwable) {
+            failure = error
+        }
+        try {
+            finishBarrier()
+        } catch (error: Throwable) {
+            if (failure == null) throw error
+            failure.addSuppressed(error)
+        }
+        failure?.let { throw it }
+    }
 }

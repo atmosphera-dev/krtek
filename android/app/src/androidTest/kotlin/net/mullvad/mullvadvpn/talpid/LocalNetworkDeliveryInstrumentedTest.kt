@@ -2484,9 +2484,13 @@ class LocalNetworkDeliveryInstrumentedTest {
                 }
                 probeExit(consumer, "mullvad")
             } finally {
-                val finalCapture = appliedConfiguration(policy, forwarding, "Connected")
-                assertEquals(capture, finalCapture, "Capture epoch changed during probes")
-                captureBarrier(token, "finish", finalCapture)
+                publicDnsObserver.finish(
+                    {
+                        val finalCapture = appliedConfiguration(policy, forwarding, "Connected")
+                        assertEquals(capture, finalCapture, "Capture epoch changed during probes")
+                    },
+                    { captureBarrier(token, "finish", capture) },
+                )
             }
         }
 
@@ -2693,13 +2697,18 @@ class LocalNetworkDeliveryInstrumentedTest {
                         )
                     }
                 } finally {
-                    val finalCapture = appliedConfiguration(policy, ForwardingAvailability.Active)
-                    assertEquals(
-                        capture,
-                        finalCapture,
-                        "Capture epoch changed during Local UDP probe",
+                    publicDnsObserver.finish(
+                        {
+                            val finalCapture =
+                                appliedConfiguration(policy, ForwardingAvailability.Active)
+                            assertEquals(
+                                capture,
+                                finalCapture,
+                                "Capture epoch changed during Local UDP probe",
+                            )
+                        },
+                        { captureBarrier(token, "finish", capture) },
                     )
-                    captureBarrier(token, "finish", finalCapture)
                 }
             }
         }
@@ -2717,6 +2726,12 @@ class LocalNetworkDeliveryInstrumentedTest {
 
     private fun captureBarrier(token: String, phase: String, capture: AppliedCapture) =
         runBlocking {
+            // Use the start-bound owner even when final capture lookup fails.
+            // Seal before filesystem/interface checks can fail independently.
+            val dnsOwner =
+                if (args.getString("krtek_public_dns_diagnostics") == "true")
+                    publicDnsObserver.observe(phase)
+                else null
             val folder = File(target.filesDir, "krtek-probes")
             val ready = File(folder, "$token-$phase.json")
             val ack = File(folder, "$token-$phase.ack")
@@ -2735,10 +2750,10 @@ class LocalNetworkDeliveryInstrumentedTest {
                             "ifindex",
                             java.net.NetworkInterface.getByName(capture.interfaceName).index,
                         )
-                        if (args.getString("krtek_public_dns_diagnostics") == "true") {
+                        if (dnsOwner != null) {
                             // Seal and fsync the actual native owner before finish
                             // becomes visible, not after instrumentation exits.
-                            put("public_dns_owner", publicDnsObserver.observe(phase))
+                            put("public_dns_owner", dnsOwner)
                         }
                         put("ready_ns", SystemClock.elapsedRealtimeNanos())
                     }
@@ -3786,6 +3801,11 @@ class LocalNetworkDeliveryInstrumentedTest {
                 return result.get(35, TimeUnit.SECONDS).also {
                     assertEquals(testPackage, it.getString("package"))
                     assertNotEquals(Process.myUid(), it.getInt("uid"))
+                    assertNotEquals(
+                        "harness-failure",
+                        it.getString("outcome"),
+                        "Consumer harness failure: ${it.getString("error_kind")}: ${it.getString("error_class")}",
+                    )
                     LocalNetworkConsumerService.requiredPermissions().forEach { permission ->
                         val granted = it.getBoolean("permission_$permission")
                         report("consumer_permission_$permission", granted)

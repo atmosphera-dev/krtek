@@ -392,6 +392,8 @@ impl ManagedControl {
         self.installed.store(true, Ordering::Release);
     }
     pub(crate) fn revoke(&self) {
+        #[cfg(feature = "public-dns-diagnostics")]
+        self.dns_observer.retire();
         self.control.detach();
         self.request.cancel();
     }

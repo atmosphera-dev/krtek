@@ -1,5 +1,5 @@
 //! Private, feature-gated byte observations, not packet validation or routing.
-//! Log I/O changes diagnostic timing. Missing chunks/markers are missing evidence.
+//! Journal I/O changes diagnostic timing. Missing chunks/markers are missing evidence.
 use std::{
     fmt::Write as _,
     fs::{File, OpenOptions},
@@ -15,39 +15,29 @@ use std::{
 
 static NEXT_OBSERVER: AtomicU64 = AtomicU64::new(1);
 static NEXT_PACKET: AtomicU64 = AtomicU64::new(1);
-// Keep each record well below Android log's per-entry limit. Not a packet limit.
+// Keep private journal records compact. This is not a packet limit.
 const CHUNK_BYTES: usize = 128;
 
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry {
     directory: None,
     owners: Vec::new(),
     latest: 0,
+    setup_error: None,
 });
 
 struct Registry {
     directory: Option<PathBuf>,
     owners: Vec<Weak<Owner>>,
     latest: u64,
+    setup_error: Option<String>,
 }
 
 /// Select an application-private, non-rotating journal directory before startup.
 /// Existing owners are never rebound to a replacement process or directory.
-pub fn configure(directory: &Path) -> io::Result<()> {
-    std::fs::create_dir_all(directory)?;
-    File::open(directory)?.sync_all()?;
-    if let Some(parent) = directory.parent() {
-        File::open(parent)?.sync_all()?;
-    }
+/// Setup errors gate observations, never daemon startup.
+pub fn configure(directory: &Path) {
     let mut registry = REGISTRY.lock().expect("diagnostic registry");
-    if registry
-        .directory
-        .as_deref()
-        .is_some_and(|current| current != directory)
-    {
-        return Err(io::Error::other("Observation directory changed"));
-    }
-    registry.directory = Some(directory.to_owned());
-    Ok(())
+    registry.configure(directory);
 }
 
 /// Start (empty expected identity) or seal an exact live owner's observation.
@@ -58,7 +48,36 @@ pub fn barrier(expected: &str) -> io::Result<String> {
 }
 
 impl Registry {
+    fn configure(&mut self, directory: &Path) {
+        let setup = || -> io::Result<()> {
+            if self
+                .directory
+                .as_deref()
+                .is_some_and(|current| current != directory)
+            {
+                return Err(io::Error::other("Observation directory changed"));
+            }
+            std::fs::create_dir_all(directory)?;
+            File::open(directory)?.sync_all()?;
+            if let Some(parent) = directory.parent() {
+                File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        };
+        // Observation failure must not change daemon startup or routing.
+        match setup() {
+            Ok(()) => {
+                self.directory = Some(directory.to_owned());
+                self.setup_error = None;
+            }
+            Err(error) => self.setup_error = Some(format!("Observation setup failed: {error}")),
+        }
+    }
+
     fn barrier(&self, expected: &str) -> io::Result<String> {
+        if let Some(error) = &self.setup_error {
+            return Err(io::Error::other(error.clone()));
+        }
         let owners: Vec<_> = self
             .owners
             .iter()
@@ -76,7 +95,7 @@ impl Registry {
         }
         if expected.is_empty() {
             let mut journal = owner.journal.lock().expect("diagnostic journal");
-            if journal.sealed || owner.epoch == 0 {
+            if journal.sealed || journal.retired || owner.epoch == 0 {
                 return Err(io::Error::other(
                     "Observation gap: owner retired or clock unavailable",
                 ));
@@ -113,6 +132,7 @@ struct Journal {
     error: Option<String>,
     sealed: bool,
     persisted: bool,
+    retired: bool,
 }
 
 impl Journal {
@@ -242,6 +262,7 @@ impl Observer {
                 error,
                 sealed: false,
                 persisted: false,
+                retired: false,
             }),
         }));
         registry.owners.retain(|owner| owner.strong_count() > 0);
@@ -313,9 +334,8 @@ impl Owner {
         outbound: bool,
         bytes: &[u8],
     ) -> Option<Observation> {
-        self.packet_to(boundary, outbound, bytes, boottime_ns(), |line| {
-            log::info!(target: "krtek_public_dns", "{line}");
-        })
+        // Payloads belong only to private custody, never exported daemon logs.
+        self.packet_to(boundary, outbound, bytes, boottime_ns(), |_| {})
     }
 
     fn event_line(&self, boundary: &str, packet: Option<&Observation>) -> String {
@@ -346,7 +366,7 @@ impl Owner {
         // Serializes final counters with every packet and completion. No Arc
         // retention, task scheduling or logger worker can write after this seal.
         let mut journal = self.journal.lock().expect("diagnostic journal");
-        if require_live && journal.sealed {
+        if require_live && (journal.sealed || journal.retired) {
             return Err(io::Error::other(
                 "Observation gap: owner retired before finish",
             ));
@@ -364,6 +384,12 @@ impl Owner {
         if let Err(error) = self.seal_result(false) {
             log::error!("Public DNS observation gap: {error}");
         }
+    }
+
+    pub(crate) fn retire(&self) {
+        // Same lock as the finish barrier: revocation cannot race a live seal.
+        // Producers still drain until joined teardown writes final counters.
+        self.journal.lock().expect("diagnostic journal").retired = true;
     }
 }
 
@@ -388,6 +414,7 @@ mod tests {
             directory: Some(directory.clone()),
             owners: Vec::new(),
             latest: 0,
+            setup_error: None,
         };
         (directory, registry)
     }
@@ -400,6 +427,78 @@ mod tests {
             .unwrap()
             .path();
         std::fs::read_to_string(file).unwrap()
+    }
+
+    #[test]
+    fn public_dns_diagnostics_setup_failure_does_not_abort_and_barrier_reports_it() {
+        let (directory, mut registry) = durable_registry();
+        let blocker = directory.join("not-a-directory");
+        std::fs::write(&blocker, b"block").unwrap();
+        registry.directory = None;
+        registry.configure(&blocker);
+        let observer = Observer::new_in(&mut registry, 1, 2, 3);
+        for expected in [String::new(), observer.identity()] {
+            assert!(
+                registry
+                    .barrier(&expected)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("setup failed")
+            );
+        }
+        drop(observer);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn public_dns_diagnostics_revoked_owner_cannot_finish_but_teardown_still_flushes() {
+        let (directory, mut registry) = durable_registry();
+        let observer = Observer::new_in(&mut registry, 1, 2, 3);
+        let identity = registry.barrier("").unwrap();
+        observer.retire();
+        assert!(registry.barrier("").is_err());
+        assert!(
+            registry
+                .barrier(&identity)
+                .unwrap_err()
+                .to_string()
+                .contains("retired")
+        );
+        assert!(!read_journal(&directory).contains("observer-close"));
+        let packet = observer.packet("handoff-input", true, &packet(4, true, 76));
+        observer.event("handoff-return", packet.as_ref());
+        observer.seal_result(false).unwrap();
+        assert!(read_journal(&directory).contains("packets=1 chunks=1 completions=1"));
+        drop(observer);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn public_dns_diagnostics_payloads_stay_private_even_when_info_logging_enabled() {
+        struct PayloadLogger(AtomicU64);
+        impl log::Log for PayloadLogger {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                if record.args().to_string().contains(" hex=") {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            fn flush(&self) {}
+        }
+        static LOGGER: PayloadLogger = PayloadLogger(AtomicU64::new(0));
+        log::set_logger(&LOGGER).unwrap();
+        log::set_max_level(log::LevelFilter::Info);
+        assert!(log::log_enabled!(target: "krtek_public_dns", log::Level::Info));
+        let (directory, mut registry) = durable_registry();
+        let observer = Observer::new_in(&mut registry, 1, 2, 3);
+        observer.packet("handoff-input", true, &packet(4, true, 4096));
+        observer.seal_result(false).unwrap();
+        assert!(read_journal(&directory).contains(" hex="));
+        assert_eq!(LOGGER.0.load(Ordering::Relaxed), 0);
+        drop(observer);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -494,6 +593,7 @@ mod tests {
             directory: None,
             owners: Vec::new(),
             latest: 0,
+            setup_error: None,
         };
         let observer = Observer::new_in(&mut registry, 1, 2, 3);
         assert!(registry.barrier("").is_err());
@@ -529,6 +629,7 @@ mod tests {
                 directory: Some(directory.into()),
                 owners: Vec::new(),
                 latest: 0,
+                setup_error: None,
             };
             let observer = Observer::new_in(&mut registry, 1, 2, 3);
             observer.packet("handoff-input", true, &packet(4, true, 76));
