@@ -44,8 +44,7 @@ const CONTROL_STORAGE: usize = 4 * 1024 * 1024;
 const CONTROL_MTU: u16 = 1280;
 
 #[cfg(feature = "public-dns-diagnostics")]
-#[path = "public_dns_diagnostics.rs"]
-mod public_dns_diagnostics;
+use crate::public_dns_diagnostics;
 
 pub(super) fn unavailable() -> io::Error {
     // GotaTun retries nonfatal receive errors synchronously. Retirement is
@@ -404,6 +403,8 @@ impl ManagedControl {
         if let Some(guard) = self.guard.lock().await.as_mut() {
             guard.stop().await;
         }
+        #[cfg(feature = "public-dns-diagnostics")]
+        self.dns_observer.seal();
         // Every production caller has already joined create_devices failure or
         // devices.stop(). The control guard is the final transport task owner.
         self.request.transport_joined();

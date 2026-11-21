@@ -4,7 +4,7 @@ import copy
 import unittest
 
 from public_dns_audit import AuditError
-from public_dns_carrier import read_carrier
+from public_dns_carrier import audit_call_owner, read_carrier
 
 
 class PublicDnsCarrierTest(unittest.TestCase):
@@ -75,6 +75,43 @@ class PublicDnsCarrierTest(unittest.TestCase):
                 read_carrier('\n'.join(lines), receipt)
         with self.assertRaises(AuditError):
             read_carrier('', self.receipt)
+
+    def durable(self):
+        data, lines = self.lines()
+        lines = [line.replace('schema=1', 'schema=2 epoch=25') for line in lines]
+        lines[0] = lines[0].replace('boot_ns=100', 'boot_ns=75')
+        lines[-1] = lines[-1].replace('boot_ns=100', 'boot_ns=150')
+        receipt = dict(self.receipt, epoch=25, call_started_ns=90, call_finished_ns=125)
+        return data, lines, receipt
+
+    def test_durable_owner_seal_reconstructs_original_bytes(self):
+        data, lines, receipt = self.durable()
+        self.assertEqual(data, read_carrier('\n'.join(lines), receipt)[0]['packet'])
+
+    def test_rejects_pid_or_epoch_replacement_even_with_original_seal(self):
+        _, lines, receipt = self.durable()
+        for old, new in (('pid=123', 'pid=124'), ('epoch=25', 'epoch=26'),
+                         ('observer=2', 'observer=3'), ('request=5', 'request=6')):
+            replacement = lines[1].replace(old, new)
+            with self.assertRaisesRegex(AuditError, 'owner changed'):
+                read_carrier('\n'.join(lines + [replacement]), receipt)
+
+    def test_rejects_replacement_only_and_abrupt_exit_without_final_counters(self):
+        _, lines, receipt = self.durable()
+        for bad in (lines[:-1], [line.replace('pid=123', 'pid=124') for line in lines]):
+            with self.assertRaises(AuditError):
+                read_carrier('\n'.join(bad), receipt)
+
+    def test_rejects_owner_started_late_or_sealed_before_call_end(self):
+        _, lines, receipt = self.durable()
+        for key, value in (('call_started_ns', 60), ('call_finished_ns', 170)):
+            with self.assertRaisesRegex(AuditError, 'complete call'):
+                audit_call_owner('\n'.join(lines), dict(receipt, **{key: value}))
+
+    def test_ignores_successors_only_outside_the_sealed_call_window(self):
+        _, lines, receipt = self.durable()
+        replacement = lines[0].replace('pid=123', 'pid=124').replace('boot_ns=75', 'boot_ns=180')
+        audit_call_owner('\n'.join(lines + [replacement]), receipt)
 
 
 if __name__ == '__main__':

@@ -101,6 +101,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         get() = args.getString("krtek_peer", "10.0.2.2")
 
     private var probeIndex = 0
+    private val publicDnsObserver = PublicDnsObserverTest()
     private val continuityIntents = mutableListOf<LocalContinuityWindows.Intent>()
 
     private fun continuityIntent(kind: String) {
@@ -2734,6 +2735,11 @@ class LocalNetworkDeliveryInstrumentedTest {
                             "ifindex",
                             java.net.NetworkInterface.getByName(capture.interfaceName).index,
                         )
+                        if (args.getString("krtek_public_dns_diagnostics") == "true") {
+                            // Seal and fsync the actual native owner before finish
+                            // becomes visible, not after instrumentation exits.
+                            put("public_dns_owner", publicDnsObserver.observe(phase))
+                        }
                         put("ready_ns", SystemClock.elapsedRealtimeNanos())
                     }
                     .toString()

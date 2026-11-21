@@ -7,11 +7,45 @@ SUCCESS = {'handoff-input': 'handoff-return', 'decrypted-return': 'decrypted-ret
            'translated-return': 'return-queued'}
 
 
+def audit_call_owner(text, receipt):
+    """Require one exact durable owner throughout the consumer's call window."""
+    keys = ('pid', 'observer', 'epoch', 'session', 'target', 'request')
+    need(all(key in receipt for key in (*keys, 'call_started_ns', 'call_finished_ns')),
+         'Observation gap: missing call owner/window')
+    expected = {key: int(receipt[key]) for key in keys}
+    start, finish = (int(receipt[key]) for key in ('call_started_ns', 'call_finished_ns'))
+    need(all(value > 0 for value in expected.values()) and 0 < start <= finish,
+         'Invalid call owner/window')
+    opened, closed = [], []
+    for line in text.splitlines():
+        if 'KRTEK_PUBLIC_DNS ' not in line:
+            continue
+        words = line.split('KRTEK_PUBLIC_DNS ', 1)[1].split()
+        need(all(word.count('=') == 1 for word in words), 'Malformed carrier owner record')
+        fields = dict(word.split('=', 1) for word in words)
+        need(len(fields) == len(words) and fields.get('schema') == '2',
+             'Missing durable carrier owner schema')
+        stamp = int(fields['boot_ns'])
+        owner = {key: int(fields[key]) for key in keys}
+        need(not (start <= stamp <= finish and owner != expected),
+             'Observation gap: owner changed during call')
+        if owner == expected:
+            if fields.get('boundary') == 'observer-open':
+                opened.append(stamp)
+            if fields.get('boundary') == 'observer-close':
+                closed.append(stamp)
+    need(len(opened) == len(closed) == 1 and opened[0] <= start <= finish <= closed[0],
+         'Observation gap: owner does not seal the complete call')
+
+
 def read_carrier(text, receipt):
     need(receipt['readback_verified'] is True and receipt['writer_flushed'] is True
          and receipt['packet_drops'] == 0, 'Incomplete carrier log custody/drop accounting')
     need(receipt['feature'] == 'public-dns-diagnostics', 'Wrong carrier build feature')
     expected = {name: int(receipt[name]) for name in ('pid', 'observer', 'session', 'target', 'request')}
+    if 'epoch' in receipt:
+        audit_call_owner(text, receipt)
+        expected['epoch'] = int(receipt['epoch'])
     need(all(value > 0 for value in expected.values()), 'Invalid carrier observer identity')
     groups, markers = {}, {}
     opened, closed, totals = None, None, None
@@ -22,7 +56,8 @@ def read_carrier(text, receipt):
         need(all(word.count('=') == 1 for word in words), 'Malformed carrier record')
         fields = dict(word.split('=', 1) for word in words)
         need(len(fields) == len(words), 'Duplicate carrier record field')
-        need(fields.get('schema') == '1', 'Unsupported carrier log schema')
+        need(fields.get('schema') == ('2' if 'epoch' in expected else '1'),
+             'Unsupported carrier log schema')
         try:
             identity = {name: int(fields[name]) for name in expected}
             stamp = int(fields['boot_ns'])
