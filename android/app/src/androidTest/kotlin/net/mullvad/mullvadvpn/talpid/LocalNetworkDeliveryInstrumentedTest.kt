@@ -99,6 +99,7 @@ class LocalNetworkDeliveryInstrumentedTest {
     private val target = instrumentation.targetContext
     private val testPackage = instrumentation.context.packageName
     private val args = InstrumentationRegistry.getArguments()
+    private val receiveBoundary by lazy { R06ReceiveBoundaryTest.Observer(instrumentation, args) }
     internal val r06Custody by lazy {
         if (args.getString("krtek_r06_custody", "false") == "true")
             R06FirstFailureCustody.Custody(instrumentation, args)
@@ -3436,6 +3437,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                         if (transport == "tcp") "18080" else "18081",
                     )
                     .toInt()
+        receiveBoundary.beforeConnect(index, transport, expect, nonce)
         val result =
             consumer.request(
                 Bundle().apply {
