@@ -1153,23 +1153,22 @@ class LocalNetworkDeliveryInstrumentedTest {
             withPolicy(repository, peerPolicy()) {
                 try {
                     if (state == "Connected") connect(connection)
-                    awaitState(
-                        repository,
-                        connection,
-                        ForwardingAvailability.Active,
-                        LocalRuleState.Forwarding,
-                        state,
-                    )
-                    appliedConfiguration(peerPolicy(), ForwardingAvailability.Active, state)
-                    LocalSession(consumer, expectedPublic = state == "Connected").use { session ->
-                        session.dwell(state)
-                        session.burst()
-                        session.dwell("${state}-large-write")
-                        if (state == "Connected") {
-                            probeExit(consumer, "mullvad")
-                            probeIcmp(consumer, "echo")
+                    LocalSession(
+                            consumer,
+                            repository,
+                            connection,
+                            state,
+                            expectedPublic = state == "Connected",
+                        )
+                        .use { session ->
+                            session.dwell(state)
+                            session.burst()
+                            session.dwell("${state}-large-write")
+                            if (state == "Connected") {
+                                probeExit(consumer, "mullvad")
+                                probeIcmp(consumer, "echo")
+                            }
                         }
-                    }
                 } finally {
                     disconnect(connection)
                 }
@@ -1239,7 +1238,7 @@ class LocalNetworkDeliveryInstrumentedTest {
             assertTrue(excluded !in original.excludedApps)
             assertTrue(PackageName(testPackage) !in original.excludedApps)
             try {
-                LocalSession(consumer).use { session ->
+                LocalSession(consumer, repository, connection, "Connected").use { session ->
                     session.dwell("before-app-list-change")
                     // Upstream applies the app list through the reconnect's new
                     // interface; the old capture stays until then. Require that
@@ -1302,7 +1301,8 @@ class LocalNetworkDeliveryInstrumentedTest {
                     configs +=
                         appliedConfiguration(policy, ForwardingAvailability.Active, "Disconnected")
                     // These are explicitly new sockets, with the original deadlines.
-                    LocalSession(consumer).use { recovered ->
+                    LocalSession(consumer, repository, connection, "Disconnected").use { recovered
+                        ->
                         recovered.dwell("initial-partial-with-exclusion")
                         connect(connection)
                         configs +=
@@ -1343,15 +1343,22 @@ class LocalNetworkDeliveryInstrumentedTest {
                     )
                     report("static_exclusion_cycle_end_ns", end)
                 } else {
-                    LocalSession(consumer, expectedPublic = true).use { recovered ->
-                        continuityConnected(
+                    LocalSession(
                             consumer,
                             repository,
                             connection,
-                            recovered,
-                            "fresh-after-app-list-change",
+                            "Connected",
+                            expectedPublic = true,
                         )
-                    }
+                        .use { recovered ->
+                            continuityConnected(
+                                consumer,
+                                repository,
+                                connection,
+                                recovered,
+                                "fresh-after-app-list-change",
+                            )
+                        }
                 }
             } finally {
                 runBlocking {
@@ -1498,7 +1505,7 @@ class LocalNetworkDeliveryInstrumentedTest {
             val policy = peerPolicy()
             try {
                 setPolicy(repository, policy)
-                LocalSession(consumer).use { session ->
+                LocalSession(consumer, repository, connection, "Disconnected").use { session ->
                     session.dwell("initial-local")
                     connect(connection)
                     continuityConnected(
@@ -1541,7 +1548,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                     probeExit(consumer, "mullvad")
                 }
                 setPolicy(repository, policy)
-                LocalSession(consumer).use { recovery ->
+                LocalSession(consumer, repository, connection, "Connected").use { recovery ->
                     recovery.dwell("new-session-after-revocation")
                     probeExit(consumer, "mullvad")
                 }
@@ -1576,38 +1583,13 @@ class LocalNetworkDeliveryInstrumentedTest {
                 }
             try {
                 setPolicy(repository, policy)
-                awaitState(
-                    repository,
-                    connection,
-                    ForwardingAvailability.Active,
-                    LocalRuleState.Forwarding,
-                    "Disconnected",
-                )
-                appliedConfiguration(
-                    policy,
-                    ForwardingAvailability.Active,
-                    "Disconnected",
-                    fixedCapture = true,
-                )
-                LocalSession(consumer).use { session ->
+                LocalSession(consumer, repository, connection, "Disconnected").use { session ->
                     session.dwell("initial-disconnected")
                     session.burst()
                     session.dwell("large-write-before-handover")
                     block(consumer, repository, connection, session)
                     disconnect(connection)
-                    awaitState(
-                        repository,
-                        connection,
-                        ForwardingAvailability.Active,
-                        LocalRuleState.Forwarding,
-                        "Disconnected",
-                    )
-                    appliedConfiguration(
-                        policy,
-                        ForwardingAvailability.Active,
-                        "Disconnected",
-                        fixedCapture = true,
-                    )
+                    awaitAppliedState(repository, connection, "Disconnected")
                     session.burst()
                     session.dwell("final-disconnected")
                 }
@@ -1631,20 +1613,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         session: LocalSession,
         stage: String,
     ): AppliedCapture {
-        awaitState(
-            repository,
-            connection,
-            ForwardingAvailability.Active,
-            LocalRuleState.Forwarding,
-            "Connected",
-        )
-        val config =
-            appliedConfiguration(
-                checkNotNull(repository.settingsUpdates.value?.localNetworkAccess),
-                ForwardingAvailability.Active,
-                "Connected",
-                fixedCapture = true,
-            )
+        val config = awaitAppliedState(repository, connection, "Connected")
         session.burst()
         session.dwell(stage)
         probeExit(consumer, "mullvad")
@@ -1748,6 +1717,9 @@ class LocalNetworkDeliveryInstrumentedTest {
 
     private inner class LocalSession(
         private val consumer: Consumer,
+        repository: SettingsRepository,
+        connection: ConnectionProxy,
+        expectedTunnel: String,
         private val expectedPublic: Boolean? = null,
     ) : AutoCloseable {
         val id: String
@@ -1804,6 +1776,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         }
 
         init {
+            awaitAppliedState(repository, connection, expectedTunnel)
             clockMark("begin")
             val response =
                 consumer.request(
@@ -2891,13 +2864,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                     }
                 }
                 report("cycle_tunnel", "Connected")
-                awaitState(
-                    repository,
-                    connection,
-                    ForwardingAvailability.Active,
-                    LocalRuleState.Forwarding,
-                    "Connected",
-                )
+                awaitAppliedState(repository, connection, "Connected")
                 block(consumer, repository, connection, policy)
             } catch (error: Throwable) {
                 r06Custody?.recordFailure("connected-body", error)
@@ -2930,22 +2897,14 @@ class LocalNetworkDeliveryInstrumentedTest {
         connection: ConnectionProxy,
         previousGeneration: String? = null,
     ): AppliedCapture {
-        val policy = checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
-        awaitState(
-            repository,
-            connection,
-            ForwardingAvailability.Active,
-            LocalRuleState.Forwarding,
-            "Connected",
-        )
-        consumer.identity()
         val config =
-            appliedConfiguration(
-                policy,
-                ForwardingAvailability.Active,
+            awaitAppliedState(
+                repository,
+                connection,
                 "Connected",
-                previousGeneration,
+                previousGeneration = previousGeneration,
             )
+        consumer.identity()
         listOf("tcp", "udp").forEach { probeSocket(consumer, it, "reply") }
         probeExit(consumer, "mullvad")
         return config
@@ -2956,12 +2915,37 @@ class LocalNetworkDeliveryInstrumentedTest {
         repository: SettingsRepository,
         connection: ConnectionProxy,
     ): AppliedCapture {
-        val policy = checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
-        awaitState(repository, connection, ForwardingAvailability.Off, null, "Connected")
+        val config =
+            awaitAppliedState(repository, connection, "Connected", ForwardingAvailability.Off, null)
         consumer.identity()
-        val config = appliedConfiguration(policy, ForwardingAvailability.Off, "Connected")
         probeExit(consumer, "mullvad")
         return config
+    }
+
+    private fun awaitAppliedState(
+        repository: SettingsRepository,
+        connection: ConnectionProxy,
+        expectedTunnel: String,
+        forwarding: ForwardingAvailability = ForwardingAvailability.Active,
+        ruleState: LocalRuleState? = LocalRuleState.Forwarding,
+        previousGeneration: String? = null,
+    ): AppliedCapture {
+        val policy = checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
+        awaitState(repository, connection, forwarding, ruleState, expectedTunnel)
+        val capture = appliedConfiguration(policy, forwarding, expectedTunnel, previousGeneration)
+        val uid = target.packageManager.getApplicationInfo(testPackage, 0).uid
+        assertTrue(uidIncluded(capture.uids, uid), "Applied capture must include the consumer UID")
+        report(
+            "applied_state",
+            JSONObject()
+                .put("elapsed_ns", SystemClock.elapsedRealtimeNanos())
+                .put("tunnel", expectedTunnel)
+                .put("forwarding", forwarding.toString())
+                .put("capture_generation", capture.generation)
+                .put("net_id", capture.netId)
+                .put("consumer_uid", uid),
+        )
+        return capture
     }
 
     private fun normalConfiguration(
