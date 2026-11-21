@@ -91,6 +91,8 @@ import org.junit.jupiter.api.Test
 import org.koin.android.ext.android.getKoin
 import org.koin.core.qualifier.named
 
+internal val R06_SEQUENCE_TEST_TIMEOUT: Duration = 4.minutes
+
 /** Restart-safe observations and ordinary-app probes; consumerProbe never writes policy. */
 class LocalNetworkDeliveryInstrumentedTest {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
@@ -3083,7 +3085,11 @@ class LocalNetworkDeliveryInstrumentedTest {
 
     @Test
     fun connectedConfigurationChangesReconcileBeforeDelivery() =
-        connectedCase { consumer, repository, connection, policy ->
+        connectedCase(testTimeout = R06_SEQUENCE_TEST_TIMEOUT) {
+            consumer,
+            repository,
+            connection,
+            policy ->
             val original = checkNotNull(repository.settingsUpdates.value)
             val split =
                 (target.applicationContext as MullvadApplication)

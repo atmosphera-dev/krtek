@@ -2,7 +2,6 @@ package net.mullvad.mullvadvpn.talpid
 
 import androidx.test.platform.app.InstrumentationRegistry
 import java.util.UUID
-import kotlin.time.Duration.Companion.minutes
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -35,7 +34,7 @@ class R06SequenceInstrumentedTest {
         fixture.report("r06_campaign_kind", "historical-inner-reconstruction")
         fixture.report("r06_trace", checkNotNull(trace))
         try {
-            fixture.connectedCase(testTimeout = 4.minutes) {
+            fixture.connectedCase(testTimeout = R06_SEQUENCE_TEST_TIMEOUT) {
                 consumer,
                 repository,
                 connection,
