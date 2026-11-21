@@ -540,6 +540,7 @@ mod tests {
         };
         LocalNetworkSnapshot {
             sequence: 1,
+            authority_revision: 0,
             observer_running: true,
             local_ready: true,
             fine_ready: true,

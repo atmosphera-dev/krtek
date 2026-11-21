@@ -30,6 +30,9 @@ mod connected;
 #[path = "retry_tests.rs"]
 mod retry;
 
+#[path = "publication_tests.rs"]
+mod publication;
+
 #[test]
 fn runtime_regions_share_one_root_and_local_exhaustion_preserves_control() {
     let pools = DeliveryBuffers::new();
@@ -58,7 +61,7 @@ fn runtime_regions_share_one_root_and_local_exhaustion_preserves_control() {
     assert_eq!(root.used(), 0);
 }
 
-fn policy() -> LocalNetworkAccess {
+pub(super) fn policy() -> LocalNetworkAccess {
     LocalNetworkAccess {
         enabled: true,
         skip_local_rules_for_excluded_apps: true,
@@ -73,7 +76,7 @@ fn policy() -> LocalNetworkAccess {
     }
 }
 
-fn observation() -> NetworkObservation {
+pub(super) fn observation() -> NetworkObservation {
     NetworkObservation {
         sequence: 9,
         permissions: Some(PermissionState {
@@ -118,7 +121,7 @@ fn route(address: &str, prefix_length: i16) -> LocalPhysicalRoute {
     }
 }
 
-fn flow(transport: Transport, source_port: u16) -> Flow {
+pub(super) fn flow(transport: Transport, source_port: u16) -> Flow {
     Flow {
         source: SocketAddr::new("172.27.1.1".parse().unwrap(), source_port),
         destination: "10.0.2.2:18080".parse().unwrap(),
@@ -283,7 +286,7 @@ fn stock_lwip_receive_endpoint_index_prunes_dead_registrations_before_full() {
         ));
         let scope = authority.receive(source, destination, &budget).unwrap();
         assert_eq!(
-            authority.inputs.read().unwrap().receive[&(source, destination)]
+            authority.inputs.read().unwrap().receive[&(source, destination, ReceivePurpose::Local)]
                 .scope
                 .upgrade()
                 .unwrap()

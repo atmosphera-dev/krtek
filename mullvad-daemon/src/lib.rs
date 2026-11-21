@@ -843,6 +843,10 @@ impl Daemon {
             ),
         );
 
+        // Publish policy revocation before any asynchronous/generic settings
+        // listener can coalesce changes into a read of the final policy.
+        local_network.observe_settings(&mut settings);
+
         #[cfg(target_os = "android")]
         let connectivity_listener = ConnectivityListener::new(config.android_context.clone())
             .inspect_err(|error| {

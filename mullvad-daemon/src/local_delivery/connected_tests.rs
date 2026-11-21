@@ -293,6 +293,7 @@ fn physical_snapshot() -> LocalNetworkSnapshot {
     let observed = observation();
     LocalNetworkSnapshot {
         sequence: 9,
+        authority_revision: 0,
         observer_running: true,
         local_ready: true,
         fine_ready: true,

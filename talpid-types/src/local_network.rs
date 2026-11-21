@@ -14,6 +14,9 @@ use tokio::sync::watch;
 #[cfg_attr(target_os = "android", jnix(package = "net.mullvad.talpid.model"))]
 pub struct LocalNetworkSnapshot {
     pub sequence: i64,
+    /// Watcher event fence, independent of the coalesced status sequence. Zero
+    /// is used by producers that publish complete observations synchronously.
+    pub authority_revision: i64,
     pub observer_running: bool,
     pub local_ready: bool,
     pub fine_ready: bool,
@@ -121,6 +124,23 @@ pub struct LocalNetworkFeed {
     sender: watch::Sender<LocalNetworkFeedState>,
     receiver: Mutex<Option<watch::Receiver<LocalNetworkFeedState>>>,
     demand: Mutex<ObservationDemand>,
+    publication: Mutex<AuthorityPublication>,
+}
+
+/// Revalidation can only retire existing work. A complete, current publication
+/// is required before new work can use its observation. The callback must never
+/// call the platform or reenter this feed: Kotlin's event lock can be held.
+pub enum AuthorityObservation {
+    Published(Option<Arc<LocalNetworkSnapshot>>),
+    Revalidate(Arc<LocalNetworkSnapshot>),
+}
+
+type AuthorityObserver = Arc<dyn Fn(AuthorityObservation) + Send + Sync>;
+
+#[derive(Default)]
+struct AuthorityPublication {
+    revision: i64,
+    observer: Option<AuthorityObserver>,
 }
 
 type DemandObserver = Arc<dyn Fn(i64, bool) + Send + Sync>;
@@ -152,6 +172,7 @@ impl LocalNetworkFeed {
             sender,
             receiver: Mutex::new(Some(receiver)),
             demand: Mutex::new(ObservationDemand::default()),
+            publication: Mutex::new(AuthorityPublication::default()),
         })
     }
 
@@ -166,6 +187,36 @@ impl LocalNetworkFeed {
     /// The daemon owns this receiver. Clones of the feed cannot claim a second one.
     pub fn take_receiver(&self) -> Option<watch::Receiver<LocalNetworkFeedState>> {
         self.receiver.lock().unwrap().take()
+    }
+
+    /// Install the sole daemon authority consumer before requesting observation.
+    /// Serialize its initial sample with all later publication/revocation calls.
+    pub fn observe_authority(&self, observer: AuthorityObserver) {
+        let mut publication = self.publication.lock().unwrap();
+        assert!(publication.observer.is_none(), "one Local authority owner");
+        let latest = self
+            .latest()
+            .latest
+            .filter(|snapshot| snapshot.authority_revision == publication.revision);
+        observer(AuthorityObservation::Published(latest));
+        publication.observer = Some(observer);
+    }
+
+    /// Synchronous revocation-only handoff, before Kotlin may coalesce events.
+    /// A late full snapshot cannot grant work across a newer witness fence.
+    pub fn revalidate(&self, registration: i64, snapshot: LocalNetworkSnapshot) -> bool {
+        if registration != self.registration || snapshot.authority_revision <= 0 {
+            return false;
+        }
+        let mut publication = self.publication.lock().unwrap();
+        if self.latest().closed || snapshot.authority_revision <= publication.revision {
+            return false;
+        }
+        publication.revision = snapshot.authority_revision;
+        if let Some(observer) = &publication.observer {
+            observer(AuthorityObservation::Revalidate(Arc::new(snapshot)));
+        }
+        true
     }
 
     /// The daemon owns policy demand. The optional platform callback is never
@@ -220,29 +271,44 @@ impl LocalNetworkFeed {
         if registration != self.registration || snapshot.sequence <= 0 {
             return false;
         }
-        self.sender.send_if_modified(|state| {
-            if state.closed || state.sequence >= snapshot.sequence {
-                return false;
+        let mut publication = self.publication.lock().unwrap();
+        let mut state = self.latest();
+        if state.closed
+            || state.sequence >= snapshot.sequence
+            || snapshot.authority_revision < publication.revision
+        {
+            return false;
+        }
+        publication.revision = snapshot.authority_revision;
+        state.sequence = snapshot.sequence;
+        state.latest = snapshot.observer_running.then(|| Arc::new(snapshot));
+        if let Some(observer) = &publication.observer {
+            observer(AuthorityObservation::Published(state.latest.clone()));
+        }
+        self.sender.send_replace(state);
+        true
+    }
+
+    /// Close authority and wake its async owner, without invoking platform demand.
+    /// Safe for the one-way JNI witness path while Kotlin's event lock is held.
+    pub fn invalidate(&self) {
+        {
+            let publication = self.publication.lock().unwrap();
+            if !self.latest().closed {
+                if let Some(observer) = &publication.observer {
+                    observer(AuthorityObservation::Published(None));
+                }
+                self.sender.send_modify(|state| {
+                    state.latest = None;
+                    state.closed = true;
+                });
             }
-            state.sequence = snapshot.sequence;
-            if snapshot.observer_running {
-                state.latest = Some(Arc::new(snapshot));
-            } else {
-                state.latest = None;
-            }
-            true
-        })
+        }
     }
 
     pub fn close(&self) {
-        self.sender.send_if_modified(|state| {
-            if state.closed {
-                return false;
-            }
-            state.latest = None;
-            state.closed = true;
-            true
-        });
+        self.invalidate();
+        // Platform demand may reenter Kotlin. Never call it under publication.
         self.set_policy_demand(false);
     }
 }
@@ -250,6 +316,136 @@ impl LocalNetworkFeed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authority_receives_every_complete_publication_before_status_coalesces() {
+        let feed = LocalNetworkFeed::new(7);
+        let mut status = feed.take_receiver().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        feed.observe_authority(Arc::new(move |event| match event {
+            AuthorityObservation::Published(sample) => {
+                recorded.lock().unwrap().push(sample.map(|s| s.sequence))
+            }
+            AuthorityObservation::Revalidate(_) => panic!("complete-only producer"),
+        }));
+        for sequence in 1..=100 {
+            assert!(feed.publish(7, snapshot(sequence)));
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            std::iter::once(None)
+                .chain((1..=100).map(Some))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            status.borrow_and_update().latest.as_ref().unwrap().sequence,
+            100
+        );
+        assert!(!status.has_changed().unwrap());
+    }
+
+    #[test]
+    fn witness_fence_rejects_late_complete_samples_stale_callbacks_and_closed_publication() {
+        let feed = LocalNetworkFeed::new(7);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        feed.observe_authority(Arc::new(move |event| {
+            recorded.lock().unwrap().push(match event {
+                AuthorityObservation::Published(s) => (true, s.map(|s| s.authority_revision)),
+                AuthorityObservation::Revalidate(s) => (false, Some(s.authority_revision)),
+            });
+        }));
+        let mut first = snapshot(1);
+        first.authority_revision = 1;
+        assert!(feed.publish(7, first));
+        let mut witness = snapshot(1);
+        witness.authority_revision = 3;
+        witness.local_ready = false;
+        assert!(!feed.revalidate(8, witness.clone()));
+        assert!(feed.revalidate(7, witness.clone()));
+        assert!(!feed.revalidate(7, witness));
+        let mut late = snapshot(100);
+        late.authority_revision = 2;
+        assert!(!feed.publish(7, late.clone()));
+        assert!(!feed.revalidate(7, late));
+        assert_eq!(
+            feed.latest().latest.unwrap().authority_revision,
+            1,
+            "witness is not a new granting status sample"
+        );
+        let mut current = snapshot(2);
+        current.authority_revision = 3;
+        assert!(feed.publish(7, current.clone()));
+        feed.close();
+        assert!(!feed.publish(7, current.clone()));
+        current.authority_revision = 4;
+        assert!(!feed.revalidate(7, current));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                (true, None),
+                (true, Some(1)),
+                (false, Some(3)),
+                (true, Some(3)),
+                (true, None)
+            ]
+        );
+    }
+
+    #[test]
+    fn authority_attached_after_a_witness_cannot_grant_from_an_older_cached_sample() {
+        let feed = LocalNetworkFeed::new(7);
+        assert!(feed.publish(7, snapshot(1)));
+        let mut pending = snapshot(1);
+        pending.authority_revision = 1;
+        assert!(feed.revalidate(7, pending.clone()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        feed.observe_authority(Arc::new(move |event| match event {
+            AuthorityObservation::Published(s) => recorded
+                .lock()
+                .unwrap()
+                .push(s.map(|s| s.authority_revision)),
+            _ => panic!("no new witness"),
+        }));
+        assert_eq!(*seen.lock().unwrap(), vec![None]);
+        pending.sequence = 2;
+        assert!(feed.publish(7, pending));
+        assert_eq!(*seen.lock().unwrap(), vec![None, Some(1)]);
+    }
+
+    #[test]
+    fn witness_conversion_failure_invalidates_without_a_platform_demand_callback() {
+        let feed = LocalNetworkFeed::new(7);
+        let demand = Arc::new(Mutex::new(Vec::new()));
+        let recorded = demand.clone();
+        feed.observe_policy_demand(Arc::new(move |sequence, wanted| {
+            recorded.lock().unwrap().push((sequence, wanted))
+        }));
+        feed.set_policy_demand(true);
+        let authority = Arc::new(Mutex::new(Vec::new()));
+        let recorded = authority.clone();
+        feed.observe_authority(Arc::new(move |event| match event {
+            AuthorityObservation::Published(s) => recorded.lock().unwrap().push(s.is_some()),
+            _ => panic!("no callback witness expected"),
+        }));
+        assert!(feed.publish(7, snapshot(1)));
+        feed.invalidate();
+        assert!(feed.latest().closed);
+        assert_eq!(*authority.lock().unwrap(), vec![false, true, false]);
+        assert_eq!(
+            *demand.lock().unwrap(),
+            vec![(0, false), (1, true)],
+            "one-way witness failure must not call back into Kotlin"
+        );
+        feed.close();
+        assert_eq!(
+            *demand.lock().unwrap(),
+            vec![(0, false), (1, true), (2, false)],
+            "async owner closes platform demand after the event lock is released"
+        );
+    }
 
     fn snapshot(sequence: i64) -> LocalNetworkSnapshot {
         LocalNetworkSnapshot {

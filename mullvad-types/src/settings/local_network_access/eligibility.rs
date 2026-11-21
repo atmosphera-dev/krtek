@@ -237,6 +237,24 @@ impl NetworkLease {
             current == *self
         })
     }
+
+    /// Revalidate the same explicitly selected rule rather than borrowing the
+    /// ordinary union. Like [`Self::is_current`], this compares current facts;
+    /// the caller must also retain its irreversibly revocable receive/query scope.
+    pub fn is_current_associated(
+        &self,
+        policy: &LocalNetworkAccess,
+        observation: &NetworkObservation,
+        rule_id: Uuid,
+    ) -> bool {
+        self.rule_ids.as_slice() == [rule_id]
+            && evaluate_associated(policy, observation, self.destination, rule_id).is_ok_and(
+                |mut current| {
+                    current.sequence = self.sequence;
+                    current == *self
+                },
+            )
+    }
 }
 
 fn unicast(address: IpAddr) -> bool {
@@ -353,6 +371,28 @@ pub fn evaluate(
     observation: &NetworkObservation,
     destination: IpAddr,
 ) -> Result<NetworkLease, DeliveryRefusal> {
+    evaluate_for_rule(policy, observation, destination, None)
+}
+
+/// Select only the explicitly associated rule, without a second eligibility
+/// evaluator. An unrelated matching rule cannot authorize Home DNS on another
+/// network or hide missing permissions for the selected rule. Ordinary Local
+/// delivery continues to use the enabled-rule union through [`evaluate`].
+pub fn evaluate_associated(
+    policy: &LocalNetworkAccess,
+    observation: &NetworkObservation,
+    destination: IpAddr,
+    rule_id: Uuid,
+) -> Result<NetworkLease, DeliveryRefusal> {
+    evaluate_for_rule(policy, observation, destination, Some(rule_id))
+}
+
+fn evaluate_for_rule(
+    policy: &LocalNetworkAccess,
+    observation: &NetworkObservation,
+    destination: IpAddr,
+    association: Option<Uuid>,
+) -> Result<NetworkLease, DeliveryRefusal> {
     use DeliveryRefusal::*;
     if !policy.enabled || policy.validate_local_rules().is_err() {
         return Err(PolicyOff);
@@ -364,7 +404,10 @@ pub fn evaluate(
         .permissions
         .filter(|facts| facts.local_network)
         .ok_or(LocalPermissionMissing)?;
-    let rules: Vec<_> = policy.matching_rules(destination).collect();
+    let rules: Vec<_> = policy
+        .matching_rules(destination)
+        .filter(|rule| association.is_none_or(|id| rule.id == id))
+        .collect();
     if rules.is_empty() {
         return Err(NoMatchingRule);
     }
@@ -528,6 +571,10 @@ pub fn condition_readiness(
 }
 
 #[cfg(test)]
+#[path = "split_dns_eligibility_tests.rs"]
+mod split_dns_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use talpid_types::local_network::LocalPhysicalPrefix;
@@ -536,7 +583,7 @@ mod tests {
         SsidIdentity::from_bytes(b"synthetic-wifi".to_vec()).unwrap()
     }
 
-    fn policy(conditioned: bool) -> LocalNetworkAccess {
+    pub(super) fn policy(conditioned: bool) -> LocalNetworkAccess {
         LocalNetworkAccess {
             enabled: true,
             skip_local_rules_for_excluded_apps: true,
@@ -564,7 +611,11 @@ mod tests {
         }
     }
 
-    fn route(prefix: &str, route_type: i32, gateway: Option<&str>) -> LocalPhysicalRoute {
+    pub(super) fn route(
+        prefix: &str,
+        route_type: i32,
+        gateway: Option<&str>,
+    ) -> LocalPhysicalRoute {
         let prefix: IpNetwork = prefix.parse().unwrap();
         LocalPhysicalRoute {
             destination: LocalPhysicalPrefix {
@@ -577,7 +628,7 @@ mod tests {
         }
     }
 
-    fn observation() -> NetworkObservation {
+    pub(super) fn observation() -> NetworkObservation {
         NetworkObservation {
             sequence: 71,
             permissions: Some(PermissionState {

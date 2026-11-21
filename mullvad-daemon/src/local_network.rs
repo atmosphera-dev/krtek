@@ -196,6 +196,12 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
         };
         runtime.observation = runtime.observation();
         if let Some(feed) = &runtime.feed {
+            let authority = Arc::downgrade(&runtime.delivery.authority);
+            feed.observe_authority(Arc::new(move |event| {
+                if let Some(authority) = authority.upgrade() {
+                    authority.observe(event);
+                }
+            }));
             feed.set_policy_demand(!policy.announced_routes().is_empty());
         }
         // Startup reconciles before exposing real delivery availability. Do not
@@ -227,6 +233,17 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
 
     pub fn status(&self) -> &LocalNetworkStatus {
         &self.status
+    }
+
+    /// Register before asynchronous settings listeners. The persister already
+    /// serializes every committed write/reset, not just the Local policy RPC.
+    pub fn observe_settings(&self, settings: &mut crate::settings::SettingsPersister) {
+        let authority = Arc::downgrade(&self.delivery.authority);
+        settings.register_change_listener(move |settings| {
+            if let Some(authority) = authority.upgrade() {
+                authority.update_policy(&settings.local_network_access);
+            }
+        });
     }
 
     #[cfg(any(target_os = "android", test))]
@@ -276,12 +293,13 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
     ) {
         self.observation = self.observation();
         if self.feed.as_ref().is_some_and(|feed| feed.latest().closed) {
+            // Witness conversion failure closes Rust authority synchronously,
+            // but defers any JNI demand callback out of the watcher event lock.
+            self.feed.as_ref().unwrap().set_policy_demand(false);
             self.receiver = None;
             self.feed = None;
         }
-        self.delivery
-            .authority
-            .update(policy, self.observation.clone());
+        self.delivery.authority.update_policy(policy);
         if let Some(feed) = &self.feed {
             feed.set_policy_demand(!self.shutting_down && !policy.announced_routes().is_empty());
         }
@@ -290,9 +308,6 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
         let observed = self.observation();
         if observed != self.observation {
             self.observation = observed;
-            self.delivery
-                .authority
-                .update(policy, self.observation.clone());
         }
         let routes = policy
             .announced_routes()
