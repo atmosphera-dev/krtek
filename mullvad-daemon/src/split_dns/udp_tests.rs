@@ -10,10 +10,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, UdpSocket},
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn request(name: &str, kind: RecordType, allowance: Option<u16>) -> Message {
     let mut request = Message::query();
@@ -403,9 +400,10 @@ async fn split_dns_udp_wrong_home_identity_and_failed_tcp_recovery_fail_closed()
 #[tokio::test]
 async fn split_dns_udp_real_home_transport_both_families_and_tcp_recovery() {
     for host in ["127.0.0.1:0", "[::1]:0"] {
-        let udp = UdpSocket::bind(host).await.unwrap();
+        let (udp, tcp) = super::super::fixture_server::bind_pair(host.parse().unwrap())
+            .await
+            .unwrap();
         let peer = udp.local_addr().unwrap();
-        let tcp = TcpListener::bind(peer).await.unwrap();
         let server = tokio::spawn(async move {
             let mut bytes = vec![0; 65535];
             let (length, from) = udp.recv_from(&mut bytes).await.unwrap();

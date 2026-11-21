@@ -30,6 +30,48 @@ use tokio::{
 
 use super::fixture::{self, Protocol, Role};
 
+/// Own both protocol endpoints before publishing one DNS address. A UDP bind
+/// does not reserve TCP's port space (including its retained TCP state).
+pub(crate) async fn bind_pair(endpoint: SocketAddr) -> io::Result<(UdpSocket, TcpListener)> {
+    bind_pair_until(
+        endpoint,
+        Instant::now() + Duration::from_secs(5),
+        UdpSocket::bind,
+    )
+    .await
+}
+
+async fn bind_pair_until<F, Fut>(
+    endpoint: SocketAddr,
+    deadline: Instant,
+    mut bind_udp: F,
+) -> io::Result<(UdpSocket, TcpListener)>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = io::Result<UdpSocket>>,
+{
+    loop {
+        // TCP chooses a genuinely available TCP port before UDP attempts the
+        // same numeric endpoint. Retain the listener through the second bind.
+        let tcp = TcpListener::bind(endpoint).await?;
+        match bind_udp(tcp.local_addr()?).await {
+            Ok(udp) => return Ok((udp, tcp)),
+            Err(error) => {
+                drop(tcp);
+                // Only ephemeral allocation may choose a new port. A configured
+                // fixture port (e.g. 53), or any other error, stays a failure.
+                if endpoint.port() != 0
+                    || error.kind() != io::ErrorKind::AddrInUse
+                    || Instant::now() >= deadline
+                {
+                    return Err(error);
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+}
+
 pub struct ServerConfig {
     pub role: Role,
     pub addresses: Vec<IpAddr>,
@@ -284,9 +326,8 @@ pub async fn run(config: ServerConfig) -> io::Result<bool> {
     // starts no listener and preserves the failure directory.
     let mut bound = Vec::new();
     for address in &config.addresses {
-        let socket = UdpSocket::bind(SocketAddr::new(*address, config.port)).await?;
+        let (socket, listener) = bind_pair(SocketAddr::new(*address, config.port)).await?;
         let endpoint = socket.local_addr()?;
-        let listener = TcpListener::bind(endpoint).await?;
         addresses.push(endpoint.to_string());
         bound.push((socket, listener));
     }
@@ -343,6 +384,117 @@ mod tests {
         op::Query,
         rr::{Name, RData, RecordType, rdata::A},
     };
+
+    #[tokio::test]
+    async fn fixture_socket_pair_owns_both_protocols_not_just_the_udp_port() {
+        for host in ["127.0.0.1:0", "[::1]:0"] {
+            let held = TcpListener::bind(host).await.unwrap();
+            let endpoint = held.local_addr().unwrap();
+            let udp = UdpSocket::bind(endpoint).await.unwrap();
+            // Deterministic original failure: successful UDP allocation proves
+            // nothing about owning TCP at that same endpoint.
+            assert_eq!(
+                TcpListener::bind(udp.local_addr().unwrap())
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::AddrInUse
+            );
+            let (udp, tcp) = bind_pair(host.parse().unwrap()).await.unwrap();
+            assert_eq!(udp.local_addr().unwrap(), tcp.local_addr().unwrap());
+            assert_ne!(tcp.local_addr().unwrap(), endpoint);
+            assert_eq!(
+                TcpListener::bind(tcp.local_addr().unwrap())
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::AddrInUse
+            );
+            assert_eq!(
+                UdpSocket::bind(udp.local_addr().unwrap())
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::AddrInUse
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fixture_socket_pair_retries_only_an_ephemeral_udp_collision_and_releases_tcp() {
+        for host in ["127.0.0.1:0", "[::1]:0"] {
+            let blocked = Arc::new(Mutex::new(Vec::new()));
+            let attempts = Arc::new(AtomicU64::new(0));
+            let (udp, tcp) = bind_pair_until(
+                host.parse().unwrap(),
+                Instant::now() + Duration::from_secs(5),
+                |endpoint| {
+                    let blocked = blocked.clone();
+                    let attempts = attempts.clone();
+                    async move {
+                        if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                            let occupied = UdpSocket::bind(endpoint).await.unwrap();
+                            blocked.lock().unwrap().push(occupied);
+                        }
+                        UdpSocket::bind(endpoint).await
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            assert!(attempts.load(Ordering::Relaxed) >= 2);
+            assert_eq!(udp.local_addr().unwrap(), tcp.local_addr().unwrap());
+            let addresses: Vec<_> = blocked
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|occupied| occupied.local_addr().unwrap())
+                .collect();
+            for old in addresses {
+                assert_ne!(old, tcp.local_addr().unwrap());
+                // Failed pair's TCP listener was released, while its UDP
+                // conflict remains held by this test.
+                let released = TcpListener::bind(old).await.unwrap();
+                assert_eq!(released.local_addr().unwrap(), old);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fixture_socket_pair_fixed_port_and_other_errors_never_choose_another_endpoint() {
+        let occupied = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert_eq!(
+            bind_pair(occupied.local_addr().unwrap())
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AddrInUse
+        );
+        let mut attempts = 0;
+        let result = bind_pair_until(
+            "127.0.0.1:0".parse().unwrap(),
+            Instant::now() + Duration::from_secs(5),
+            |_| {
+                attempts += 1;
+                std::future::ready(Err(io::ErrorKind::PermissionDenied.into()))
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn fixture_socket_pair_deadline_preserves_the_actual_bind_error() {
+        let mut attempts = 0;
+        let result = bind_pair_until("127.0.0.1:0".parse().unwrap(), Instant::now(), |_| {
+            attempts += 1;
+            std::future::ready(Err(io::ErrorKind::AddrInUse.into()))
+        })
+        .await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(attempts, 1);
+    }
 
     async fn start_case(
         label: &str,
