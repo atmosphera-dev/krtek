@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="split_dns_title">Split DNS</string>
+    <string name="split_dns_domain">Domain</string>
+    <string name="split_dns_add_domain">Add domain</string>
+    <string name="split_dns_remove_domain">Remove domain</string>
+    <string name="split_dns_domain_preview">Matches %1$s and everything under it, like
+    nas.%1$s</string>
+    <string name="split_dns_home_ip">Home DNS IP</string>
+    <string name="split_dns_home_ip_help">Your router\'s or home DNS server\'s own address, for
+    example 192.168.1.1 (not 172.27.1.1).</string>
+    <string name="split_dns_home_network">Home network</string>
+    <string name="split_dns_no_fallback">If your home DNS can\'t be reached, listed domains fail
+    instead of asking another server. Other domains work as before.</string>
+    <string name="split_dns_route_help">DNS answers do not add local network rules. Use full names,
+    like nas.home; bare names are not expanded.</string>
+    <string name="split_dns_private_dns">Android\'s Private DNS and apps with their own secure DNS
+    (for example Chrome) skip split DNS. Turn them off to use it.</string>
+    <string name="split_dns_open_private_dns">Open Private DNS settings</string>
+</resources>
