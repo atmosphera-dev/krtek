@@ -9,6 +9,10 @@ pub mod window;
 
 mod offline;
 
+/// Default-off WireGuard observation barriers; no routing authority.
+#[cfg(all(feature = "public-dns-diagnostics", target_os = "android"))]
+pub use talpid_wireguard::public_dns_diagnostics;
+
 /// Split tunneling
 pub mod split_tunnel;
 

@@ -104,6 +104,7 @@ features = [
 [features]
 cgroup2 = []
 multihop-pcap = ["talpid-wireguard/multihop-pcap"]
+public-dns-diagnostics = ["talpid-wireguard/public-dns-diagnostics"]
 
 [lints]
 workspace = true

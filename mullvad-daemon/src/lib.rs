@@ -30,6 +30,10 @@ mod target_state;
 mod tunnel;
 pub mod version;
 
+/// Default-off private native observation custody for Android test barriers.
+#[cfg(all(feature = "public-dns-diagnostics", target_os = "android"))]
+pub use talpid_core::public_dns_diagnostics;
+
 use crate::{
     migrations::{MigrationData, multihop::scenario::Scenario},
     target_state::PersistentTargetState,

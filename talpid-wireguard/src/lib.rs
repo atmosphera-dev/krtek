@@ -37,6 +37,11 @@ use tokio::sync::Mutex as AsyncMutex;
 
 mod gotatun;
 
+/// Default-off private diagnostic ownership and durable observation barriers.
+#[cfg(all(feature = "public-dns-diagnostics", any(target_os = "android", test)))]
+#[path = "gotatun/public_dns_diagnostics.rs"]
+pub mod public_dns_diagnostics;
+
 /// WireGuard config data-types
 pub mod config;
 mod connectivity;

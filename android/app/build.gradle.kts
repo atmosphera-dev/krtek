@@ -174,6 +174,9 @@ android {
         // Workaround to include all instrumented tests in app module. Without this we'd have to
         // create an APK for each submodule and pass each on for testing with the orchestrator.
         getByName("androidTest") {
+            // Same ordinary-UID DNS implementation as the independent stock comparison consumer.
+            java.directories += rootProject.file("test/publicdns/src/shared/java").path
+
             val instrumentedTests =
                 rootProject.subprojects
                     .mapNotNull { subProject ->
@@ -362,9 +365,18 @@ cargo {
         }
     targetDirectory = "$repoRootPath/target"
     features {
+        val publicDnsDiagnostics =
+            providers
+                .gradleProperty("krtek.publicDnsDiagnostics")
+                .getOrElse("false")
+                .toBooleanStrict()
         val enabledFeatures = buildList {
             if (enableApiOverride) {
                 add("api-override")
+            }
+            // Explicit diagnostic APK only; absent from the normal build.
+            if (publicDnsDiagnostics) {
+                add("public-dns-diagnostics")
             }
             if (getBooleanPropertyOrNull("mullvad.app.build.cargo.r06Diagnostics") == true) {
                 add("r06-diagnostics")

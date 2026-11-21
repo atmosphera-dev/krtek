@@ -109,6 +109,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         get() = args.getString("krtek_peer", "10.0.2.2")
 
     private var probeIndex = 0
+    private val publicDnsObserver = PublicDnsObserverTest()
     private val continuityIntents = mutableListOf<LocalContinuityWindows.Intent>()
 
     private fun continuityIntent(kind: String) {
@@ -2484,7 +2485,10 @@ class LocalNetworkDeliveryInstrumentedTest {
                     if (result.getString("outcome") == "fragmented-udp") {
                         assertTrue(decoded.getBoolean("validated"))
                         assertEquals(4096, decoded.getInt("sent"))
-                        assertEquals(8192, decoded.getString("query_hex").length)
+                        val queryFile = decoded.getJSONObject("query")
+                        assertEquals(4096, queryFile.getInt("size"))
+                        assertEquals(64, queryFile.getString("sha256").length)
+                        assertTrue(queryFile.getString("path").endsWith("/query.bin"))
                         assertEquals(0, decoded.getInt("option_value"))
                         assertTrue(decoded.getBoolean("option_set"))
                     }
@@ -2495,9 +2499,13 @@ class LocalNetworkDeliveryInstrumentedTest {
                 }
                 probeExit(consumer, "mullvad")
             } finally {
-                val finalCapture = appliedConfiguration(policy, forwarding, "Connected")
-                assertEquals(capture, finalCapture, "Capture epoch changed during probes")
-                captureBarrier(token, "finish", finalCapture)
+                publicDnsObserver.finish(
+                    {
+                        val finalCapture = appliedConfiguration(policy, forwarding, "Connected")
+                        assertEquals(capture, finalCapture, "Capture epoch changed during probes")
+                    },
+                    { captureBarrier(token, "finish", capture) },
+                )
             }
         }
 
@@ -2704,13 +2712,18 @@ class LocalNetworkDeliveryInstrumentedTest {
                         )
                     }
                 } finally {
-                    val finalCapture = appliedConfiguration(policy, ForwardingAvailability.Active)
-                    assertEquals(
-                        capture,
-                        finalCapture,
-                        "Capture epoch changed during Local UDP probe",
+                    publicDnsObserver.finish(
+                        {
+                            val finalCapture =
+                                appliedConfiguration(policy, ForwardingAvailability.Active)
+                            assertEquals(
+                                capture,
+                                finalCapture,
+                                "Capture epoch changed during Local UDP probe",
+                            )
+                        },
+                        { captureBarrier(token, "finish", capture) },
                     )
-                    captureBarrier(token, "finish", finalCapture)
                 }
             }
         }
@@ -2728,6 +2741,12 @@ class LocalNetworkDeliveryInstrumentedTest {
 
     private fun captureBarrier(token: String, phase: String, capture: AppliedCapture) =
         runBlocking {
+            // Use the start-bound owner even when final capture lookup fails.
+            // Seal before filesystem/interface checks can fail independently.
+            val dnsOwner =
+                if (args.getString("krtek_public_dns_diagnostics") == "true")
+                    publicDnsObserver.observe(phase)
+                else null
             val folder = File(target.filesDir, "krtek-probes")
             val ready = File(folder, "$token-$phase.json")
             val ack = File(folder, "$token-$phase.ack")
@@ -2746,6 +2765,11 @@ class LocalNetworkDeliveryInstrumentedTest {
                             "ifindex",
                             java.net.NetworkInterface.getByName(capture.interfaceName).index,
                         )
+                        if (dnsOwner != null) {
+                            // Seal and fsync the actual native owner before finish
+                            // becomes visible, not after instrumentation exits.
+                            put("public_dns_owner", dnsOwner)
+                        }
                         put("ready_ns", SystemClock.elapsedRealtimeNanos())
                     }
                     .toString()
@@ -3834,6 +3858,11 @@ class LocalNetworkDeliveryInstrumentedTest {
                         it.getInt("uid"),
                     )
                     assertNotEquals(Process.myUid(), it.getInt("uid"))
+                    assertNotEquals(
+                        "harness-failure",
+                        it.getString("outcome"),
+                        "Consumer harness failure: ${it.getString("error_kind")}: ${it.getString("error_class")}",
+                    )
                     LocalNetworkConsumerService.requiredPermissions().forEach { permission ->
                         val granted = it.getBoolean("permission_$permission")
                         report("consumer_permission_$permission", granted)

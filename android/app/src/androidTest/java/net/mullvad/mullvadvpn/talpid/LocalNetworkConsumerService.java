@@ -160,7 +160,13 @@ public final class LocalNetworkConsumerService extends Service {
     FutureTask<Void> task =
         new FutureTask<>(
             () -> {
-               Bundle result = execute(command, ownedResources);
+              long started = SystemClock.elapsedRealtime();
+              Bundle result;
+              try {
+                result = execute(command, ownedResources);
+              } catch (Exception error) {
+                result = probeFailure("request-execution", error, started);
+              }
               if (completed.compareAndSet(false, true)) send(reply, command, result);
               return null;
             });
@@ -245,7 +251,7 @@ public final class LocalNetworkConsumerService extends Service {
       activeProbe = resources;
       try {
         if (Thread.currentThread().isInterrupted()) return outcome("deadline");
-        return FragmentedUdpProbe.run(family, resources::icmpSocket);
+        return FragmentedUdpProbe.run(getFilesDir(), family, resources::icmpSocket);
       } finally {
         resources.close();
         activeProbe = null;

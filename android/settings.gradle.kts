@@ -114,6 +114,7 @@ include(
     ":test:api",
     ":test:e2e",
     ":test:mockapi",
+    ":test:publicdns",
     ":test:detekt",
     ":test:baselineprofile",
 )
