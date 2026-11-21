@@ -2,6 +2,7 @@
 //! transports until the complete authority/configuration integration is ready.
 
 mod transport;
+mod udp;
 
 #[cfg(test)]
 pub(crate) mod home_io;
