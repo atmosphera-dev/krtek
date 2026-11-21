@@ -128,7 +128,12 @@ pub extern "system" fn Java_net_mullvad_mullvadvpn_app_service_MullvadDaemon_ini
     );
     let files_dir = pathbuf_from_java(&env, files_directory);
     #[cfg(feature = "public-dns-diagnostics")]
-    mullvad_daemon::public_dns_diagnostics::configure(&files_dir.join("krtek-public-dns"));
+    // Diagnostic disk budgets only: exhausting them fails observation, never forwarding.
+    mullvad_daemon::public_dns_diagnostics::configure(
+        &files_dir.join("krtek-public-dns"),
+        16 * 1024 * 1024,
+        64 * 1024 * 1024,
+    );
 
     // In some cases, this function may be called multiple times for the same daemon process.
     // Since the tracing dispatcher can only be initialized once, we use a OnceLock to

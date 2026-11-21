@@ -2437,8 +2437,14 @@ class LocalNetworkDeliveryInstrumentedTest {
             probeExit(consumer, "mullvad")
             val token = checkNotNull(args.getString("krtek_capture_token"))
             check(token.matches(Regex("[a-z0-9-]{1,64}")))
-            captureBarrier(token, "start", capture)
-            try {
+            publicDnsObserver.capture(
+                { captureBarrier(token, "start", capture) },
+                {
+                    val finalCapture = appliedConfiguration(policy, forwarding, "Connected")
+                    assertEquals(capture, finalCapture, "Capture epoch changed during probes")
+                },
+                { captureBarrier(token, "finish", capture) },
+            ) {
                 // Both small controls precede either large echo. Failure is a
                 // real observation, never silently retried with another peer.
                 listOf(32, 3072).forEach { size ->
@@ -2498,14 +2504,6 @@ class LocalNetworkDeliveryInstrumentedTest {
                     }
                 }
                 probeExit(consumer, "mullvad")
-            } finally {
-                publicDnsObserver.finish(
-                    {
-                        val finalCapture = appliedConfiguration(policy, forwarding, "Connected")
-                        assertEquals(capture, finalCapture, "Capture epoch changed during probes")
-                    },
-                    { captureBarrier(token, "finish", capture) },
-                )
             }
         }
 
@@ -2602,8 +2600,19 @@ class LocalNetworkDeliveryInstrumentedTest {
                     withTimeout(10_000) { rpc.GetLocalNetworkStatus().execute(Unit) }
                 }
                 assertTrue(eligible(start), "Unexpected Local status before UDP probe")
-                captureBarrier(token, "start", capture)
-                try {
+                publicDnsObserver.capture(
+                    { captureBarrier(token, "start", capture) },
+                    {
+                        val finalCapture =
+                            appliedConfiguration(policy, ForwardingAvailability.Active)
+                        assertEquals(
+                            capture,
+                            finalCapture,
+                            "Capture epoch changed during Local UDP probe",
+                        )
+                    },
+                    { captureBarrier(token, "finish", capture) },
+                ) {
                     val result = runBlocking {
                         withContext(Dispatchers.IO) {
                             consumer
@@ -2711,19 +2720,6 @@ class LocalNetworkDeliveryInstrumentedTest {
                             true,
                         )
                     }
-                } finally {
-                    publicDnsObserver.finish(
-                        {
-                            val finalCapture =
-                                appliedConfiguration(policy, ForwardingAvailability.Active)
-                            assertEquals(
-                                capture,
-                                finalCapture,
-                                "Capture epoch changed during Local UDP probe",
-                            )
-                        },
-                        { captureBarrier(token, "finish", capture) },
-                    )
                 }
             }
         }

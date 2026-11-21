@@ -670,6 +670,8 @@ impl IpSend for ManagedSend {
             Reply::Discard => Ok(()),
             Reply::Application => {
                 #[cfg(feature = "public-dns-diagnostics")]
+                let _dns_send = self.owner.dns_observer.send_guard(&bytes);
+                #[cfg(feature = "public-dns-diagnostics")]
                 let dns_return = self
                     .owner
                     .dns_observer
@@ -708,12 +710,10 @@ impl IpSend for ManagedSend {
                         send.await.map_err(|_| unavailable())?;
                         #[cfg(feature = "public-dns-diagnostics")]
                         if dns_queue.is_some() {
-                            self.owner
-                                .dns_observer
-                                .event("return-queued", dns_queue.as_ref());
-                            self.owner
-                                .dns_observer
-                                .event("decrypted-return-queued", dns_return.as_ref());
+                            self.owner.dns_observer.events(&[
+                                ("return-queued", dns_queue.as_ref()),
+                                ("decrypted-return-queued", dns_return.as_ref()),
+                            ]);
                         }
                     }
                     Err(TranslationError::Stale) => return Err(unavailable()),

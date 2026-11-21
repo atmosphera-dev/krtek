@@ -40,6 +40,16 @@ class PublicDnsCarrierTest(unittest.TestCase):
         _, lines = self.lines(completed=False)
         self.assertFalse(read_carrier('\n'.join(lines), self.receipt)[0]['completed'])
 
+    def test_storage_gap_fails_even_with_complete_packets_and_terminal_counters(self):
+        _, lines = self.lines()
+        gap = self.prefix + 'event=gap boundary=observation-gap packet=0 reason=journal-byte-budget from_boot_ns=100 subsequent=all-selected-owner-records'
+        with self.assertRaisesRegex(AuditError, 'Observation gap'):
+            read_carrier('\n'.join([*lines[:-1], gap, lines[-1]]), self.receipt)
+        _, lines, receipt = self.durable()
+        gap = lines[0].split('event=', 1)[0] + 'event=gap boundary=observation-gap packet=0 reason=aggregate-byte-budget'
+        with self.assertRaisesRegex(AuditError, 'Observation gap'):
+            audit_call_owner('\n'.join([*lines, gap]), receipt)
+
     def test_rejects_missing_whole_packet_using_terminal_counters(self):
         _, lines = self.lines()
         with self.assertRaisesRegex(AuditError, 'terminal counters'):

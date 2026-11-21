@@ -35,6 +35,7 @@ def audit_call_owner(text, receipt):
         need(not (start <= stamp <= finish and owner != expected),
              'Observation gap: owner changed during call')
         if owner == expected:
+            need(fields.get('event') != 'gap', 'Observation gap: diagnostic storage exhausted')
             if fields.get('boundary') == 'observer-open':
                 opened.append(stamp)
             if fields.get('boundary') == 'observer-close':
@@ -80,6 +81,7 @@ def read_carrier(text, receipt):
             raise ValueError('Missing/invalid carrier identity or clock') from error
         if identity != expected:
             continue
+        need(fields.get('event') != 'gap', 'Observation gap: diagnostic storage exhausted')
         need(stamp > 0 and receipt['started_ns'] <= stamp <= receipt['finished_ns'],
              'Carrier record outside verified capture window')
         boundary, event = fields.get('boundary'), fields.get('event')
