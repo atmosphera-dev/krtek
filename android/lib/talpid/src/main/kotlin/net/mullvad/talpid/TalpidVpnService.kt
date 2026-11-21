@@ -20,6 +20,7 @@ import co.touchlab.kermit.Logger
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.properties.Delegates.observable
 import net.mullvad.mullvadvpn.lib.common.util.EstablishError.ParameterNotApplied
 import net.mullvad.mullvadvpn.lib.common.util.establishSafe
@@ -39,6 +40,11 @@ import net.mullvad.talpid.util.UnderlyingConnectivityStatusResolver
 
 @Suppress("TooManyFunctions")
 open class TalpidVpnService : LifecycleVpnService() {
+    private fun Builder.establishObserved() = run {
+        establishEntries.incrementAndGet()
+        establishSafe()
+    }
+
     private lateinit var localNetworkWatcher: LocalNetworkWatcher
     private val localNetworkDemand = LocalNetworkDemand {
         if (it) localNetworkWatcher.start() else localNetworkWatcher.stop()
@@ -339,7 +345,7 @@ open class TalpidVpnService : LifecycleVpnService() {
             } else config.copy(dnsServers = ArrayList(dns))
         establishing()
         connectivityListener.invalidateNetworkStateCache()
-        val descriptor = builder.establishSafe().mapLeft { EstablishError }.bind()
+        val descriptor = builder.establishObserved().mapLeft { EstablishError }.bind()
         frontendEstablished(generation, descriptor, observeCapture = true)
         val override = applied.takeIf { it != config }
         configured
@@ -369,7 +375,7 @@ open class TalpidVpnService : LifecycleVpnService() {
         builder.excludeApplications(excludedPackages.asList())
         establishing()
         connectivityListener.invalidateNetworkStateCache()
-        val descriptor = builder.establishSafe().mapLeft { EstablishError }.bind()
+        val descriptor = builder.establishObserved().mapLeft { EstablishError }.bind()
         frontendEstablished(generation, descriptor, observeCapture = false)
     }
         .merge()
@@ -456,7 +462,7 @@ open class TalpidVpnService : LifecycleVpnService() {
         connectivityListener.invalidateNetworkStateCache()
         val vpnInterfaceFd =
             builder
-                .establishSafe()
+                .establishObserved()
                 .onLeft {
                     Logger.w("Failed to establish tunnel $it")
                     if (it is ParameterNotApplied && config.hasIpv6Address) {
@@ -623,6 +629,11 @@ open class TalpidVpnService : LifecycleVpnService() {
         }
 
     companion object {
+        private val establishEntries = AtomicLong()
+
+        /** Process-lifetime Builder entry count, not successful descriptors or requests. */
+        fun builderEstablishAttempts(): Long = establishEntries.get()
+
         const val FALLBACK_DUMMY_DNS_SERVER = "192.0.2.1"
         const val BLOCKING_ADDRESS_IPV4 = "10.0.0.1"
         const val BLOCKING_ADDRESS_IPV6 = "fd00::1"

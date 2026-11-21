@@ -12,7 +12,11 @@ import okio.ByteString.Companion.toByteString
 internal fun LocalNetworkAccess.toDomain(): ModelLocalNetworkAccess {
     // Reads preserve stored values, including semantic errors, for the editor.
     // Only mutation serialization validates and normalizes policy.
-    return ModelLocalNetworkAccess(enabled, rules.map { it.toDomain() })
+    return ModelLocalNetworkAccess(
+        enabled = enabled,
+        rules = rules.map { it.toDomain() },
+        skipLocalRulesForExcludedApps = skip_local_rules_for_excluded_apps ?: true,
+    )
 }
 
 private fun LocalBypassRule.toDomain(): ModelLocalBypassRule {
@@ -54,6 +58,7 @@ internal fun ModelLocalNetworkAccess.fromDomain(): LocalNetworkAccess {
 internal fun ModelLocalNetworkAccess.asExpected(): LocalNetworkAccess {
     return LocalNetworkAccess(
         enabled = enabled,
+        skip_local_rules_for_excluded_apps = skipLocalRulesForExcludedApps,
         rules =
             rules.map { rule ->
                 LocalBypassRule(

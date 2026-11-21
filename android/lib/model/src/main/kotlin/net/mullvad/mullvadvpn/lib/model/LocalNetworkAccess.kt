@@ -6,6 +6,7 @@ import java.util.UUID
 data class LocalNetworkAccess(
     val enabled: Boolean = false,
     val rules: List<LocalBypassRule> = emptyList(),
+    val skipLocalRulesForExcludedApps: Boolean = true,
 ) {
     fun validationError(): LocalPolicyValidationError? =
         when {

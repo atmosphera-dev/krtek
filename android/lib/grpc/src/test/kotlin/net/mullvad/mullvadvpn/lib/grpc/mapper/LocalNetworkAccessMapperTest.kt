@@ -13,6 +13,7 @@ class LocalNetworkAccessMapperTest {
     private fun policy() =
         LocalNetworkAccess(
             enabled = true,
+            skip_local_rules_for_excluded_apps = false,
             rules =
                 listOf(
                     LocalBypassRule(
@@ -119,6 +120,25 @@ class LocalNetworkAccessMapperTest {
             assertEquals(raw, LocalNetworkPolicyUpdate(expected = read.asExpected()).expected)
         }
         assertEquals(policy(), policy().toDomain().fromDomain())
+    }
+
+    @Test
+    fun `should default absent excluded apps preference on and retain explicit values`() {
+        for (value in listOf(null, false, true)) {
+            val raw = policy().copy(skip_local_rules_for_excluded_apps = value)
+            val decoded = LocalNetworkAccess.ADAPTER.decode(LocalNetworkAccess.ADAPTER.encode(raw))
+            assertEquals(value, decoded.skip_local_rules_for_excluded_apps)
+            val read = decoded.toDomain()
+            assertEquals(value ?: true, read.skipLocalRulesForExcludedApps)
+            val canonical = raw.copy(skip_local_rules_for_excluded_apps = value ?: true)
+            assertEquals(canonical, read.fromDomain())
+            assertEquals(canonical, read.asExpected())
+        }
+        assertEquals(true, LocalNetworkAccess().toDomain().skipLocalRulesForExcludedApps)
+        assertEquals(
+            true,
+            net.mullvad.mullvadvpn.lib.model.LocalNetworkAccess().skipLocalRulesForExcludedApps,
+        )
     }
 
     @Test

@@ -439,7 +439,8 @@ fun VpnSettingsContent(
                 is VpnSettingItem.LocalNetworkSharingSetting ->
                     item(key = it::class.simpleName) {
                         NavigationListItem(
-                            modifier = Modifier.animateItem(),
+                            modifier =
+                                Modifier.animateItem().testTag("local_network_sharing_entry"),
                             title = stringResource(id = R.string.local_network_sharing),
                             onClick = navigateToLocalNetworkSharing,
                         )

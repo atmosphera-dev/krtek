@@ -539,6 +539,7 @@ mod tests {
     fn policy(conditioned: bool) -> LocalNetworkAccess {
         LocalNetworkAccess {
             enabled: true,
+            skip_local_rules_for_excluded_apps: true,
             rules: vec![LocalBypassRule {
                 id: Uuid::from_u128(1),
                 name: "synthetic-rule".into(),

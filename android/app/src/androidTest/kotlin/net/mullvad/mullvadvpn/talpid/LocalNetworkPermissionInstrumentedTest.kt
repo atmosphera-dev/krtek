@@ -127,10 +127,13 @@ class LocalNetworkPermissionInstrumentedTest {
                 }
                 var primaryFailure: Throwable? = null
                 try {
-                    driver.click(copy(R.string.local_access_edit))
-                    driver.click(copy(R.string.local_access_add_wifi))
+                    driver.clickTag(
+                        "local_access_edit_${rule.id}",
+                        copy(R.string.local_access_edit),
+                    )
+                    driver.clickTag("local_access_add_wifi", copy(R.string.local_access_add_wifi))
                     driver.enter("local_access_wifi_0", "krtek-permission-mismatch-9231")
-                    driver.click(copy(R.string.local_access_save))
+                    driver.clickTag("local_access_save", copy(R.string.local_access_save))
                     withTimeout(10_000) {
                         repository.settingsUpdates.first {
                             it?.localNetworkAccess?.rules?.singleOrNull()?.ssidIds?.isNotEmpty() ==
@@ -213,15 +216,21 @@ class LocalNetworkPermissionInstrumentedTest {
             "Device must be staged with denied location permissions before this test"
         }
         withRestrictionEdit { driver, rule ->
-            driver.click(copy(R.string.local_access_request_location), false)
+            driver.clickTag(
+                "local_access_permission_confirm",
+                copy(R.string.local_access_request_location),
+            )
             driver.settleAction()
             permissionControl("permission_deny_button")
             runBlocking {
                 awaitRuleReason(rule.id, LocalRuleInactiveReason.LocationPermissionMissing)
             }
             driver.requireRenderedText(copy(R.string.local_access_fine_missing))
-            driver.click(copy(R.string.local_access_retry), false)
-            driver.click(copy(R.string.local_access_request_location), false)
+            driver.clickTag("local_access_permission_retry", copy(R.string.local_access_retry))
+            driver.clickTag(
+                "local_access_permission_confirm",
+                copy(R.string.local_access_request_location),
+            )
             driver.settleAction()
             systemClick("com.android.permissioncontroller") { it.text?.toString() == "Approximate" }
             permissionControl("permission_allow_foreground_only_button")
@@ -244,7 +253,10 @@ class LocalNetworkPermissionInstrumentedTest {
             "Device must be staged with denied precise and background location before this test"
         }
         withRestrictionEdit { driver, rule ->
-            driver.click(copy(R.string.local_access_request_location), false)
+            driver.clickTag(
+                "local_access_permission_confirm",
+                copy(R.string.local_access_request_location),
+            )
             driver.settleAction()
             systemClick("com.android.permissioncontroller") { it.text?.toString() == "Precise" }
             permissionControl("permission_allow_foreground_only_button")
@@ -252,7 +264,10 @@ class LocalNetworkPermissionInstrumentedTest {
                 awaitRuleReason(rule.id, LocalRuleInactiveReason.BackgroundLocationMissing)
             }
             val saved = checkNotNull(repository.settingsUpdates.value?.localNetworkAccess)
-            driver.click(copy(R.string.local_access_location_permission), false)
+            driver.clickTag(
+                "local_access_permission_confirm",
+                copy(R.string.local_access_location_permission),
+            )
             driver.settleAction()
             requireLocationPage()
             driver.returnFromSystemSettings("refusal")
@@ -264,8 +279,11 @@ class LocalNetworkPermissionInstrumentedTest {
             driver.requireRenderedText(
                 copy(R.string.local_access_background_settings_help, copy(R.string.app_name))
             )
-            driver.click(copy(R.string.local_access_retry), false)
-            driver.click(copy(R.string.local_access_location_permission), false)
+            driver.clickTag("local_access_permission_retry", copy(R.string.local_access_retry))
+            driver.clickTag(
+                "local_access_permission_confirm",
+                copy(R.string.local_access_location_permission),
+            )
             driver.settleAction()
             requireLocationPage()
             systemClick("com.android.permissioncontroller") {
@@ -293,16 +311,19 @@ class LocalNetworkPermissionInstrumentedTest {
                 check(granted("ACCESS_FINE_LOCATION") && granted("ACCESS_BACKGROUND_LOCATION"))
                 // Rules off and no draft: no Local observation, so no Wi-Fi name yet.
                 assertTrue(repository.localNetworkStatus.value?.currentWifi !is ConnectedWifi.Known)
-                driver.click(copy(R.string.local_access_add_rule))
+                driver.clickTag("local_access_add_rule", copy(R.string.local_access_add_rule))
                 // The open draft is the observation demand; wait for its fresh Wi-Fi status.
                 val known = awaitKnownWifi()
                 driver.enter("local_access_addresses", "192.168.240.10/32")
-                driver.click(copy(R.string.local_access_connected_wifi))
+                driver.clickTag(
+                    "local_access_connected_wifi",
+                    copy(R.string.local_access_connected_wifi),
+                )
                 driver.requireConnectedDraft(known.ssid)
                 driver.requireNoIdentityPrompt()
                 assertEquals(original, repository.settingsUpdates.value?.localNetworkAccess)
                 driver.back()
-                driver.click(copy(R.string.local_access_discard), false)
+                driver.clickTag("local_access_dialog_confirm", copy(R.string.local_access_discard))
                 assertEquals(original, repository.settingsUpdates.value?.localNetworkAccess)
             }
         }

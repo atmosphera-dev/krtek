@@ -59,6 +59,7 @@ internal fun LocalRuleEditorControls(
     }
     LocalWifiFields(draft, enabled, actions.onUpdate)
     PrimaryTextButton(
+        modifier = Modifier.testTag("local_access_connected_wifi"),
         onClick = actions.onConnectedWifi,
         isEnabled = enabled,
         text = stringResource(R.string.local_access_connected_wifi),
@@ -88,11 +89,13 @@ internal fun LocalRuleEditorActions(
         state.error?.let { Text(stringResource(it), color = MaterialTheme.colorScheme.error) }
         if (state.policyEditable) {
             PrimaryButton(
+                modifier = Modifier.testTag("local_access_save"),
                 text = stringResource(R.string.local_access_save),
                 onClick = actions.onSave,
             )
         }
         PrimaryTextButton(
+            modifier = Modifier.testTag("local_access_editor_cancel"),
             onClick = actions.onClose,
             text = stringResource(android.R.string.cancel),
         )
@@ -137,6 +140,7 @@ private fun LocalWifiFields(
     }
     if (draft.wifiNames.size < LocalNetworkAccess.MAX_SSIDS_PER_RULE)
         PrimaryTextButton(
+            modifier = Modifier.testTag("local_access_add_wifi"),
             onClick = { onUpdate { it.copy(wifiNames = it.wifiNames + LocalWifiDraft("")) } },
             isEnabled = enabled,
             text = stringResource(R.string.local_access_add_wifi),

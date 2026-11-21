@@ -24,7 +24,7 @@ import org.junit.jupiter.api.Test
 class LocalNetworkAccessRepositoryTest {
     @Test
     fun `should forward expected policy and retain typed command failures`() = runTest {
-        val policy = LocalNetworkAccess(enabled = true)
+        val policy = LocalNetworkAccess(skipLocalRulesForExcludedApps = false)
         val expected = LocalNetworkAccess()
         val status = MutableStateFlow<LocalNetworkStatus?>(null)
         val service =

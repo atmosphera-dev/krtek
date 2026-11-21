@@ -1178,7 +1178,7 @@ class LocalNetworkDeliveryInstrumentedTest {
             }
         }
 
-    private fun connect(connection: ConnectionProxy, reconnect: Boolean = false) = runBlocking {
+    internal fun connect(connection: ConnectionProxy, reconnect: Boolean = false) = runBlocking {
         continuityIntent(if (reconnect) "reconnect" else "connect")
         report(
             "session_intent",
@@ -1656,7 +1656,7 @@ class LocalNetworkDeliveryInstrumentedTest {
     /**
      * Selects an owned empty custom list (NoMatchingRelay), then restores the exact relay proto.
      */
-    private suspend fun <T> withEmptyRelayList(
+    internal suspend fun <T> withEmptyRelayList(
         repository: SettingsRepository,
         block: suspend () -> T,
     ): T {
@@ -2220,6 +2220,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                     wifi,
                 )
             ),
+            skipLocalRulesForExcludedApps = true,
         )
 
     private fun withPolicy(
@@ -3457,6 +3458,9 @@ class LocalNetworkDeliveryInstrumentedTest {
                     putInt("timeout_ms", 5_000)
                 }
             )
+        report("probe_index", index)
+        report("probe_consumer_uid", result.getInt("uid"))
+        report("probe_consumer_package", checkNotNull(result.getString("package")))
         report("probe_transport", checkNotNull(transport))
         report("probe_outcome", checkNotNull(result.getString("outcome")))
         result.getString("error_class")?.let { report("probe_error_class", it) }
@@ -3768,7 +3772,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         return receipt.generation to receipt.handle
     }
 
-    internal inner class Consumer : AutoCloseable {
+    internal inner class Consumer(private val packageName: String = testPackage) : AutoCloseable {
         private val service = CompletableFuture<Messenger>()
         @Volatile private var pending: Pair<String, CompletableFuture<Bundle>>? = null
         private val reply =
@@ -3787,8 +3791,8 @@ class LocalNetworkDeliveryInstrumentedTest {
             Intent()
                 .setComponent(
                     ComponentName(
-                        instrumentation.context,
-                        LocalNetworkConsumerService::class.java,
+                        packageName,
+                        LocalNetworkConsumerService::class.java.name,
                     )
                 )
         private val connection =
@@ -3824,7 +3828,11 @@ class LocalNetworkDeliveryInstrumentedTest {
                         }
                     )
                 return result.get(35, TimeUnit.SECONDS).also {
-                    assertEquals(testPackage, it.getString("package"))
+                    assertEquals(packageName, it.getString("package"))
+                    assertEquals(
+                        target.packageManager.getApplicationInfo(packageName, 0).uid,
+                        it.getInt("uid"),
+                    )
                     assertNotEquals(Process.myUid(), it.getInt("uid"))
                     LocalNetworkConsumerService.requiredPermissions().forEach { permission ->
                         val granted = it.getBoolean("permission_$permission")
@@ -3845,7 +3853,7 @@ class LocalNetworkDeliveryInstrumentedTest {
             assertEquals("identity", result.getString("outcome"))
             assertEquals("android.app.Application", result.getString("application_class"))
             assertEquals(
-                target.packageManager.getApplicationInfo(testPackage, 0).uid,
+                target.packageManager.getApplicationInfo(packageName, 0).uid,
                 result.getInt("uid"),
             )
             assertEquals(target.applicationInfo.uid, Process.myUid())

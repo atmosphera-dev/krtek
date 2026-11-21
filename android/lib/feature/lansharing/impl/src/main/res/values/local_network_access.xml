@@ -17,6 +17,11 @@
     <string name="local_access_scope_help">Save local addresses, optionally for a specific
     Wi-Fi.</string>
     <string name="local_access_enable">Local network rules</string>
+    <string name="local_access_excluded_apps_skip">Excluded apps skip local rules</string>
+    <string name="local_access_excluded_apps_description">On: apps you excluded from the VPN reach
+    local devices directly, the way Android normally does. Off: they also follow your local network
+    rules while Mullvad is disconnected, but their open local connections can close when Mullvad
+    connects or disconnects, or when you change this setting.</string>
     <string name="local_access_enable_title">Enable local network rules?</string>
     <string name="local_access_confirmation">You can add rules now. Local forwarding is not
     available in this version yet.</string>

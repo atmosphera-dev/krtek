@@ -161,6 +161,26 @@ class LocalCaptureServiceTest {
     }
 
     @Test
+    fun `should count actual Builder entries rather than rejected requests or finished epochs`() {
+        val before = TalpidVpnService.builderEstablishAttempts()
+        assertEquals(CreateTunResult.EstablishError, service.openLocalFrontend(10, emptyArray()))
+        assertEquals(before, TalpidVpnService.builderEstablishAttempts())
+        assertEquals(
+            CreateTunResult.Success(7),
+            service.openLocalFrontend(11, arrayOf("10.0.2.2/32")),
+        )
+        assertEquals(before + 1, TalpidVpnService.builderEstablishAttempts())
+        // A second open is refused while the first generation still owns capture.
+        assertEquals(CreateTunResult.EstablishError, service.openSecuredFrontend(12, config))
+        assertEquals(before + 1, TalpidVpnService.builderEstablishAttempts())
+        service.finishLocalFrontend(11)
+        assertEquals(CreateTunResult.Success(7), service.openSecuredFrontend(12, config))
+        assertEquals(before + 2, TalpidVpnService.builderEstablishAttempts())
+        service.finishLocalFrontend(12)
+        assertEquals(before + 2, TalpidVpnService.builderEstablishAttempts())
+    }
+
+    @Test
     fun `should configure assigned capture exactly without synthetic fields or Native cache`() {
         assertEquals(CreateTunResult.Success(7), service.openSecuredFrontend(11, config))
         config.addresses.forEach {
