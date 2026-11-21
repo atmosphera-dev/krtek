@@ -98,6 +98,9 @@ def udp_segment(protocol, payload):
 
 def reassemble(rows):
     ordered = sorted(rows, key=lambda row: row['offset'])
+    if ordered[0]['family'] == 6:
+        first = udp_segment(ordered[0]['protocol'], ordered[0]['payload'])
+        need(first is not None and len(first) >= 8, 'Incomplete IPv6 first-fragment UDP header chain')
     segment = bytearray()
     for index, row in enumerate(ordered):
         need(row['offset'] == len(segment), 'Missing, duplicate or overlapping fragment')
@@ -107,15 +110,26 @@ def reassemble(rows):
     return udp_segment(ordered[0]['protocol'], bytes(segment))
 
 
+def fragment_key(row):
+    # RFC 8200: only offset zero supplies IPv6's reassembled Next Header.
+    return (row['family'], row['source'], row['destination'], row['identifier'],
+            row['protocol'] if row['family'] == 4 else None)
+
+
+def fragmented(row):
+    # IPv6 atomic fragments are independent, even when their ID is reused.
+    return row['offset'] != 0 or row['more']
+
+
 def audit_datagram(packets, source, destination, source_port, destination_port, payload):
     need(packets, 'No matching IP packets')
     rows = [decode(packet) for packet in packets]
     need(all(row['family'] == 6 or row['protocol'] == 17 for row in rows), 'Not UDP protocol')
     source, destination = str(ipaddress.ip_address(source)), str(ipaddress.ip_address(destination))
-    key = (rows[0]['family'], source, destination, rows[0]['protocol'], rows[0]['identifier'])
-    need(all((row['family'], row['source'], row['destination'], row['protocol'], row['identifier']) == key
-             for row in rows), 'Mixed packet tuple/protocol/fragment ID')
-    need(rows[0]['identifier'] is not None or len(rows) == 1, 'Multiple unfragmented datagrams')
+    key = fragment_key(rows[0])
+    need(key[1:3] == (source, destination) and all(fragment_key(row) == key for row in rows),
+         'Mixed packet tuple/protocol/fragment ID')
+    need(len(rows) == 1 or all(fragmented(row) for row in rows), 'Multiple independent datagrams')
     segment = reassemble(rows)
     need(segment is not None and len(segment) >= 8, 'Truncated/non-UDP header')
     sport, dport, length, check = struct.unpack_from('!4H', segment)
@@ -146,7 +160,7 @@ def audit_tun(records, probe, query, response, observer):
         if not begin <= record['timestamp_ns'] <= end:
             continue
         row = decode(record['packet'])
-        if (row['family'] != probe['family'] or row['protocol'] not in (17, 0, 43, 60)
+        if (row['family'] != probe['family']
                 or (row['family'] == 4 and row['protocol'] != 17)):
             continue
         pair = (ipaddress.ip_address(row['source']), ipaddress.ip_address(row['destination']))
@@ -164,14 +178,14 @@ def audit_tun(records, probe, query, response, observer):
             segment = udp_segment(first['protocol'], first['payload'])
             if segment is None or len(segment) < 8:
                 continue
-            group = [(record, first)] if first['identifier'] is None else [
-                (r, row) for r, row in rows if (row['protocol'], row['identifier']) ==
-                (first['protocol'], first['identifier'])]
+            group = [(record, first)] if not fragmented(first) else [
+                (r, row) for r, row in rows if fragmented(row)
+                and fragment_key(row) == fragment_key(first)]
             need(sum(row['offset'] == 0 for _, row in group) == 1,
                  'Missing/duplicate DNS first packet')
             if struct.unpack_from('!HH', segment) == (sport, dport):
                 if len(segment) < 10:
-                    # IPv4 can put only the UDP header in its first fragment.
+                    # Both families may put only the UDP header in the first fragment.
                     try:
                         segment = reassemble([row for _, row in group])
                     except AuditError:

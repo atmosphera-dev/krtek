@@ -101,6 +101,46 @@ class PublicDnsPacketsTest(unittest.TestCase):
         self.assertEqual(len(wire), self.tun(6, body, wire)['request']['fragments'])
         self.assertEqual(fragmentable[1232:2464], packets.decode(wire[1])['payload'])
 
+    def test_ipv6_first_fragment_must_contain_complete_headers(self):
+        source, destination, body, _ = self.family(6, 76)
+        for extension in (bytes([17, 1]) + bytes(14), bytes([17, 0]) + bytes(6)):
+            fragmentable = extension + udp_segment(source, destination, 30001, 53, body)
+            wire = [ip_piece(source, destination, 1234, 0, True, fragmentable[:8], protocol=60),
+                    ip_piece(source, destination, 1234, 8, False, fragmentable[8:], protocol=60)]
+            with self.subTest(extension_bytes=len(extension)):
+                with self.assertRaises(AuditError):
+                    packets.audit_datagram(wire, source, destination, 30001, 53, body)
+
+    def test_ipv6_udp_header_only_first_fragment(self):
+        source, destination, body, _ = self.family(6, 76)
+        segment = udp_segment(source, destination, 30001, 53, body)
+        wire = [ip_piece(source, destination, 1234, 0, True, segment[:8]),
+                ip_piece(source, destination, 1234, 8, False, segment[8:])]
+        self.assertEqual(2, self.tun(6, body, wire)['request']['fragments'])
+
+    def test_ipv6_tail_next_header_does_not_select_protocol(self):
+        source, destination, body, wire = self.family(6)
+        wire = [wire[0], *[packet[:40] + bytes([59]) + packet[41:] for packet in wire[1:]]]
+        self.assertEqual(len(wire), packets.audit_datagram(
+            wire[::-1], source, destination, 30001, 53, body)['fragments'])
+        self.assertEqual(len(wire), self.tun(6, body, wire)['request']['fragments'])
+
+    def test_ipv6_atomic_datagrams_with_reused_id_are_independent(self):
+        source, destination, body, _ = self.family(6, 76)
+        atomic = ip_piece(source, destination, 1234, 0, False,
+                          udp_segment(source, destination, 30001, 53, body))
+        unrelated = ip_piece(source, destination, 1234, 0, False,
+                             udp_segment(source, destination, 30002, 53, body))
+        self.assertEqual(1, self.tun(6, body, [unrelated, atomic])['request']['fragments'])
+        with self.assertRaisesRegex(AuditError, 'independent datagrams'):
+            packets.audit_datagram([atomic, unrelated], source, destination, 30001, 53, body)
+
+    def test_ipv6_atomic_packet_does_not_join_fragmented_datagram(self):
+        source, destination, body, wire = self.family(6)
+        unrelated = ip_piece(source, destination, 1234, 0, False,
+                             udp_segment(source, destination, 30002, 53, b'other'))
+        self.assertEqual(len(wire), self.tun(6, body, [unrelated, *wire])['request']['fragments'])
+
     def test_reassembled_ipv4_options_count_toward_length(self):
         source, destination, body, wire = self.family(4, 65504)
         first = bytearray(wire[0][:20] + bytes([1, 1, 1, 0]) + wire[0][20:])
