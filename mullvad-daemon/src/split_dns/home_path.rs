@@ -11,9 +11,9 @@ use hickory_proto::op::{DnsResponse, Message};
 
 use super::transport::{ExchangeError, Protocol};
 
-pub(super) type PathFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub(crate) type PathFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-pub(super) trait HomeDnsPath: Send + Sync {
+pub(crate) trait HomeDnsPath: Send + Sync {
     /// `client` is the original captured source, not an upstream bind request.
     /// The path selects its configured Home resolver and authorizes the request.
     fn authorize(
@@ -27,7 +27,7 @@ pub(super) trait HomeDnsPath: Send + Sync {
     fn close(&self) -> PathFuture<'_, io::Result<()>>;
 }
 
-pub(super) trait HomeDnsQuery: Send + Sync {
+pub(crate) trait HomeDnsQuery: Send + Sync {
     fn current(&self) -> bool;
     fn retired(&self) -> PathFuture<'_, ()>;
     fn exchange(

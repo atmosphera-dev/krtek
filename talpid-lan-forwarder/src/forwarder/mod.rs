@@ -334,6 +334,11 @@ pub struct Forwarder<A: LocalAuthority> {
 }
 
 impl<A: LocalAuthority> Forwarder<A> {
+    /// Sibling capture consumers share this arena and its TCP output headroom.
+    pub fn reply_buffers(&self) -> Arc<dyn RelayBufferAllocator> {
+        self.replies.clone()
+    }
+
     pub fn new(authority: Arc<A>, buffers: Arc<dyn RelayBufferAllocator>) -> Result<Self, Refused> {
         Self::with_mtu(authority, buffers, DEFAULT_LOCAL_MTU)
     }

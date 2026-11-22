@@ -42,6 +42,50 @@ impl HomeDnsGrant {
 }
 
 impl DeliveryAuthority {
+    /// Non-authorizing input scope, also available for unavailable-Home SERVFAIL.
+    /// The committed-policy publication revokes it before notification coalescing.
+    pub(crate) fn dns_input(
+        &self,
+        source: IpAddr,
+        resolver: IpAddr,
+        buffers: &dyn RelayBufferAllocator,
+    ) -> Result<(Arc<SuffixMatcher>, ReceiveScope), Refused> {
+        let mut inputs = self.inputs.write().unwrap();
+        inputs.revalidate_receive();
+        let dns = &inputs.policy.split_dns;
+        if !dns.enabled {
+            return Err(Refused::Denied);
+        }
+        let matcher = inputs.dns_matcher.clone().ok_or(Refused::Denied)?;
+        let capture = inputs.capture.as_ref().ok_or(Refused::Denied)?;
+        if !inputs.endpoint || !capture.sources.contains(&source) {
+            return Err(Refused::Denied);
+        }
+        let identity = capture.identity;
+        let generation = capture.generation()?;
+        let key = (source, resolver);
+        if let Some(scope) = inputs.dns_inputs.get(&key).and_then(|r| r.scope.upgrade()) {
+            return Ok((matcher, scope));
+        }
+        let scope = ReceiveScope::new(source, resolver, buffers)?;
+        let revision = inputs.dns_revision;
+        inputs.dns_inputs.insert(
+            key,
+            DnsInputScope {
+                scope: scope.downgrade(),
+                revision,
+                capture: identity,
+                generation,
+                _charge: scope.registration_credit(),
+            },
+        );
+        Ok((matcher, scope))
+    }
+
+    pub(crate) fn dns_enabled(&self) -> bool {
+        self.inputs.read().unwrap().policy.split_dns.enabled
+    }
+
     /// Resolver selection belongs to the Local Home path, never to the DNS
     /// message consumer. The normal authorization below rechecks the selected
     /// address and policy, so a concurrent policy replacement cannot grant the

@@ -2,6 +2,7 @@
 use mullvad_types::settings::local_network_access::{
     LocalNetworkAccess,
     eligibility::{NetworkLease, NetworkObservation, evaluate, evaluate_associated},
+    split_dns::SuffixMatcher,
     status::ForwardingAvailability,
 };
 #[cfg(test)]
@@ -109,6 +110,8 @@ struct Inputs {
     endpoint: bool,
     receive: BTreeMap<ReceiveKey, ReceiveRecord>,
     dns_revision: u64,
+    dns_matcher: Option<Arc<SuffixMatcher>>,
+    dns_inputs: BTreeMap<(IpAddr, IpAddr), DnsInputScope>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -125,10 +128,18 @@ impl ReceivePurpose {
 
 type ReceiveKey = (IpAddr, IpAddr, ReceivePurpose);
 
-// B3's real query entry remains inactive until capture and both DNS lanes are
-// fully integrated. Tests exercise the same existing Local authority owner.
-#[cfg(test)]
+// Home query capabilities and non-authorizing capture input scopes share the
+// existing authority owner, including pre-coalescing policy revocation.
+#[cfg(any(target_os = "android", test))]
 pub(crate) mod home_dns;
+
+struct DnsInputScope {
+    scope: WeakReceiveScope,
+    revision: u64,
+    capture: u64,
+    generation: Option<u64>,
+    _charge: Arc<dyn RelayBufferReservation>,
+}
 
 /// Fixed non-transport facts, deliberately without NetworkLease's rule-ID Vec.
 /// Re-evaluation permits unrelated rule edits but cannot migrate a datagram to a
@@ -183,6 +194,15 @@ struct ReceiveRecord {
 type RetiredReceive = (ReceiveKey, u64, Arc<dyn RelayBufferReservation>);
 
 impl Inputs {
+    fn compile_dns(policy: &LocalNetworkAccess) -> Option<Arc<SuffixMatcher>> {
+        if !policy.split_dns.enabled {
+            return None;
+        }
+        SuffixMatcher::compile(policy.split_dns.suffixes.iter().map(String::as_str))
+            .ok()
+            .map(Arc::new)
+    }
+
     fn grant(&self, source: IpAddr, destination: IpAddr) -> Result<DeliveryGrant, Refused> {
         self.grant_for(source, destination, ReceivePurpose::Local)
     }
@@ -239,6 +259,22 @@ impl Inputs {
     }
 
     fn revalidate_receive(&mut self) {
+        self.dns_inputs.retain(|(source, _), record| {
+            let Some(scope) = record.scope.upgrade() else {
+                return false;
+            };
+            let current = self.endpoint
+                && self.dns_revision == record.revision
+                && self.capture.as_ref().is_some_and(|capture| {
+                    capture.identity == record.capture
+                        && capture.sources.contains(source)
+                        && capture.generation().is_ok_and(|g| g == record.generation)
+                });
+            if !current {
+                scope.revoke();
+            }
+            scope.current()
+        });
         let mut records = std::mem::take(&mut self.receive);
         records.retain(|_, record| {
             let Some(scope) = record.scope.upgrade() else {
@@ -345,6 +381,8 @@ impl DeliveryAuthority {
                 endpoint: true,
                 receive: BTreeMap::new(),
                 dns_revision: 1,
+                dns_matcher: Inputs::compile_dns(policy),
+                dns_inputs: BTreeMap::new(),
             }),
             preparer,
             revalidate: watch::channel(0).0,
@@ -358,6 +396,7 @@ impl DeliveryAuthority {
     pub fn update(&self, policy: &LocalNetworkAccess, observation: Option<NetworkObservation>) {
         let mut inputs = self.inputs.write().unwrap();
         if inputs.policy != *policy {
+            inputs.dns_matcher = Inputs::compile_dns(policy);
             inputs.dns_revision = inputs
                 .dns_revision
                 .checked_add(1)
@@ -377,6 +416,7 @@ impl DeliveryAuthority {
     pub fn update_policy(&self, policy: &LocalNetworkAccess) {
         let mut inputs = self.inputs.write().unwrap();
         if inputs.policy != *policy {
+            inputs.dns_matcher = Inputs::compile_dns(policy);
             inputs.dns_revision = inputs
                 .dns_revision
                 .checked_add(1)
@@ -558,14 +598,17 @@ impl DeliveryAuthority {
             }
         }
         let retired = self.retired_receive.clone();
-        let scope = ReceiveScope::new_notifying(
-            source,
-            destination,
-            buffers,
-            Some(Box::new(move |id, charge| {
+        let retired: talpid_lan_forwarder::authority::ReceiveRetirement =
+            Box::new(move |id, charge| {
                 retired.lock().unwrap().push((key, id, charge));
-            })),
-        )?;
+            });
+        let scope = if purpose.is_home() {
+            // Application and Home upstream are separate IP legs. Their
+            // non-authorizing context must not require equal address families.
+            ReceiveScope::new_context_notifying(source, destination, buffers, Some(retired))?
+        } else {
+            ReceiveScope::new_notifying(source, destination, buffers, Some(retired))?
+        };
         inputs.receive.insert(
             key,
             ReceiveRecord {

@@ -1,5 +1,7 @@
 //! Exercise the daemon's actual configuration, classifier and authority through
 //! the production capture actor, with real packet and physical socket consumers.
+#[path = "dns_capture_tests.rs"]
+mod dns_capture_tests;
 use super::*;
 use crate::local_network::ConnectContinuation;
 use crate::local_network::TunnelPhase;

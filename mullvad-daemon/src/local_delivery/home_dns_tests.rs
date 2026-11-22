@@ -26,6 +26,62 @@ fn query_flow(transport: Transport) -> Flow {
     flow
 }
 
+#[test]
+fn split_dns_home_query_app_and_home_address_families_are_independent() {
+    for home_v6 in [false, true] {
+        for client_v6 in [false, true] {
+            let mut on = configured();
+            let home: IpAddr = if home_v6 { "fe80::2" } else { "10.0.2.2" }
+                .parse()
+                .unwrap();
+            on.split_dns.home_resolver = Some(home);
+            assert!(on.validate().is_ok());
+            let authority = DeliveryAuthority::new(
+                &on,
+                Arc::new(move |_, lease| {
+                    assert_eq!(lease.destination, home);
+                    Ok(())
+                }),
+            );
+            authority.update(&on, Some(observation()));
+            let buffers = BufferBudget::new(65536);
+            let source: SocketAddr = if client_v6 {
+                "[fdf0:ce4a:801d::172:27:1:1]:49152"
+            } else {
+                "172.27.1.1:49152"
+            }
+            .parse()
+            .unwrap();
+            let query = authority
+                .home_dns_authorize_configured(source, Transport::Udp, &buffers)
+                .expect("Home's two legs must not require one IP packet family");
+            assert_eq!(query.0.scope.source(), source.ip());
+            assert_eq!(query.0.scope.destination(), home);
+            let socket = socket2::Socket::new(
+                socket2::Domain::for_address(query.destination()),
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )
+            .unwrap();
+            authority.home_dns_prepare(&socket, &query).unwrap();
+            let mut off = on.clone();
+            off.split_dns.enabled = false;
+            authority.update_policy(&off);
+            authority.update_policy(&on);
+            assert!(!authority.home_dns_current(&query));
+            if home_v6 != client_v6 {
+                assert!(
+                    matches!(
+                        ReceiveScope::new(source.ip(), home, &buffers),
+                        Err(Refused::Denied)
+                    ),
+                    "ordinary Local packet scopes stay single-family"
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn split_dns_home_query_hickory_runtime_retains_exact_resolver_and_revocation_fence() {
     use crate::split_dns::home_io::HomeIoOwner;

@@ -4,7 +4,7 @@
 //! datagram. Completion owns the original packets separately from lwIP's mutable
 //! reassembly backing. The consumer can release those originals unchanged, or
 //! consume them locally. This is not another tunnel reader, route classifier or
-//! socket owner. No active capture selects this receiver yet.
+//! socket owner. The selective DNS consumer supplies capture/policy lifetimes.
 
 pub use crate::ip_endpoint::contract::IpError;
 use crate::ip_endpoint::{
@@ -171,6 +171,32 @@ pub struct PacketReceiver {
     buffers: Arc<dyn RelayBufferAllocator>,
     pending: BTreeMap<Key, Pending>,
     live: Arc<ReceiverLifetime>,
+}
+
+/// Non-authorizing UDP candidate selection using the same IP boundary as input.
+pub fn udp_endpoints(bytes: &[u8]) -> Result<Option<(IpAddr, IpAddr)>, IpError> {
+    let endpoints = packet::ip_endpoints(bytes).map_err(|_| IpError::Malformed)?;
+    let protocol = if endpoints.0.is_ipv4() {
+        Ipv4Packet::new_checked(bytes)
+            .map_err(|_| IpError::Malformed)?
+            .next_header()
+    } else {
+        let ip = Ipv6Packet::new_checked(bytes).map_err(|_| IpError::Malformed)?;
+        if ip.next_header() == IpProtocol::Ipv6Frag {
+            Ipv6ExtHeader::new_checked(ip.payload())
+                .map_err(|_| IpError::Malformed)?
+                .next_header()
+        } else {
+            ip.next_header()
+        }
+    };
+    match u8::from(protocol) {
+        17 => Ok(Some(endpoints)),
+        // Extension-prefixed input is not supported by the native receiver.
+        // It must be explicitly refused, never mistaken for non-DNS transit.
+        0 | 43 | 51 | 60 => Err(IpError::Unsupported),
+        _ => Ok(None),
+    }
 }
 
 impl PacketReceiver {

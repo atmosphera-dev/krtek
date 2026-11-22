@@ -25,6 +25,7 @@ pub(super) struct Observation {
     pub updates: Option<watch::Receiver<CaptureNetworkState>>,
     pub lease: Arc<CaptureLease>,
     pub sources: RelaySources,
+    pub dns_servers: Vec<std::net::IpAddr>,
     mtu: u16,
     requested_routes: Vec<CaptureRoute>,
     lifecycle: Mutex<Option<(i64, String, String)>>,
@@ -71,6 +72,7 @@ impl Observation {
             updates,
             lease,
             sources: config.sources(),
+            dns_servers: Vec::new(),
             mtu: config.mtu(),
             requested_routes: Vec::new(),
             lifecycle: Mutex::new(None),
@@ -130,6 +132,7 @@ impl Observation {
                 ));
             }
             self.requested_routes = expected.routes;
+            self.dns_servers = expected.dns_servers;
         }
         Ok(())
     }

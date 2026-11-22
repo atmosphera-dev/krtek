@@ -26,7 +26,7 @@ pub mod rpc_uniqueness_check;
 pub mod runtime;
 pub mod settings;
 pub mod shutdown;
-#[cfg(test)]
+#[cfg(any(target_os = "android", test))]
 mod split_dns;
 mod target_state;
 mod tunnel;

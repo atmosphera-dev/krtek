@@ -24,6 +24,8 @@
 pub mod authority;
 #[cfg(feature = "r06-diagnostics")]
 pub mod diagnostics;
+#[cfg(test)]
+mod dns_candidate_tests;
 mod forwarder;
 mod ip_endpoint;
 pub mod packet;

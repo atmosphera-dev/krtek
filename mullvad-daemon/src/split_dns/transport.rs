@@ -28,7 +28,7 @@ use hickory_proto::{
 pub(super) const MAX_MESSAGE_BYTES: usize = u16::MAX as usize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Protocol {
+pub(crate) enum Protocol {
     Udp,
     Tcp,
 }
@@ -128,7 +128,7 @@ pub(super) async fn exchange<P: RuntimeProvider>(
 
 /// Decode exactly one complete library message; Hickory's convenience
 /// `Message::from_vec` permits trailing bytes and is insufficient here.
-pub(super) fn decode_message(bytes: &[u8]) -> Result<Message, ExchangeError> {
+pub(crate) fn decode_message(bytes: &[u8]) -> Result<Message, ExchangeError> {
     if bytes.len() > MAX_MESSAGE_BYTES {
         return Err(ExchangeError::Malformed);
     }

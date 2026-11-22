@@ -1,6 +1,6 @@
 //! Capture-owned Home work. No task, TUN descriptor or Ordinary capability is
 //! created here. The sole frontend polls this owner and supplies checked writes.
-//! Still inactive until full/Partial capture integration is complete.
+//! Selected by the full-capture UDP consumer; Partial and TCP are separate work.
 
 use std::{
     collections::LinkedList,

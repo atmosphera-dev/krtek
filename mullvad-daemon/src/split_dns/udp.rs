@@ -1,5 +1,5 @@
-//! Selective handling of a complete captured UDP DNS message. Inactive until
-//! attached to the capture owner. IP completion, resource admission, capture
+//! Selective handling of a complete captured UDP DNS message. The capture
+//! owner supplies IP completion, resource admission, capture
 //! generation and final sink/grant checks remain that owner's responsibilities.
 //!
 //! In particular PassThrough borrows the original bytes: the caller releases its

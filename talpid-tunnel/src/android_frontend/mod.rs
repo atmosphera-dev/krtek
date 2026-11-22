@@ -10,10 +10,12 @@ pub use fd_name::interface_name;
 mod fd_format;
 pub use fd_format::{CaptureFormat, UnsupportedCaptureFormat};
 mod config;
+mod dns;
 mod observation;
 mod owner;
 mod receiver;
 pub use config::{CaptureConfig, CaptureDisposition, CaptureDropReason};
+pub use dns::{DnsFuture, DnsReceiver};
 use observation::Observation;
 pub use receiver::LocalReceiver;
 use receiver::Receiver;
@@ -262,6 +264,11 @@ async fn drive_epoch<A: LocalAuthority>(
         let wants_write = forwarder.has_output() || reply.is_some();
         tokio::select! {
             _ = &mut *stop => return owner::Event::Terminal(FrontendState::Stopped),
+            _ = async {}, if pending.is_none() && forwarder.has_original() => {
+                if let Some(original) = forwarder.original() {
+                    *pending = dispatch(forwarder, &original, session);
+                }
+            },
             command = commands.recv() => match command {
                 Some(command) => return owner::Event::Command(command),
                 None => return owner::Event::Terminal(FrontendState::Stopped),
@@ -279,7 +286,7 @@ async fn drive_epoch<A: LocalAuthority>(
                 if result.is_ok() { forwarder.revalidate(); }
                 else { updates_open = false; }
             }
-            result = capture.readable(), if pending.is_none() => {
+            result = capture.readable(), if pending.is_none() && !forwarder.has_original() => {
                 let Ok(mut ready) = result else { return owner::Event::Terminal(FrontendState::Failed); };
                 // A continuously readable interface cannot monopolize stop or
                 // authority updates. Readiness is retained when this allowance ends.
@@ -288,7 +295,7 @@ async fn drive_epoch<A: LocalAuthority>(
                         Ok(Ok(0)) => return owner::Event::Terminal(FrontendState::Failed),
                         Ok(Ok(len)) => {
                             *pending = ingest(forwarder, &packet[..len], session);
-                            if pending.is_some() { break; }
+                            if pending.is_some() || forwarder.has_original() { break; }
                         },
                         Ok(Err(error)) if error.kind() == io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
@@ -329,9 +336,6 @@ fn drain_checked_local<A: LocalAuthority>(
     forwarder: &mut impl Receiver<A>,
     session: Option<(&RelayCapture, &RelaySink)>,
 ) -> io::Result<bool> {
-    let Some(forwarder) = forwarder.receiver() else {
-        return Ok(false);
-    };
     let write = |bytes: &[u8]| {
         #[cfg(feature = "r06-diagnostics")]
         talpid_lan_forwarder::diagnostics::tcp_packet("checked-tun-write-attempt", bytes);
@@ -350,12 +354,7 @@ fn drain_checked_local<A: LocalAuthority>(
         );
         result
     };
-    match forwarder.write_output(|bytes| match session {
-        Some((session, sink)) => session
-            .with_sink(sink, || write(bytes))
-            .map_err(|_| io::Error::other("Capture session retired"))?,
-        None => write(bytes),
-    }) {
+    match forwarder.write_output(session, write) {
         Ok(written) => Ok(written),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
         Err(error) => Err(error),
@@ -363,6 +362,26 @@ fn drain_checked_local<A: LocalAuthority>(
 }
 
 fn ingest<A: LocalAuthority>(
+    forwarder: &mut impl Receiver<A>,
+    bytes: &[u8],
+    session: Option<(&CaptureConfig, &Observation)>,
+) -> Option<PendingIngress> {
+    if let Some((config, observation)) = session {
+        let advertised = &observation.dns_servers;
+        if let Some(capture) = observation.lease.capability()
+            && talpid_netstack::raw_packet::inspect(bytes).is_ok_and(|ip| {
+                ip.source()
+                    .is_some_and(|source| observation.sources.contains(source))
+            })
+            && forwarder.intercept(bytes, advertised, &capture, config.mtu())
+        {
+            return None;
+        }
+    }
+    dispatch(forwarder, bytes, session)
+}
+
+fn dispatch<A: LocalAuthority>(
     forwarder: &mut impl Receiver<A>,
     bytes: &[u8],
     session: Option<(&CaptureConfig, &Observation)>,
