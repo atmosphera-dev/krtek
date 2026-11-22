@@ -12,7 +12,7 @@ use crate::ip_endpoint::{
     contract::{LocalIpEngine, ReceiveScopeId, ReplyTuple},
     native::Engine,
 };
-use crate::{ReceiveScope, Transport, packet};
+use crate::{ReceiveScope, packet};
 use smoltcp::wire::{IpProtocol, Ipv4Packet, Ipv6ExtHeader, Ipv6FragmentHeader, Ipv6Packet};
 use std::{
     collections::BTreeMap,
@@ -70,6 +70,12 @@ struct ReceiverLifetime {
 }
 
 impl CompletedDatagram {
+    pub fn tcp_packet(&self, buffers: &dyn RelayBufferAllocator) -> Result<RelayBuffer, IpError> {
+        if !self.current() {
+            return Err(IpError::Stale);
+        }
+        self.complete.tcp_packet(buffers)
+    }
     pub fn packet(&self) -> Result<packet::Packet<'_>, IpError> {
         if !self.current() {
             return Err(IpError::Stale);
@@ -175,6 +181,14 @@ pub struct PacketReceiver {
 
 /// Non-authorizing UDP candidate selection using the same IP boundary as input.
 pub fn udp_endpoints(bytes: &[u8]) -> Result<Option<(IpAddr, IpAddr)>, IpError> {
+    transport_endpoints(bytes, false)
+}
+
+pub fn dns_endpoints(bytes: &[u8]) -> Result<Option<(IpAddr, IpAddr)>, IpError> {
+    transport_endpoints(bytes, true)
+}
+
+fn transport_endpoints(bytes: &[u8], tcp: bool) -> Result<Option<(IpAddr, IpAddr)>, IpError> {
     let endpoints = packet::ip_endpoints(bytes).map_err(|_| IpError::Malformed)?;
     let protocol = if endpoints.0.is_ipv4() {
         Ipv4Packet::new_checked(bytes)
@@ -192,6 +206,7 @@ pub fn udp_endpoints(bytes: &[u8]) -> Result<Option<(IpAddr, IpAddr)>, IpError> 
     };
     match u8::from(protocol) {
         17 => Ok(Some(endpoints)),
+        6 if tcp => Ok(Some(endpoints)),
         // Extension-prefixed input is not supported by the native receiver.
         // It must be explicitly refused, never mistaken for non-DNS transit.
         0 | 43 | 51 | 60 => Err(IpError::Unsupported),
@@ -324,9 +339,6 @@ impl PacketReceiver {
         match complete {
             Some(complete) => {
                 let parsed = complete.validated()?;
-                if parsed.flow.transport != Transport::Udp {
-                    return Err(IpError::Unsupported);
-                }
                 if parsed.flow.source.ip() != key.source
                     || parsed.flow.destination.ip() != key.destination
                 {
@@ -453,7 +465,7 @@ fn key(bytes: &[u8]) -> Result<(Key, bool), IpError> {
             (0, u8::from(ip.next_header()), false)
         }
     };
-    if protocol != u8::from(IpProtocol::Udp) {
+    if protocol != u8::from(IpProtocol::Udp) && protocol != u8::from(IpProtocol::Tcp) {
         return Err(IpError::Unsupported);
     }
     Ok((

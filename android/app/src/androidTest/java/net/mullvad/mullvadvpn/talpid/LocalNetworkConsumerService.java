@@ -183,7 +183,7 @@ public final class LocalNetworkConsumerService extends Service {
       String transport = command.getString("transport");
       (transport != null && transport.startsWith("session-") ? sessionCommands : worker).execute(task);
       main.postDelayed(deadline,
-          ("lookup".equals(transport) || "split-dns-lookup".equals(transport) || "exit-check".equals(transport) || "icmp-check".equals(transport))
+          ("lookup".equals(transport) || "split-dns-lookup".equals(transport) || "split-dns-tcp".equals(transport) || "exit-check".equals(transport) || "icmp-check".equals(transport))
               ? 30000L : 12000L);
     } catch (RejectedExecutionException ignored) {
       completed.set(true);
@@ -201,6 +201,17 @@ public final class LocalNetworkConsumerService extends Service {
     }
     if ("lookup".equals(transport)) return lookup(command);
     if ("split-dns-lookup".equals(transport)) return splitDnsLookup(command);
+    if ("split-dns-tcp".equals(transport)) {
+      ProbeResources resources = new ProbeResources();
+      ownedResources.set(resources);
+      activeProbe = resources;
+      try {
+        return splitDnsTcp(command, resources);
+      } finally {
+        resources.close();
+        activeProbe = null;
+      }
+    }
     if ("gateway-echo".equals(transport)) {
       int family = command.getInt("family");
       int size = command.getInt("payload_size");
@@ -980,10 +991,95 @@ public final class LocalNetworkConsumerService extends Service {
     }
   }
 
+  /** Test-only framed TCP consumer. Fixture-library goldens validate Home's
+   * complete bytes; the existing independent diagnostic parser validates the
+   * ordinary example.com answer. No product DNS codec is used by this UID. */
+  private Bundle splitDnsTcp(Bundle command, ProbeResources resources) {
+    long started = SystemClock.elapsedRealtime();
+    java.io.File directory = new java.io.File(getFilesDir(), "krtek-split-dns/" + UUID.randomUUID());
+    try {
+      String resolver = command.getString("tcp_resolver");
+      if (resolver == null || !InetAddresses.isNumericAddress(resolver)) throw new IOException("Numeric captured resolver required");
+      JSONArray messages = new JSONObject(command.getString("tcp_vectors")).getJSONArray("messages");
+      if (messages.length() != 3) throw new IOException("This selector requires Home/Ordinary/Home vectors");
+      if (!directory.mkdirs()) throw new IOException("Cannot retain TCP consumer evidence");
+      byte[][] queries = new byte[3][];
+      ByteArrayOutputStream framed = new ByteArrayOutputStream();
+      for (int index = 0; index < 3; index++) {
+        JSONObject vector = messages.getJSONObject(index);
+        if (vector.getBoolean("home") != (index != 1)) throw new IOException("Wrong per-message authority vector");
+        queries[index] = splitDnsWireBytes(vector.getString("query_hex"));
+        if (queries[index].length < 12 || queries[index].length > 65535) throw new IOException("Invalid DNS frame length");
+        java.nio.file.Files.write(new java.io.File(directory, "query-" + index + ".bin").toPath(), queries[index]);
+        framed.write(queries[index].length >>> 8);
+        framed.write(queries[index].length);
+        framed.write(queries[index]);
+      }
+      Socket socket = new Socket();
+      resources.tcpSocket(socket);
+      socket.connect(new InetSocketAddress(InetAddresses.parseNumericAddress(resolver), 53), 5000);
+      socket.setSoTimeout(6000);
+      // Split the first prefix, then coalesce its remainder and the next two
+      // messages in one write. The app does not bind/protect this socket.
+      byte[] bytes = framed.toByteArray();
+      socket.getOutputStream().write(bytes, 0, 1);
+      socket.getOutputStream().flush();
+      socket.getOutputStream().write(bytes, 1, bytes.length - 1);
+      socket.getOutputStream().flush();
+      socket.shutdownOutput();
+      java.io.DataInputStream input = new java.io.DataInputStream(socket.getInputStream());
+      for (int index = 0; index < 3; index++) {
+        byte[] reply = new byte[input.readUnsignedShort()];
+        input.readFully(reply);
+        java.nio.file.Files.write(new java.io.File(directory, "reply-" + index + ".bin").toPath(), reply);
+        if (index != 1) {
+          byte[] expected = splitDnsWireBytes(messages.getJSONObject(index).getString("expected_hex"));
+          java.nio.file.Files.write(new java.io.File(directory, "expected-" + index + ".bin").toPath(), expected);
+          if (!Arrays.equals(reply, expected)) throw new IOException("Home reply differs from fixture-library golden at " + index);
+        } else {
+          int id = (queries[index][0] & 255) * 256 + (queries[index][1] & 255);
+          net.mullvad.mullvadvpn.test.publicdns.PublicDnsWire.Audit audit =
+              net.mullvad.mullvadvpn.test.publicdns.PublicDnsWire.audit(reply, id);
+          if (!audit.envelopeValid || !audit.usableA) throw new IOException("Ordinary TCP answer: " + audit.classification);
+        }
+      }
+      Bundle result = outcome("split-dns-tcp");
+      result.putInt("message_count", 3);
+      result.putInt("home_exact", 2);
+      result.putBoolean("ordinary_usable", true);
+      result.putInt("local_port", socket.getLocalPort());
+      result.putString("local_address", socket.getLocalAddress().getHostAddress());
+      result.putString("evidence_dir", directory.getAbsolutePath());
+      return result;
+    } catch (Exception error) {
+      Bundle result = probeFailure("split-dns-tcp", error, started);
+      result.putString("evidence_dir", directory.getAbsolutePath());
+      return result;
+    }
+  }
+
+  private static byte[] splitDnsWireBytes(String hex) throws IOException {
+    if ((hex.length() & 1) != 0) throw new IOException("Odd fixture hex length");
+    byte[] bytes = new byte[hex.length() / 2];
+    for (int index = 0; index < bytes.length; index++) {
+      int high = Character.digit(hex.charAt(index * 2), 16);
+      int low = Character.digit(hex.charAt(index * 2 + 1), 16);
+      if (high < 0 || low < 0) throw new IOException("Non-hex fixture byte");
+      bytes[index] = (byte) (high * 16 + low);
+    }
+    return bytes;
+  }
+
   private static final class ProbeResources implements AutoCloseable {
     private boolean closed;
     private HttpsURLConnection connection;
     private FileDescriptor icmpSocket;
+    private Socket tcpSocket;
+
+    synchronized void tcpSocket(Socket value) throws IOException {
+      if (closed) { value.close(); throw new IOException("Probe closed"); }
+      tcpSocket = value;
+    }
 
     synchronized void connection(HttpsURLConnection value) throws IOException {
       if (closed) { value.disconnect(); throw new IOException("Probe closed"); }
@@ -997,6 +1093,10 @@ public final class LocalNetworkConsumerService extends Service {
 
     @Override public synchronized void close() {
       closed = true;
+      if (tcpSocket != null) {
+        try { tcpSocket.close(); } catch (IOException error) { throw new IllegalStateException("TCP probe close failed", error); }
+        tcpSocket = null;
+      }
       if (connection != null) { connection.disconnect(); connection = null; }
       if (icmpSocket != null) {
         FileDescriptor socket = icmpSocket;

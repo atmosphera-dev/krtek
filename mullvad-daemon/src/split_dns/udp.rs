@@ -212,7 +212,8 @@ impl HomeUdpOutput {
 impl UdpQuery {
     pub(super) fn check_input(&self, input: &CompletedDatagram) -> Result<(), IpError> {
         let packet = input.packet()?;
-        if packet.flow.source != self.client
+        if packet.flow.transport != talpid_lan_forwarder::Transport::Udp
+            || packet.flow.source != self.client
             || packet.flow.destination != self.resolver
             || decode_message(packet.payload).map_err(|_| IpError::Malformed)? != self.request
         {

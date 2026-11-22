@@ -4,11 +4,12 @@ use crate::packet::{
     tests::{flow, tcp_packet, udp_packet},
 };
 use smoltcp::wire::{IpProtocol, Ipv4Packet};
+use std::net::Shutdown;
 use std::sync::{
     Condvar, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 #[path = "stock_lwip_tests.rs"]
 mod stock_lwip_tests;
@@ -1350,6 +1351,67 @@ async fn tcp_nonce_reaches_application_and_both_sockets_close() {
 }
 
 #[tokio::test]
+async fn tcp_service_reuses_endpoint_in_both_families_without_physical_preparation() {
+    use crate::tcp_service::{ServiceStream, TcpChannel, TcpService};
+    struct Service(Mutex<Option<ServiceStream>>);
+    impl TcpService for Service {
+        fn open(
+            &self,
+            _: Flow,
+            _: &crate::ReceiveScope,
+            buffers: &dyn RelayBufferAllocator,
+        ) -> Result<Box<dyn TcpChannel>, Refused> {
+            let (app, peer) = ServiceStream::pair(buffers, STREAM_BUFFER)?;
+            *self.0.lock().unwrap() = Some(peer);
+            Ok(Box::new(app))
+        }
+    }
+    for ipv6 in [false, true] {
+        let authority = Arc::new(Authority::default());
+        let service = Arc::new(Service(Mutex::new(None)));
+        let mut forwarder = test_forwarder(authority.clone()).with_tcp_service(service.clone());
+        let mut app = App::new(flow(ipv6, Transport::Tcp));
+        app.until(&mut forwarder, |app, _| app.socket().can_send())
+            .await;
+        let nonce: Vec<u8> = (0..STREAM_BUFFER * 3 + 17)
+            .map(|n| (n % 251) as u8)
+            .collect();
+        let mut sent = 0;
+        let mut received = Vec::new();
+        let mut held = VecDeque::new();
+        app.until(&mut forwarder, |app, _| {
+            if sent < nonce.len() && app.socket().can_send() {
+                sent += app.socket().send_slice(&nonce[sent..]).unwrap();
+            }
+            let mut bytes = [0; 1024];
+            let mut peer = service.0.lock().unwrap();
+            let peer = peer.as_mut().unwrap();
+            if let Ok(n) = peer.try_read(&mut bytes) {
+                held.extend(&bytes[..n]);
+            }
+            while !held.is_empty() {
+                match peer.try_write(held.as_slices().0) {
+                    Ok(n) => {
+                        held.drain(..n);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    result => panic!("service write: {result:?}"),
+                }
+            }
+            while app.socket().can_recv() {
+                let n = app.socket().recv_slice(&mut bytes).unwrap();
+                received.extend_from_slice(&bytes[..n]);
+            }
+            sent == nonce.len() && received.len() == nonce.len()
+        })
+        .await;
+        assert_eq!(received, nonce);
+        assert_eq!(authority.preparations.load(Ordering::SeqCst), 0);
+        forwarder.close_all().await;
+    }
+}
+
+#[tokio::test]
 async fn mtu_values_outside_upstream_interface_range_are_refused_without_panicking() {
     if isolated_native_budget(
         "mtu_values_outside_upstream_interface_range_are_refused_without_panicking",
@@ -2538,7 +2600,11 @@ async fn physical_reply_then_reset(ipv6: bool) {
     let mut peek = [0; 256];
     let n = tokio::time::timeout(
         Duration::from_secs(2),
-        forwarder.tcp[&flow].physical.peek(&mut peek),
+        forwarder.tcp[&flow]
+            .physical
+            .network()
+            .unwrap()
+            .peek(&mut peek),
     )
     .await
     .unwrap()
@@ -3729,7 +3795,7 @@ async fn physical_tcp_reset_reaches_the_application() {
 // The prefix is deliberately part of the peer's exact-byte assertion, so no
 // bytes are silently discarded to arrange the backpressure ordering.
 async fn block_physical_write(forwarder: &Forwarder<Authority>, flow: Flow) -> Vec<u8> {
-    let stream = &forwarder.tcp[&flow].physical;
+    let stream = forwarder.tcp[&flow].physical.network().unwrap();
     socket2::SockRef::from(stream)
         .set_send_buffer_size(4096)
         .unwrap();
@@ -3970,7 +4036,15 @@ async fn concurrent_tcp_tuples_at_one_destination_keep_physical_ownership() {
         let peer_index = |f: &Forwarder<Authority>, flow| {
             peers
                 .iter()
-                .position(|p| p.peer_addr().unwrap() == f.tcp[&flow].physical.local_addr().unwrap())
+                .position(|p| {
+                    p.peer_addr().unwrap()
+                        == f.tcp[&flow]
+                            .physical
+                            .network()
+                            .unwrap()
+                            .local_addr()
+                            .unwrap()
+                })
                 .unwrap()
         };
         let indices = [

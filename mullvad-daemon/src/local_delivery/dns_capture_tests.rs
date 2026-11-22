@@ -97,7 +97,7 @@ fn request(name: &str, id: u16, resolver: SocketAddr) -> Vec<u8> {
     )
 }
 
-async fn full_capture(home: bool, ipv6: bool, malformed: bool) {
+async fn full_capture(home: bool, ipv6: bool, malformed: bool, tcp: bool) {
     let platform = platform();
     let buffers = DeliveryBuffers::new();
     let mut policy = policy();
@@ -163,6 +163,26 @@ async fn full_capture(home: bool, ipv6: bool, malformed: bool) {
     let mut pair = broker.acquire(&receipt).unwrap();
     pair.control.activate().unwrap();
     let peer = UnixDatagram::from_std(platform.peer.lock().unwrap().take().unwrap()).unwrap();
+    if tcp {
+        use futures::FutureExt;
+        let result = std::panic::AssertUnwindSafe(async {
+            tcp_consumer(&peer, client, resolver).await;
+            assert!(
+                futures::poll!(Box::pin(pair.receive.recv())).is_pending(),
+                "listed TCP reached Ordinary"
+            );
+        })
+        .catch_unwind()
+        .await;
+        requested.transport_joined();
+        pair.control.detach();
+        owner.stop().await.unwrap();
+        if let Err(error) = result {
+            std::panic::resume_unwind(error);
+        }
+        assert_eq!(calls.load(SeqCst), 2);
+        return;
+    }
     peer.send(&request("NAS.HOME.", 701, resolver))
         .await
         .unwrap();
@@ -280,23 +300,120 @@ async fn full_capture(home: bool, ipv6: bool, malformed: bool) {
 #[tokio::test]
 async fn split_dns_live_full_home_reply_and_unlisted_original_reach_consumers() {
     for ipv6 in [false, true] {
-        full_capture(true, ipv6, false).await;
+        full_capture(true, ipv6, false, false).await;
     }
 }
 
 #[tokio::test]
 async fn split_dns_live_full_unavailable_home_is_servfail_never_ordinary() {
     for ipv6 in [false, true] {
-        full_capture(false, ipv6, false).await;
+        full_capture(false, ipv6, false, false).await;
     }
 }
 
 #[tokio::test]
 async fn split_dns_live_full_malformed_ipv4_neither_reaches_carrier_nor_authorizes_home() {
-    full_capture(true, false, true).await;
+    full_capture(true, false, true, false).await;
 }
 
 #[tokio::test]
 async fn split_dns_live_full_malformed_ipv6_neither_reaches_carrier_nor_authorizes_home() {
-    full_capture(true, true, true).await;
+    full_capture(true, true, true, false).await;
+}
+
+fn tcp_wire(flow: Flow, sequence: u32, ack: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
+    if flow.source.is_ipv4() {
+        return tcp_packet(flow, sequence, ack, flags, payload);
+    }
+    let mut bytes = vec![0; 60 + payload.len()];
+    bytes[0] = 0x60;
+    bytes[4..6].copy_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
+    bytes[6] = 6;
+    bytes[7] = 64;
+    let (IpAddr::V6(source), IpAddr::V6(destination)) = (flow.source.ip(), flow.destination.ip())
+    else {
+        unreachable!()
+    };
+    bytes[8..24].copy_from_slice(&source.octets());
+    bytes[24..40].copy_from_slice(&destination.octets());
+    bytes[40..42].copy_from_slice(&flow.source.port().to_be_bytes());
+    bytes[42..44].copy_from_slice(&flow.destination.port().to_be_bytes());
+    bytes[44..48].copy_from_slice(&sequence.to_be_bytes());
+    bytes[48..52].copy_from_slice(&ack.to_be_bytes());
+    bytes[52] = 0x50;
+    bytes[53] = flags;
+    bytes[54..56].copy_from_slice(&32768u16.to_be_bytes());
+    bytes[60..].copy_from_slice(payload);
+    let mut pseudo = bytes[8..40].to_vec();
+    pseudo.extend(((20 + payload.len()) as u32).to_be_bytes());
+    pseudo.extend([0, 0, 0, 6]);
+    pseudo.extend(&bytes[40..]);
+    bytes[56..58].copy_from_slice(&checksum(&pseudo).to_be_bytes());
+    assert!(packet::parse(&bytes).is_ok());
+    bytes
+}
+
+async fn tcp_consumer(peer: &UnixDatagram, client: SocketAddr, resolver: SocketAddr) {
+    let flow = Flow {
+        source: client,
+        destination: resolver,
+        transport: Transport::Tcp,
+    };
+    peer.send(&tcp_wire(flow, 100, 0, 2, &[])).await.unwrap();
+    let syn = capture_reply(peer).await;
+    let offset = if client.is_ipv4() { 20 } else { 40 };
+    assert_eq!(syn[offset + 13] & 0x12, 0x12);
+    let mut ack =
+        u32::from_be_bytes(syn[offset + 4..offset + 8].try_into().unwrap()).wrapping_add(1);
+    let mut frames = Vec::new();
+    for (name, id) in [("first.home.", 811), ("last.home.", 812)] {
+        let udp = request(name, id, resolver);
+        let bytes = packet::parse(&udp).unwrap().payload;
+        frames.extend((bytes.len() as u16).to_be_bytes());
+        frames.extend(bytes);
+    }
+    peer.send(&tcp_wire(flow, 101, ack, 0x18, &frames[..1]))
+        .await
+        .unwrap();
+    peer.send(&tcp_wire(flow, 102, ack, 0x18, &frames[1..]))
+        .await
+        .unwrap();
+    let mut received = Vec::new();
+    let mut decoded = 0;
+    while decoded != 2 {
+        let bytes = capture_reply(peer).await;
+        let packet = packet::parse(&bytes).unwrap();
+        assert_eq!(packet.flow.source, resolver);
+        assert_eq!(packet.flow.destination, client);
+        let sequence = u32::from_be_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+        if !packet.payload.is_empty() && sequence == ack {
+            received.extend_from_slice(packet.payload);
+            ack = ack.wrapping_add(packet.payload.len() as u32);
+        }
+        while received.len() >= 2 {
+            let size = usize::from(u16::from_be_bytes(received[..2].try_into().unwrap()));
+            if received.len() < size + 2 {
+                break;
+            }
+            let reply = crate::split_dns::decode_message(&received[2..size + 2]).unwrap();
+            assert_eq!(reply.metadata.id, 811 + decoded);
+            assert_eq!(reply.answers[0].ttl, 741);
+            assert_eq!(
+                reply.answers[0].data,
+                RData::A(A("10.77.10.1".parse().unwrap()))
+            );
+            received.drain(..size + 2);
+            decoded += 1;
+        }
+        peer.send(&tcp_wire(flow, 101 + frames.len() as u32, ack, 0x10, &[]))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn split_dns_live_full_tcp_segmented_and_coalesced_home_frames_reach_consumers() {
+    for ipv6 in [false, true] {
+        full_capture(true, ipv6, false, true).await;
+    }
 }

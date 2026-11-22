@@ -1,6 +1,9 @@
-//! Selective full-capture UDP DNS with Home-only transports. Partial forwarding
-//! and the per-message TCP frontend are separate integration milestones.
+//! Selective connected UDP and per-message TCP DNS. Android's resolver list
+//! stays unchanged; Partial forwarding is a separate integration milestone.
 
+mod tcp;
+mod tcp_egress;
+mod tcp_io;
 mod transport;
 mod udp;
 mod udp_work;

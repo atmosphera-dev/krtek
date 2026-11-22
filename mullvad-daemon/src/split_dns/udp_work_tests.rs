@@ -175,6 +175,55 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn split_dns_udp_work_tcp_input_cannot_obtain_home_udp_authority() {
+    let mut fixture = Fixture::new(true);
+    let (query, scope, mut original) = fixture.input(49001);
+    let flow = original.packet().unwrap().flow;
+    let mut wire = original.pop_original().unwrap().unwrap().to_vec();
+    // Independent test-only wire generator: retain the same DNS payload/tuple
+    // but supply a complete, checksum-valid TCP segment rather than UDP.
+    wire.splice(20..28, [0; 20]);
+    let length = wire.len() as u16;
+    wire[2..4].copy_from_slice(&length.to_be_bytes());
+    wire[9] = 6;
+    wire[10..12].fill(0);
+    wire[20..22].copy_from_slice(&flow.source.port().to_be_bytes());
+    wire[22..24].copy_from_slice(&flow.destination.port().to_be_bytes());
+    wire[24..28].copy_from_slice(&1234u32.to_be_bytes());
+    wire[28..32].copy_from_slice(&5678u32.to_be_bytes());
+    wire[32] = 0x50;
+    wire[33] = 0x10;
+    wire[34..36].copy_from_slice(&4096u16.to_be_bytes());
+    let checksum = |bytes: &[u8]| {
+        let mut sum: u32 = bytes
+            .chunks(2)
+            .map(|bytes| u32::from(u16::from_be_bytes([bytes[0], *bytes.get(1).unwrap_or(&0)])))
+            .sum();
+        while sum >> 16 != 0 {
+            sum = (sum & 65535) + (sum >> 16);
+        }
+        !(sum as u16)
+    };
+    let mut pseudo = wire[12..20].to_vec();
+    pseudo.extend([0, 6]);
+    pseudo.extend(((wire.len() - 20) as u16).to_be_bytes());
+    pseudo.extend(&wire[20..]);
+    wire[36..38].copy_from_slice(&checksum(&pseudo).to_be_bytes());
+    let header = checksum(&wire[..20]);
+    wire[10..12].copy_from_slice(&header.to_be_bytes());
+    let input = fixture.receiver.ingest(&scope, &wire).unwrap().unwrap();
+    assert_eq!(input.packet().unwrap().flow.transport, Transport::Tcp);
+    assert!(
+        fixture
+            .work
+            .submit(query, input, Duration::from_secs(1), true, 65507)
+            .is_err()
+    );
+    assert_eq!(fixture.path.calls.load(SeqCst), 0);
+    fixture.work.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn split_dns_udp_work_silent_home_does_not_block_sibling_or_repeat_completion() {
     let mut f = Fixture::new(true);
     let _silent = f.submit(49000);

@@ -17,14 +17,19 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
-/** First full-capture UDP milestone, not the all-state/TCP B3 campaign. */
+/** Connected DNS consumers, not the all-state B3 campaign. */
 class SplitDnsInstrumentedTest {
     private val harness = LocalNetworkDeliveryInstrumentedTest()
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
     private val args = InstrumentationRegistry.getArguments()
 
-    @Test
-    fun splitDnsFullUdp() =
+    private fun fullDnsCase(
+        probe:
+            (
+                LocalNetworkDeliveryInstrumentedTest.Consumer,
+                LocalNetworkDeliveryInstrumentedTest.AppliedCapture,
+            ) -> Unit
+    ) =
         harness.connectedCase(3.minutes) { consumer, repository, connection, base ->
             val privateDns =
                 instrumentation.uiAutomation
@@ -88,44 +93,78 @@ class SplitDnsInstrumentedTest {
                 after.dns,
                 "Split DNS must not substitute Android's resolver list",
             )
-            val hostname = "run11-${UUID.randomUUID().toString().replace("-", "")}.home"
-            val result =
-                consumer.request(
-                    Bundle().apply {
-                        putString("transport", "split-dns-lookup")
-                        putString("hostname", hostname)
-                    }
-                )
-            harness.report("split_dns_listed", result)
-            assertEquals("split-dns-lookup", result.getString("outcome"))
-            assertEquals("resolved", result.getString("lookup_outcome"))
-            assertTrue(
-                harness.uidIncluded(after.uids, result.getInt("uid")),
-                "The ordinary consumer must be included in this capture",
-            )
-            val answers = checkNotNull(result.getStringArrayList("addresses"))
-            assertFalse(answers.isEmpty())
-            val expected =
-                setOf(
-                    InetAddresses.parseNumericAddress("10.77.10.1"),
-                    InetAddresses.parseNumericAddress("fd71:7274:656b:10::1"),
-                )
-            assertTrue(
-                answers.map { InetAddresses.parseNumericAddress(it) }.all { it in expected },
-                "Only the fixture's Home addresses may reach the ordinary consumer",
-            )
-            val ordinary =
-                consumer.request(
-                    Bundle().apply {
-                        putString("transport", "lookup")
-                        putString("hostname", "example.com")
-                    }
-                )
-            harness.report("split_dns_ordinary", ordinary)
-            assertEquals("resolved", ordinary.getString("lookup_outcome"))
-            harness.report(
-                "split_dns_cache_limit",
-                "Platform lookup may use Android/app cache; packet attribution remains a separate runner gate",
-            )
+            probe(consumer, after)
         }
+
+    @Test
+    fun splitDnsFullTcp() = fullDnsCase { consumer, after ->
+        val peer =
+            InetAddresses.parseNumericAddress(
+                checkNotNull(args.getString("krtek_dns_tcp_resolver"))
+            )
+        val advertised =
+            after.dns
+                .split(',')
+                .filter { it.isNotBlank() }
+                .map { InetAddresses.parseNumericAddress(it.trim().removePrefix("/")) }
+        assertTrue(peer in advertised, "TCP must target an actually advertised resolver")
+        val result =
+            consumer.request(
+                Bundle().apply {
+                    putString("transport", "split-dns-tcp")
+                    putString("tcp_resolver", peer.hostAddress)
+                    putString("tcp_vectors", checkNotNull(args.getString("krtek_dns_tcp_vectors")))
+                }
+            )
+        harness.report("split_dns_tcp", result)
+        assertEquals("split-dns-tcp", result.getString("outcome"))
+        assertEquals(3, result.getInt("message_count"))
+        assertEquals(2, result.getInt("home_exact"))
+        assertTrue(result.getBoolean("ordinary_usable"))
+        assertTrue(harness.uidIncluded(after.uids, result.getInt("uid")))
+        assertTrue(result.getInt("local_port") > 0)
+    }
+
+    @Test
+    fun splitDnsFullUdp() = fullDnsCase { consumer, after ->
+        val hostname = "run11-${UUID.randomUUID().toString().replace("-", "")}.home"
+        val result =
+            consumer.request(
+                Bundle().apply {
+                    putString("transport", "split-dns-lookup")
+                    putString("hostname", hostname)
+                }
+            )
+        harness.report("split_dns_listed", result)
+        assertEquals("split-dns-lookup", result.getString("outcome"))
+        assertEquals("resolved", result.getString("lookup_outcome"))
+        assertTrue(
+            harness.uidIncluded(after.uids, result.getInt("uid")),
+            "The ordinary consumer must be included in this capture",
+        )
+        val answers = checkNotNull(result.getStringArrayList("addresses"))
+        assertFalse(answers.isEmpty())
+        val expected =
+            setOf(
+                InetAddresses.parseNumericAddress("10.77.10.1"),
+                InetAddresses.parseNumericAddress("fd71:7274:656b:10::1"),
+            )
+        assertTrue(
+            answers.map { InetAddresses.parseNumericAddress(it) }.all { it in expected },
+            "Only the fixture's Home addresses may reach the ordinary consumer",
+        )
+        val ordinary =
+            consumer.request(
+                Bundle().apply {
+                    putString("transport", "lookup")
+                    putString("hostname", "example.com")
+                }
+            )
+        harness.report("split_dns_ordinary", ordinary)
+        assertEquals("resolved", ordinary.getString("lookup_outcome"))
+        harness.report(
+            "split_dns_cache_limit",
+            "Platform lookup may use Android/app cache; packet attribution remains a separate runner gate",
+        )
+    }
 }

@@ -204,6 +204,7 @@ struct CaptureState {
     live: bool,
     sink: Option<RelaySink>,
     last_sink: u64,
+    socket_revision: u64,
     attempts: [Weak<Attempt>; MAX_TARGETS],
 }
 
@@ -236,6 +237,27 @@ impl RelayTargetId {
 pub struct RelayCapture(Arc<Capture>);
 
 impl RelayCapture {
+    /// Capture/target context for an unprotected process socket. Suspension
+    /// revokes it even when the same sink later resumes; Local is unchanged.
+    pub fn socket_context(&self, target: RelayTargetId) -> Option<RelaySocketContext> {
+        let state = self.0.state.lock().expect("capture state");
+        if !state.live || state.sink.is_none() {
+            return None;
+        }
+        state
+            .attempts
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find_map(|attempt| {
+                let active = attempt.target == target
+                    && *attempt.phase.lock().expect("attempt state") == AttemptPhase::Active;
+                active.then(|| RelaySocketContext {
+                    attempt: RelayAttempt(attempt),
+                    sink: state.sink.clone().expect("checked sink"),
+                    revision: state.socket_revision,
+                })
+            })
+    }
     pub fn with_current<T>(&self, operation: impl FnOnce() -> T) -> Result<T, RelayFlowError> {
         let state = self.0.state.lock().expect("capture state");
         if !state.live {
@@ -371,6 +393,7 @@ impl RelayCaptureOwner {
                 live: true,
                 sink: None,
                 last_sink: 0,
+                socket_revision: 0,
                 attempts: std::array::from_fn(|_| Weak::new()),
             }),
             _charge: charge,
@@ -464,6 +487,10 @@ impl RelayCaptureOwner {
             return Err(RelayFlowError::Stale);
         }
         state.sink = None;
+        state.socket_revision = state
+            .socket_revision
+            .checked_add(1)
+            .expect("capture socket revision exhausted");
         let records = sink_records(&state, false, "sink-suspended");
         drop(state);
         emit_records(records);
@@ -767,6 +794,38 @@ impl RelayAttempt {
             attempt: self.clone(),
             consumed: false,
         })
+    }
+}
+
+/// An existing admitted attempt plus an irreversible capture-suspension witness.
+/// This is not ownership of a TUN, a socket, or permission to protect/bind one.
+#[derive(Clone)]
+pub struct RelaySocketContext {
+    attempt: RelayAttempt,
+    sink: RelaySink,
+    revision: u64,
+}
+impl RelaySocketContext {
+    pub fn current(&self) -> bool {
+        self.with_current(|| ()).is_ok()
+    }
+
+    /// Same capture -> attempt lock order as packet admission. No await,
+    /// platform/authority/broker reentry or retained borrowed data in operation.
+    pub fn with_current<T>(&self, operation: impl FnOnce() -> T) -> Result<T, RelayFlowError> {
+        let capture = self.attempt.0.capture.state.lock().expect("capture state");
+        let phase = self.attempt.0.phase.lock().expect("attempt state");
+        if !capture.live
+            || capture.socket_revision != self.revision
+            || !capture
+                .sink
+                .as_ref()
+                .is_some_and(|current| current.same_sink(&self.sink))
+            || *phase != AttemptPhase::Active
+        {
+            return Err(RelayFlowError::Stale);
+        }
+        Ok(operation())
     }
 }
 

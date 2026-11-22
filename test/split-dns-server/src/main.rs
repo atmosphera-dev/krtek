@@ -31,6 +31,14 @@ enum Command {
         #[arg(long)]
         token: String,
     },
+    /// Independent complete query/Home-response goldens for the ordinary-UID
+    /// connected TCP consumer. Run in the device guest, never on the host.
+    TcpVectors {
+        #[arg(long)]
+        nonce: String,
+        #[arg(long)]
+        id: u16,
+    },
 }
 
 #[derive(clap::Args)]
@@ -56,7 +64,55 @@ async fn main() -> std::io::Result<()> {
     match Arguments::parse().command {
         Command::Serve(args) => serve(args).await,
         Command::Finish { path, token } => server::publish_finish(&path, &token),
+        Command::TcpVectors { nonce, id } => tcp_vectors(&nonce, id),
     }
+}
+
+fn tcp_vectors(nonce: &str, id: u16) -> std::io::Result<()> {
+    use hickory_proto::{
+        op::{Message, Query},
+        rr::{Name, RecordType},
+    };
+    if nonce.is_empty()
+        || nonce.len() > 40
+        || !nonce.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return Err(std::io::Error::other(
+            "an alphanumeric DNS-label nonce is required",
+        ));
+    }
+    let hex = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let mut vectors = Vec::new();
+    for (offset, (name, home)) in [
+        (format!("{nonce}-first.home."), true),
+        ("example.com.".into(), false),
+        (format!("{nonce}-last.home."), true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut request = Message::query();
+        request.metadata.id = id.wrapping_add(offset as u16);
+        request.add_query(Query::query(
+            Name::from_ascii(name).map_err(std::io::Error::other)?,
+            RecordType::A,
+        ));
+        let query = request.to_vec().map_err(std::io::Error::other)?;
+        let expected = home.then(|| {
+            fixture::answer(&request, fixture::Role::Home, fixture::Protocol::Tcp)
+                .unwrap()
+                .to_vec()
+                .unwrap()
+        });
+        vectors.push(serde_json::json!({"query_hex":hex(&query), "expected_hex":expected.map(|bytes| hex(&bytes)), "home":home}));
+    }
+    println!("{}", serde_json::json!({"messages":vectors}));
+    Ok(())
 }
 
 async fn serve(args: ServerArguments) -> std::io::Result<()> {

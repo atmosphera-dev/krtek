@@ -20,7 +20,6 @@ use std::{
     collections::{HashMap, VecDeque},
     future::{Future, poll_fn},
     io,
-    net::Shutdown,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll, Waker},
@@ -30,7 +29,7 @@ use talpid_types::relay_flow::{
     BUFFER_OVERHEAD, RelayBuffer, RelayBufferAllocator, RelayBufferReservation,
 };
 use tokio::{
-    net::{TcpSocket, TcpStream, UdpSocket},
+    net::{TcpSocket, UdpSocket},
     sync::Notify,
     task::JoinHandle,
     time::Instant,
@@ -129,7 +128,7 @@ impl<T> Task<T> {
 }
 enum Work {
     Preparing(Task<Socket>),
-    Connecting(Task<TcpStream>),
+    Connecting(Task<Box<dyn crate::tcp_service::TcpChannel>>),
     Waiting,
 }
 impl Work {
@@ -159,7 +158,7 @@ struct Tcp<G> {
     incarnation: Incarnation,
     finished_at: Option<Instant>,
     grant: G,
-    physical: TcpStream,
+    physical: Box<dyn crate::tcp_service::TcpChannel>,
     handle: SocketHandle,
     last_activity: Instant,
     physical_eof: bool,
@@ -309,6 +308,7 @@ enum TcpInput {
 /// `revalidation_signal`. `close_all` joins even blocking preparations.
 pub struct Forwarder<A: LocalAuthority> {
     authority: Arc<A>,
+    tcp_service: Option<Arc<dyn crate::tcp_service::TcpService>>,
     stack: Stack,
     pending: HashMap<Flow, Pending<Arc<A::Grant>>>,
     tcp: HashMap<Flow, Tcp<Arc<A::Grant>>>,
@@ -334,6 +334,12 @@ pub struct Forwarder<A: LocalAuthority> {
 }
 
 impl<A: LocalAuthority> Forwarder<A> {
+    /// Reuse the same TCP sequence, incarnation, resource and output owners for
+    /// an internal protocol service instead of preparing a physical connection.
+    pub fn with_tcp_service(mut self, service: Arc<dyn crate::tcp_service::TcpService>) -> Self {
+        self.tcp_service = Some(service);
+        self
+    }
     /// Sibling capture consumers share this arena and its TCP output headroom.
     pub fn reply_buffers(&self) -> Arc<dyn RelayBufferAllocator> {
         self.replies.clone()
@@ -376,6 +382,7 @@ impl<A: LocalAuthority> Forwarder<A> {
             .map_err(|_| Refused::Full)?;
         Ok(Self {
             authority,
+            tcp_service: None,
             stack: Stack::new(mtu, input.clone(), replies.clone()),
             pending: HashMap::with_capacity(TCP_FLOWS + UDP_FLOWS),
             tcp: HashMap::with_capacity(TCP_FLOWS),
@@ -534,10 +541,30 @@ impl<A: LocalAuthority> Forwarder<A> {
         }
     }
 
-    fn prepare(&self, flow: Flow, grant: &Arc<A::Grant>, storage: &FlowStorage) -> Work {
+    fn prepare(
+        &self,
+        flow: Flow,
+        grant: &Arc<A::Grant>,
+        scope: &crate::ReceiveScope,
+        storage: &FlowStorage,
+    ) -> Work {
         let authority = self.authority.clone();
         let grant = grant.clone();
         let charge = storage.fixed.clone();
+        if flow.transport == Transport::Tcp
+            && let Some(service) = &self.tcp_service
+        {
+            let service = service.clone();
+            let scope = scope.clone();
+            let buffers = self.buffers.clone();
+            return Work::Connecting(Task::new(tokio::spawn(async move {
+                let _charge = charge;
+                if !scope.current() || !authority.current(&grant) {
+                    return Err(Refused::Stale);
+                }
+                service.open(flow, &scope, &*buffers)
+            })));
+        }
         Work::Preparing(Task::new(tokio::task::spawn_blocking(move || {
             let _charge = charge;
             if !authority.current(&grant) {
@@ -926,7 +953,7 @@ impl<A: LocalAuthority> Forwarder<A> {
                 return;
             }
         };
-        let work = self.prepare(flow, &grant, &storage);
+        let work = self.prepare(flow, &grant, scope, &storage);
         let tcp = tcp_segment.map(|syn| {
             let incarnation = Incarnation::new(self.next_tcp_id, syn);
             self.next_tcp_id += 1;
@@ -1003,12 +1030,22 @@ impl<A: LocalAuthority> Forwarder<A> {
     /// Expiry never detaches a blocking prepare or frees its slot prematurely.
     fn sweep(&mut self) {
         let now = Instant::now();
+        for entry in self.tcp.values_mut() {
+            entry.physical.queued_output(
+                self.stack
+                    .sockets
+                    .get::<tcp::Socket<'_>>(entry.handle)
+                    .send_queue(),
+            );
+        }
         self.retired_tcp.retain(|entry| now < entry.deadline);
         let dead: Vec<_> = self
             .tcp
             .iter()
             .filter_map(|(flow, entry)| {
-                let revoked = !self.authority.current(&entry.grant) || !entry.scope.current();
+                let revoked = !self.authority.current(&entry.grant)
+                    || !entry.scope.current()
+                    || !entry.physical.current();
                 (revoked || now >= entry.last_activity + IDLE_LIMIT).then_some((*flow, revoked))
             })
             .collect();
@@ -1134,7 +1171,7 @@ impl<A: LocalAuthority> Forwarder<A> {
         match authorization {
             Ok(grant) => {
                 let grant = Arc::new(grant);
-                pending.work = self.prepare(flow, &grant, &pending.storage);
+                pending.work = self.prepare(flow, &grant, &pending.scope, &pending.storage);
                 pending.grant = grant;
                 pending.attempt_revision = self.revision;
                 pending.retried = true;
@@ -1231,7 +1268,7 @@ impl<A: LocalAuthority> Forwarder<A> {
                                 crate::diagnostics::observe("physical-connect-failed", format_args!("flow={flow:?} destination={destination} errno={:?}", error.raw_os_error()));
                                 let _ = error;
                                 Refused::PreparationFailed
-                            })
+                            }).map(|stream| Box::new(stream) as Box<dyn crate::tcp_service::TcpChannel>)
                         })));
                         self.pending.insert(flow, pending);
                     } else {
@@ -1334,7 +1371,7 @@ impl<A: LocalAuthority> Forwarder<A> {
             {
                 // A validated reset/stack abort discards data immediately. A
                 // graceful terminal state, in contrast, can still own rx bytes.
-                let _ = socket2::SockRef::from(&entry.physical).set_linger(Some(Duration::ZERO));
+                entry.physical.abort();
                 removed.push((*flow, false));
                 continue;
             }
@@ -1361,9 +1398,7 @@ impl<A: LocalAuthority> Forwarder<A> {
                 entry.last_activity = Instant::now();
             }
             if entry.application_fin && !endpoint.may_recv() && !entry.application_eof {
-                failed |= socket2::SockRef::from(&entry.physical)
-                    .shutdown(Shutdown::Write)
-                    .is_err();
+                failed |= entry.physical.shutdown().is_err();
                 entry.application_eof = true;
             }
             while !entry.physical_eof && endpoint.can_send() && self.authority.current(&entry.grant)
@@ -1549,7 +1584,7 @@ impl<A: LocalAuthority> Forwarder<A> {
                 if self
                     .tcp
                     .get(&owner.flow)
-                    .is_some_and(|entry| !entry.scope.current())
+                    .is_some_and(|entry| !entry.scope.current() || !entry.physical.current())
                     || self
                         .pending
                         .get(&owner.flow)
@@ -1660,7 +1695,7 @@ impl<A: LocalAuthority> Forwarder<A> {
         for pending in self.pending.values_mut() {
             ready |= pending.work.poll(cx);
         }
-        for entry in self.tcp.values() {
+        for entry in self.tcp.values_mut() {
             let endpoint = self.stack.sockets.get::<tcp::Socket<'_>>(entry.handle);
             if !entry.physical_eof && endpoint.can_send() {
                 ready |= entry.physical.poll_read_ready(cx).is_ready();

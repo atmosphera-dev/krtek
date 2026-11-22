@@ -30,6 +30,7 @@ mod forwarder;
 mod ip_endpoint;
 pub mod packet;
 pub mod packet_receiver;
+pub mod tcp_service;
 
 pub use authority::{Disposition, LocalAuthority, ReceiveScope, Refused};
 pub use forwarder::{Forwarder, MAX_SUPPORTED_MTU, MIN_SUPPORTED_MTU, Stats, validate_mtu};
