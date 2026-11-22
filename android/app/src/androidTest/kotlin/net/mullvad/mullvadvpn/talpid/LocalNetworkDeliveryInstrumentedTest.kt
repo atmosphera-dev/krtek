@@ -3848,6 +3848,10 @@ class LocalNetworkDeliveryInstrumentedTest {
                         }
                     )
                 return result.get(35, TimeUnit.SECONDS).also {
+                    // Record retained consumer evidence before any check can fail the call.
+                    it.getString("evidence_dir")?.let { dir ->
+                        report("consumer_evidence_dir", dir)
+                    }
                     assertEquals(packageName, it.getString("package"))
                     assertEquals(
                         target.packageManager.getApplicationInfo(packageName, 0).uid,

@@ -64,11 +64,16 @@ async fn main() -> std::io::Result<()> {
     match Arguments::parse().command {
         Command::Serve(args) => serve(args).await,
         Command::Finish { path, token } => server::publish_finish(&path, &token),
-        Command::TcpVectors { nonce, id } => tcp_vectors(&nonce, id),
+        Command::TcpVectors { nonce, id } => {
+            println!("{}", tcp_vectors(&nonce, id)?);
+            Ok(())
+        }
     }
 }
 
-fn tcp_vectors(nonce: &str, id: u16) -> std::io::Result<()> {
+/// Stub-resolver queries, as an app's resolver sends them: recursion desired. A real
+/// ordinary resolver refuses non-recursive questions, and Home goldens echo the flag.
+fn tcp_vectors(nonce: &str, id: u16) -> std::io::Result<serde_json::Value> {
     use hickory_proto::{
         op::{Message, Query},
         rr::{Name, RecordType},
@@ -98,6 +103,7 @@ fn tcp_vectors(nonce: &str, id: u16) -> std::io::Result<()> {
     {
         let mut request = Message::query();
         request.metadata.id = id.wrapping_add(offset as u16);
+        request.metadata.recursion_desired = true;
         request.add_query(Query::query(
             Name::from_ascii(name).map_err(std::io::Error::other)?,
             RecordType::A,
@@ -111,8 +117,7 @@ fn tcp_vectors(nonce: &str, id: u16) -> std::io::Result<()> {
         });
         vectors.push(serde_json::json!({"query_hex":hex(&query), "expected_hex":expected.map(|bytes| hex(&bytes)), "home":home}));
     }
-    println!("{}", serde_json::json!({"messages":vectors}));
-    Ok(())
+    Ok(serde_json::json!({"messages":vectors}))
 }
 
 async fn serve(args: ServerArguments) -> std::io::Result<()> {
@@ -148,5 +153,40 @@ async fn serve(args: ServerArguments) -> std::io::Result<()> {
         Err(std::io::Error::other(
             "fixture observation window is incomplete",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hickory_proto::op::{Message, MessageType};
+
+    fn decode(hex: &str) -> Message {
+        let bytes = (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+            .collect::<Vec<_>>();
+        Message::from_vec(&bytes).unwrap()
+    }
+
+    #[test]
+    fn tcp_vectors_ask_for_recursion_and_home_goldens_echo_it() {
+        let vectors = super::tcp_vectors("rdControl", 65535).unwrap();
+        let messages = vectors["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        for (index, vector) in messages.iter().enumerate() {
+            let query = decode(vector["query_hex"].as_str().unwrap());
+            assert_eq!(query.metadata.message_type, MessageType::Query);
+            assert!(query.metadata.recursion_desired, "query {index}");
+            assert_eq!(query.metadata.id, 65535u16.wrapping_add(index as u16));
+            match vector["expected_hex"].as_str() {
+                Some(expected) => {
+                    let reply = decode(expected);
+                    assert!(vector["home"].as_bool().unwrap());
+                    assert!(reply.metadata.recursion_desired, "golden {index}");
+                    assert_eq!(reply.metadata.id, query.metadata.id);
+                }
+                None => assert!(!vector["home"].as_bool().unwrap()),
+            }
+        }
     }
 }
