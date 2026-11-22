@@ -57,6 +57,28 @@ data class SplitDnsDraft(
             current.copy(splitDns = split).takeIf { it.validationError() == null }
         }
 
+    /** The first field the user must fix, in the order the editor shows them. */
+    fun problem(rules: List<LocalBypassRule>): Int? {
+        val resolver = HomeDnsResolver.parse(homeResolver)
+        val association = localRuleId?.let { id -> rules.find { it.id.toString() == id } }
+        return when {
+            domains.any { it.canonical() == null } -> R.string.split_dns_invalid_domain
+            homeResolver.isNotEmpty() && resolver == null -> R.string.split_dns_invalid_home_ip
+            !enabled -> null
+            domains.isEmpty() -> R.string.split_dns_missing_domain
+            resolver == null -> R.string.split_dns_invalid_home_ip
+            association == null -> R.string.split_dns_missing_home_network
+            association.cidrs.none { it.contains(resolver.addressBytes()) } ->
+                R.string.split_dns_home_ip_not_covered
+            else -> null
+        }
+    }
+
+    /** Row identities are presentation only; saved values decide whether two drafts differ. */
+    fun sameContent(other: SplitDnsDraft): Boolean =
+        copy(domains = domains.map { it.copy(id = "") }) ==
+            other.copy(domains = other.domains.map { it.copy(id = "") })
+
     override fun toString(): String = "SplitDnsDraft(redacted)"
 
     companion object {

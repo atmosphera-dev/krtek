@@ -18,4 +18,17 @@ data class LocalPolicyActions(
     val onCancelDelete: () -> Unit = {},
     val onConnectedWifi: () -> Unit = {},
     val onRequestAccess: (Boolean) -> Unit = {},
+    val splitDns: SplitDnsActions = SplitDnsActions(),
+)
+
+/** Split DNS callbacks; the section never reaches the repository or Android settings itself. */
+data class SplitDnsActions(
+    val onEnabled: (Boolean) -> Unit = {},
+    val onEdit: () -> Unit = {},
+    val onUpdate: ((SplitDnsDraft) -> SplitDnsDraft) -> Unit = {},
+    val onSave: () -> Unit = {},
+    val onClose: () -> Unit = {},
+    val onDiscard: () -> Unit = {},
+    val onKeep: () -> Unit = {},
+    val onPrivateDnsSettings: () -> Unit = {},
 )

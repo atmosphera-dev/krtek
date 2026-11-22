@@ -36,20 +36,46 @@ class LocalNetworkSharingViewModel(
 ) : ViewModel() {
 
     private val editor = savedStateHandle.getStateFlow("local-rule-editor", LocalEditorState())
+    private val dnsEditor =
+        savedStateHandle.getStateFlow(SPLIT_DNS_EDITOR_KEY, SplitDnsEditorState())
     private val deleteTarget =
         savedStateHandle.getStateFlow<LocalRuleDeleteTarget?>("local-rule-delete", null)
     private val saving = MutableStateFlow(false)
+
+    /** Saving, or either editor is open: nothing else may start. */
+    private val occupied: Boolean
+        get() = saving.value || editor.value.draft != null || dnsEditor.value.draft != null
+
     private val error = MutableStateFlow<Int?>(null)
     private val effects = Channel<LocalNetworkSharingSideEffect>(Channel.BUFFERED)
     val uiSideEffect = effects.receiveAsFlow()
     private var wifiRequests = 0L
     private val policyChanges =
-        LocalPolicyChanges(settingsRepository, viewModelScope, saving, error, editor) {
-            closeEditor,
-            requestWifi ->
-            if (closeEditor) setEditor(LocalEditorState())
+        LocalPolicyChanges(
+            settingsRepository,
+            viewModelScope,
+            saving,
+            error,
+            { editor.value.draft != null || dnsEditor.value.draft != null },
+        ) { closeEditor, requestWifi ->
+            if (closeEditor) {
+                // Only one editor can be open; a successful save closes it.
+                savedStateHandle.setRuleEditor(LocalEditorState())
+                savedStateHandle[SPLIT_DNS_EDITOR_KEY] = SplitDnsEditorState()
+            }
             requestWifi?.let { effects.send(LocalNetworkSharingSideEffect(it)) }
         }
+
+    /** Split DNS draft and actions; shares this screen's saving, error and policy transaction. */
+    private val splitDns =
+        SplitDnsSettings(
+            settingsRepository,
+            savedStateHandle,
+            saving,
+            error,
+            { editor.value.draft != null },
+            policyChanges,
+        )
 
     init {
         viewModelScope.launch {
@@ -78,7 +104,7 @@ class LocalNetworkSharingViewModel(
                                 (wifi as? ConnectedWifi.Unknown)?.reason ==
                                     WifiUnknownReason.Pending
                         if (edit.waitingForWifi && edit.wifiRequest == request && pending)
-                            setEditor(
+                            savedStateHandle.setRuleEditor(
                                 edit.copy(wifiMessage = R.string.local_access_wifi_not_available)
                             )
                     }
@@ -97,7 +123,7 @@ class LocalNetworkSharingViewModel(
                     when {
                         wifi is ConnectedWifi.Known -> fillConnectedWifi(wifi)
                         wifi is ConnectedWifi.Unknown && !wifi.reason.awaitsWifi() ->
-                            setEditor(
+                            savedStateHandle.setRuleEditor(
                                 edit.copy(
                                     waitingForWifi = false,
                                     wifiMessage = wifi.reason.message(),
@@ -112,20 +138,23 @@ class LocalNetworkSharingViewModel(
         combine(
                 settingsRepository.settingsUpdates.filterNotNull(),
                 settingsRepository.localNetworkStatus,
-                combine(editor, deleteTarget) { edit, target -> edit to target },
+                combine(editor, deleteTarget, dnsEditor) { edit, target, dns ->
+                    Triple(edit, target, dns)
+                },
                 saving,
                 error,
-            ) { settings, status, (edit, target), busy, failure ->
+            ) { settings, status, editors, busy, failure ->
                 LocalNetworkSharingUiState(
                         lanSharingEnabled = settings.allowLan,
                         isModal = isModal,
                         policy = settings.localNetworkAccess ?: LocalNetworkAccess(),
                         policyReadable = settings.localNetworkAccess != null,
                         status = status,
-                        editor = edit,
+                        editor = editors.first,
                         saving = busy,
                         error = failure,
-                        deleteTarget = target,
+                        deleteTarget = editors.second,
+                        splitDnsEditor = editors.third,
                     )
                     .toLc<Boolean, LocalNetworkSharingUiState>()
             }
@@ -141,15 +170,9 @@ class LocalNetworkSharingViewModel(
 
     fun edit(rule: LocalBypassRule?) {
         val policy = settingsRepository.settingsUpdates.value?.localNetworkAccess
-        if (
-            saving.value ||
-                editor.value.draft != null ||
-                policy == null ||
-                policy.validationError() != null
-        )
-            return
+        if (occupied || policy == null || policy.validationError() != null) return
         val draft = rule?.let(LocalRuleDraft::from) ?: LocalRuleDraft(UUID.randomUUID().toString())
-        setEditor(LocalEditorState(draft, draft))
+        savedStateHandle.setRuleEditor(LocalEditorState(draft, draft))
         error.value = null
     }
 
@@ -158,7 +181,7 @@ class LocalNetworkSharingViewModel(
         editor.value.draft?.let {
             val next = update(it)
             // Only editing the Wi-Fi names supersedes a pending "Use connected Wi-Fi" request.
-            setEditor(
+            savedStateHandle.setRuleEditor(
                 if (next.wifiNames == it.wifiNames) editor.value.copy(draft = next)
                 else editor.value.copy(draft = next, waitingForWifi = false, wifiMessage = null)
             )
@@ -168,7 +191,7 @@ class LocalNetworkSharingViewModel(
 
     fun closeEditor() {
         if (!saving.value) {
-            setEditor(
+            savedStateHandle.setRuleEditor(
                 if (editor.value.dirty) editor.value.copy(confirmDiscard = true)
                 else LocalEditorState()
             )
@@ -176,9 +199,9 @@ class LocalNetworkSharingViewModel(
         }
     }
 
-    fun discard() = setEditor(LocalEditorState())
+    fun discard() = savedStateHandle.setRuleEditor(LocalEditorState())
 
-    fun keepEditing() = setEditor(editor.value.copy(confirmDiscard = false))
+    fun keepEditing() = savedStateHandle.setRuleEditor(editor.value.copy(confirmDiscard = false))
 
     fun save() {
         val rule = editor.value.draft?.rule()
@@ -203,8 +226,12 @@ class LocalNetworkSharingViewModel(
         it.copy(skipLocalRulesForExcludedApps = skip)
     }
 
+    fun onSplitDns(action: SplitDnsAction) {
+        splitDns.handle(action)
+    }
+
     fun requestDelete(rule: LocalBypassRule?) {
-        if (saving.value || editor.value.draft != null) return
+        if (occupied) return
         val current =
             settingsRepository.settingsUpdates.value?.localNetworkAccess?.rules?.find {
                 it.id == rule?.id
@@ -219,10 +246,6 @@ class LocalNetworkSharingViewModel(
         it.copy(rules = it.rules.filterNot { rule -> rule.id == id })
     }
 
-    private fun setEditor(value: LocalEditorState) {
-        savedStateHandle["local-rule-editor"] = value
-    }
-
     fun useConnectedWifi() {
         val wifi = settingsRepository.localNetworkStatus.value?.currentWifi
         if (wifi is ConnectedWifi.Known) fillConnectedWifi(wifi)
@@ -231,7 +254,7 @@ class LocalNetworkSharingViewModel(
             val draft = edit.draft ?: return
             val reason = (wifi as? ConnectedWifi.Unknown)?.reason ?: WifiUnknownReason.Pending
             val missing = reason == WifiUnknownReason.PermissionMissing
-            setEditor(
+            savedStateHandle.setRuleEditor(
                 edit.copy(
                     draft =
                         if (draft.wifiNames.isEmpty())
@@ -257,7 +280,7 @@ class LocalNetworkSharingViewModel(
             names.size < LocalNetworkAccess.MAX_SSIDS_PER_RULE ->
                 names.add(LocalWifiDraft.from(wifi.ssid))
             else -> {
-                setEditor(
+                savedStateHandle.setRuleEditor(
                     edit.copy(
                         waitingForWifi = false,
                         wifiMessage = R.string.local_access_wifi_limit,
@@ -266,7 +289,7 @@ class LocalNetworkSharingViewModel(
                 return
             }
         }
-        setEditor(
+        savedStateHandle.setRuleEditor(
             edit.copy(
                 draft = draft.copy(wifiNames = names),
                 waitingForWifi = false,
@@ -274,6 +297,10 @@ class LocalNetworkSharingViewModel(
             )
         )
     }
+}
+
+private fun SavedStateHandle.setRuleEditor(value: LocalEditorState) {
+    this["local-rule-editor"] = value
 }
 
 /**

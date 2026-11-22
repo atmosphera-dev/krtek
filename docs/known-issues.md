@@ -84,6 +84,10 @@ Each issue in this document should provide, at least, the following:
   but partial or checksum-invalid transports never authorize a physical socket
   and replies are never shortened into a smaller application datagram. Unowned
   asynchronous control packets are suppressed.
+* Split DNS answers only plain DNS on port 53. Android Private DNS and apps'
+  own encrypted DNS (DNS over TLS or HTTPS) skip it. In this revision it is
+  active only while Mullvad is connected. See
+  [split DNS](split-dns.md#known-limits).
 * The capture uses `172.27.1.1/32` and `fdf0:ce4a:801d::172:27:1:1/128`
   independently of Mullvad's assignment. These private addresses can still
   collide with a real private network.

@@ -2,12 +2,26 @@
 
 ## Implementation status
 
-Split DNS is under development. The saved policy, message transports and editor
-components are foundations only. The normal capture path does not select a
-split-DNS forwarder, and the Local settings screen does not expose the new
-editor yet. Saving policy through development tooling does not activate DNS
-forwarding. The behavior below describes the feature's completion contract,
-not verified behavior in this revision.
+Split DNS is configured in Settings > VPN settings > Local network sharing, below
+the Local rules. In this revision it answers listed names while Krtek's full
+capture is active, that is while Mullvad is connected: plain DNS
+over UDP and TCP port 53 to a resolver Android was given is inspected there.
+While Mullvad is disconnected, Krtek does not yet capture DNS, so listed names
+are resolved the way Android resolves them without split DNS. That state, and
+the matching behavior under "Block connections without VPN", is a separate
+pending integration step. The contract below describes the complete feature.
+
+## Settings screen
+
+| # | Control | Behavior |
+|---|---|---|
+| 1 | Use home DNS for listed domains | Saves immediately. Turning it on with an incomplete configuration opens the editor instead; nothing is saved until Save |
+| 2 | Summary | Shows where it is used (for example "Used on Wi-Fi: My home"), the home network rule's current status, Home DNS IP, home network and the domains without their final dot |
+| 3 | Edit split DNS | One draft for domains, Home DNS IP and home network. Each domain shows the normalized name it matches. Save stores the whole Local policy atomically with the screen's other changes |
+| 4 | Home network | Lists the existing Local rules with their network. Choosing one never enables, broadens or otherwise changes that rule |
+| 5 | Errors and conflicts | Invalid input names the field to fix and keeps the draft. If the saved split DNS settings changed while editing, the draft stays and a second Save replaces them. Back or Cancel with changes asks before discarding |
+| 6 | Invalid saved settings | When only the split DNS part of the stored policy is invalid, the editor stays available to repair it; other Local controls stay locked as before |
+| 7 | Private DNS note | Explains that Private DNS and apps' own secure DNS skip split DNS, with a button to Android's network settings. Krtek never changes these settings itself |
 
 ## Names and Home DNS
 
@@ -60,13 +74,22 @@ authorization or the ordinary tunnel. A Home answer containing a public IP
 does not grant direct internet access. Normal hostname and certificate checks
 remain necessary; DNS does not rewrite URLs, SNI or service identity.
 
-## Android limits
+## Known limits
 
-Android Private DNS and apps' own Secure DNS can skip the plain DNS endpoint.
-Turn them off to rely on split DNS; Krtek must not change them silently. Strict
-or Automatic Private DNS observations are not a compatibility promise. Apps
-outside Krtek's captured UID range or using hardcoded/encrypted DNS are not
-universally confined by this feature.
+- Android Private DNS (DNS over TLS on port 853) and apps' own encrypted DNS
+  (DNS over HTTPS, for example Chrome's Secure DNS) do not use the plain DNS
+  endpoint, so they skip split DNS. Turn them off to rely on split DNS; Krtek
+  must not change them silently. Strict or Automatic Private DNS observations
+  are not a compatibility promise. The settings button opens Android's network
+  settings, where Private DNS is found; Android has no public direct link.
+- While Mullvad is disconnected, split DNS is not active yet (see Implementation
+  status).
+- Apps outside Krtek's captured UID range or using hardcoded resolvers are not
+  universally confined by this feature.
+- Android and apps cache answers, so a policy change need not change an app's
+  destination immediately.
+- A truncated Home answer is retried over TCP only when the client can reach
+  Home over TCP; otherwise the listed question fails.
 
 Existing [Android limitations](known-issues.md), including capture transition
 gaps and OS bypasses, remain. This work does not resolve the separate fragmented

@@ -42,37 +42,14 @@ internal fun LocalPolicyControls(state: LocalNetworkSharingUiState, actions: Loc
                 ),
                 color = MaterialTheme.colorScheme.error,
             )
+            if (state.splitDnsRepairable) LocalPolicyBody(state, actions)
         } else {
             LocalPolicyHeader(
                 state,
                 onEnabled = { if (it) confirmEnable = true else actions.onEnabled(false) },
                 onExcludedAppsSkipLocalRules = actions.onExcludedAppsSkipLocalRules,
             )
-            if (state.saving) {
-                Text(stringResource(R.string.local_access_saving))
-            } else if (state.editor.draft == null) {
-                state.error?.let {
-                    Text(stringResource(it), color = MaterialTheme.colorScheme.error)
-                }
-                if (state.policy.rules.isEmpty()) Text(stringResource(R.string.local_access_empty))
-                state.policy.rules.forEach { rule ->
-                    LocalRuleRow(
-                        rule = rule,
-                        condition = state.status?.rules?.find { it.id == rule.id }?.state,
-                        onEdit = { actions.onEdit(rule) },
-                        onDelete = { actions.onRequestDelete(rule) },
-                        onRequestAccess = { actions.onRequestAccess(rule.ssidIds.isNotEmpty()) },
-                    )
-                    HorizontalDivider()
-                }
-                PrimaryButton(
-                    modifier = Modifier.testTag("local_access_add_rule"),
-                    text = stringResource(R.string.local_access_add_rule),
-                    onClick = { actions.onEdit(null) },
-                )
-            } else {
-                LocalRuleEditorControls(state, actions)
-            }
+            LocalPolicyBody(state, actions)
         }
     }
     if (confirmEnable && state.policyEditable) {
@@ -89,6 +66,43 @@ internal fun LocalPolicyControls(state: LocalNetworkSharingUiState, actions: Loc
         )
     }
     LocalPolicyEditConfirmations(state, actions)
+}
+
+/** Exactly one of: saving notice, rule list with Split DNS summary, rule editor, DNS editor. */
+@Composable
+private fun LocalPolicyBody(state: LocalNetworkSharingUiState, actions: LocalPolicyActions) {
+    val dnsDraft = state.splitDnsEditor.draft
+    when {
+        state.saving -> Text(stringResource(R.string.local_access_saving))
+        state.editor.draft != null -> LocalRuleEditorControls(state, actions)
+        dnsDraft != null ->
+            SplitDnsEditorControls(dnsDraft, state.policy.rules, true, actions.splitDns.onUpdate)
+        else -> {
+            state.error?.let { Text(stringResource(it), color = MaterialTheme.colorScheme.error) }
+            if (state.policyEditable) LocalRuleList(state, actions)
+            SplitDnsSection(state, actions.splitDns)
+        }
+    }
+}
+
+@Composable
+private fun LocalRuleList(state: LocalNetworkSharingUiState, actions: LocalPolicyActions) {
+    if (state.policy.rules.isEmpty()) Text(stringResource(R.string.local_access_empty))
+    state.policy.rules.forEach { rule ->
+        LocalRuleRow(
+            rule = rule,
+            condition = state.status?.rules?.find { it.id == rule.id }?.state,
+            onEdit = { actions.onEdit(rule) },
+            onDelete = { actions.onRequestDelete(rule) },
+            onRequestAccess = { actions.onRequestAccess(rule.ssidIds.isNotEmpty()) },
+        )
+        HorizontalDivider()
+    }
+    PrimaryButton(
+        modifier = Modifier.testTag("local_access_add_rule"),
+        text = stringResource(R.string.local_access_add_rule),
+        onClick = { actions.onEdit(null) },
+    )
 }
 
 @Composable
@@ -122,6 +136,15 @@ private fun LocalPolicyEditConfirmations(
             onCancel = actions.onKeep,
         )
     }
+    if (state.splitDnsEditor.confirmDiscard) {
+        LocalPolicyConfirmation(
+            title = R.string.local_access_discard_title,
+            confirm = R.string.local_access_discard,
+            cancel = R.string.local_access_keep_editing,
+            onConfirm = actions.splitDns.onDiscard,
+            onCancel = actions.splitDns.onKeep,
+        )
+    }
 }
 
 @Composable
@@ -135,7 +158,7 @@ private fun LocalPolicyHeader(
         stringResource(R.string.local_access_scope_help),
         style = MaterialTheme.typography.bodyMedium,
     )
-    if (!state.saving && state.editor.draft == null) {
+    if (!state.saving && !state.editing) {
         SwitchListItem(
             title = stringResource(R.string.local_access_enable),
             isToggled = state.policy.enabled,
@@ -152,7 +175,7 @@ private fun LocalPolicyHeader(
             stringResource(R.string.local_access_excluded_apps_description),
             style = MaterialTheme.typography.bodyMedium,
         )
-    } else if (state.editor.draft != null) {
+    } else if (state.editing) {
         Text(
             stringResource(
                 if (state.policy.enabled) R.string.local_access_policy_on

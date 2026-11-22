@@ -275,7 +275,20 @@ class LocalNetworkEditorInstrumentedTest {
         assertEquals(value, rendered.text?.toString())
     }
 
-    internal fun back() = EditorBackNavigationTest.toDiscardDialog(instrumentation, compose)
+    internal fun back(editorField: String = "local_access_name") =
+        EditorBackNavigationTest.toDiscardDialog(instrumentation, compose, editorField)
+
+    /** Full display capture for the final screenshot set; the IME is hidden first. */
+    internal fun screenshot(): android.graphics.Bitmap {
+        if (EditorBackNavigationTest.imeVisible(instrumentation)) {
+            EditorBackNavigationTest.hideIme(instrumentation)
+            compose.waitUntil(timeoutMillis = 15_000) {
+                !EditorBackNavigationTest.imeVisible(instrumentation)
+            }
+        }
+        ExternalUiActionCompletion.settle(instrumentation::waitForIdleSync, compose::waitForIdle)
+        return checkNotNull(instrumentation.uiAutomation.takeScreenshot())
+    }
 
     private fun mainActivityResumed(): Boolean {
         var resumed = false

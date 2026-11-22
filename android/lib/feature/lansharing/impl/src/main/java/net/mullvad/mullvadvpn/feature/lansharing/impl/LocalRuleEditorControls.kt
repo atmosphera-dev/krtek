@@ -75,11 +75,13 @@ internal fun LocalRuleEditorControls(
     )
 }
 
+/** Save and Cancel for whichever editor is open: a Local rule or the split DNS settings. */
 @Composable
 internal fun LocalRuleEditorActions(
     state: LocalNetworkSharingUiState,
     actions: LocalPolicyActions,
 ) {
+    val dns = state.splitDnsEditor.draft != null && state.editor.draft == null
     Column(
         Modifier.fillMaxWidth()
             .padding(horizontal = Dimens.sideMarginNew, vertical = Dimens.smallPadding),
@@ -87,16 +89,22 @@ internal fun LocalRuleEditorActions(
     ) {
         HorizontalDivider()
         state.error?.let { Text(stringResource(it), color = MaterialTheme.colorScheme.error) }
-        if (state.policyEditable) {
+        if (dns || state.policyEditable) {
             PrimaryButton(
-                modifier = Modifier.testTag("local_access_save"),
-                text = stringResource(R.string.local_access_save),
-                onClick = actions.onSave,
+                modifier = Modifier.testTag(if (dns) "split_dns_save" else "local_access_save"),
+                text =
+                    stringResource(
+                        if (dns) R.string.split_dns_save else R.string.local_access_save
+                    ),
+                onClick = if (dns) actions.splitDns.onSave else actions.onSave,
             )
         }
         PrimaryTextButton(
-            modifier = Modifier.testTag("local_access_editor_cancel"),
-            onClick = actions.onClose,
+            modifier =
+                Modifier.testTag(
+                    if (dns) "split_dns_editor_cancel" else "local_access_editor_cancel"
+                ),
+            onClick = if (dns) actions.splitDns.onClose else actions.onClose,
             text = stringResource(android.R.string.cancel),
         )
     }

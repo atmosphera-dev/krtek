@@ -6,6 +6,8 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Delete
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -17,73 +19,128 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.style.TextOverflow
 import java.util.UUID
+import net.mullvad.mullvadvpn.lib.model.HomeDnsResolver
+import net.mullvad.mullvadvpn.lib.model.LocalBypassRule
+import net.mullvad.mullvadvpn.lib.ui.component.listitem.SwitchListItem
 import net.mullvad.mullvadvpn.lib.ui.component.textfield.CustomTextField
+import net.mullvad.mullvadvpn.lib.ui.component.textfield.mullvadDarkTextFieldColors
+import net.mullvad.mullvadvpn.lib.ui.designsystem.MullvadExposedDropdownMenuBox
 import net.mullvad.mullvadvpn.lib.ui.designsystem.PrimaryButton
 import net.mullvad.mullvadvpn.lib.ui.designsystem.PrimaryTextButton
 import net.mullvad.mullvadvpn.lib.ui.theme.Dimens
+import net.mullvad.mullvadvpn.lib.ui.theme.color.menuItemColors
 
-internal data class SplitDnsEditorUiState(
-    val draft: SplitDnsDraft,
-    val homeNetworkLabel: String,
-    val saving: Boolean = false,
-    val error: Int? = null,
-) {
-    override fun toString(): String = "SplitDnsEditorUiState(saving=$saving)"
+/** Saved split DNS summary below the Local rules. Callbacks decide what each control does. */
+@Composable
+internal fun SplitDnsSection(state: LocalNetworkSharingUiState, actions: SplitDnsActions) {
+    val split = state.policy.splitDns
+    val rule = state.policy.rules.find { it.id == split.localRuleId }
+    HorizontalDivider()
+    Text(stringResource(R.string.split_dns_title), style = MaterialTheme.typography.titleMedium)
+    if (state.splitDnsRepairable) {
+        Text(
+            stringResource(R.string.split_dns_policy_invalid),
+            color = MaterialTheme.colorScheme.error,
+        )
+    }
+    SwitchListItem(
+        title = stringResource(R.string.split_dns_enable),
+        isToggled = split.enabled,
+        isEnabled = state.policyEditable,
+        testTag = "split_dns_enabled",
+        onCellClicked = actions.onEnabled,
+    )
+    if (split.enabled && rule != null) {
+        Text(rule.usedOn(), style = MaterialTheme.typography.bodyMedium)
+        val condition = state.status?.rules?.find { it.id == rule.id }?.state
+        Text(stringResource(condition.message()), style = MaterialTheme.typography.bodyMedium)
+    }
+    split.homeResolver?.let {
+        SplitDnsSummaryValue(R.string.split_dns_home_ip, listOf(it.numericAddress))
+    }
+    rule?.let { SplitDnsSummaryValue(R.string.split_dns_home_network, listOf(it.networkLabel())) }
+    if (split.suffixes.isNotEmpty()) {
+        SplitDnsSummaryValue(
+            R.string.split_dns_domains,
+            split.suffixes.map { SplitDnsDomainDraft.from(it).text },
+        )
+    }
+    PrimaryButton(
+        modifier = Modifier.testTag("split_dns_edit"),
+        text = stringResource(R.string.split_dns_edit),
+        onClick = actions.onEdit,
+    )
+    Text(
+        stringResource(R.string.split_dns_no_fallback),
+        style = MaterialTheme.typography.bodyMedium,
+    )
+    Text(stringResource(R.string.split_dns_route_help), style = MaterialTheme.typography.bodyMedium)
+    HorizontalDivider()
+    Text(
+        stringResource(R.string.split_dns_private_dns),
+        style = MaterialTheme.typography.bodyMedium,
+    )
+    PrimaryTextButton(
+        modifier = Modifier.testTag("split_dns_private_dns_settings"),
+        text = stringResource(R.string.split_dns_open_private_dns),
+        onClick = actions.onPrivateDnsSettings,
+    )
 }
 
-internal data class SplitDnsEditorActions(
-    val onUpdate: ((SplitDnsDraft) -> SplitDnsDraft) -> Unit,
-    val onChooseHomeNetwork: () -> Unit,
-    val onSave: () -> Unit,
-    val onCancel: () -> Unit,
-    val onPrivateDnsSettings: () -> Unit,
-)
+@Composable
+private fun SplitDnsSummaryValue(label: Int, values: List<String>) {
+    Text(stringResource(label), style = MaterialTheme.typography.titleSmall)
+    values.forEach { Text(it, style = MaterialTheme.typography.bodyLarge) }
+}
 
-/** Callback-only editor, not yet selected by the Local settings screen. */
+/** Callback-only editor body; Save and Cancel live in the screen's editor action bar. */
 @Composable
 internal fun SplitDnsEditorControls(
-    state: SplitDnsEditorUiState,
-    actions: SplitDnsEditorActions,
+    draft: SplitDnsDraft,
+    rules: List<LocalBypassRule>,
+    enabled: Boolean,
+    onUpdate: ((SplitDnsDraft) -> SplitDnsDraft) -> Unit,
 ) {
     Column(
         Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(Dimens.smallPadding),
     ) {
-        Text(
-            stringResource(R.string.split_dns_title),
-            style = MaterialTheme.typography.titleMedium,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        state.draft.domains.forEachIndexed { index, row ->
-            key(row.id) { SplitDnsDomainField(row, index, !state.saving, actions.onUpdate) }
+        Text(stringResource(R.string.split_dns_edit), style = MaterialTheme.typography.titleMedium)
+        draft.domains.forEachIndexed { index, row ->
+            key(row.id) { SplitDnsDomainField(row, index, enabled, onUpdate) }
         }
-        PrimaryTextButton(
+        PrimaryButton(
+            modifier = Modifier.testTag("split_dns_add_domain"),
             text = stringResource(R.string.split_dns_add_domain),
-            isEnabled = !state.saving,
+            isEnabled = enabled,
             onClick = {
-                actions.onUpdate {
+                onUpdate {
                     it.copy(
                         domains = it.domains + SplitDnsDomainDraft(UUID.randomUUID().toString(), "")
                     )
                 }
             },
         )
-        SplitDnsHomeFields(state, actions)
-        SplitDnsNotes(actions.onPrivateDnsSettings)
-        state.error?.let { Text(stringResource(it), color = MaterialTheme.colorScheme.error) }
-        PrimaryButton(
-            text = stringResource(R.string.local_access_save),
-            isEnabled = !state.saving,
-            onClick = actions.onSave,
+        CustomTextField(
+            value = draft.homeResolver,
+            labelText = stringResource(R.string.split_dns_home_ip),
+            modifier = Modifier.testTag("split_dns_home_ip"),
+            keyboardType = KeyboardType.Uri,
+            isEnabled = enabled,
+            isValidValue =
+                draft.homeResolver.isEmpty() || HomeDnsResolver.parse(draft.homeResolver) != null,
+            isDigitsOnlyAllowed = false,
+            onValueChanged = { value -> onUpdate { it.copy(homeResolver = value) } },
+            onSubmit = {},
         )
-        PrimaryTextButton(
-            text = stringResource(android.R.string.cancel),
-            isEnabled = !state.saving,
-            onClick = actions.onCancel,
+        Text(
+            stringResource(R.string.split_dns_home_ip_help),
+            style = MaterialTheme.typography.bodyMedium,
         )
+        SplitDnsHomeNetworkPicker(draft.localRuleId, rules) { id ->
+            onUpdate { it.copy(localRuleId = id) }
+        }
     }
 }
 
@@ -100,7 +157,7 @@ private fun SplitDnsDomainField(
                 value = row.text,
                 labelText = stringResource(R.string.split_dns_domain),
                 modifier = Modifier.weight(1f).testTag("split_dns_domain_$index"),
-                keyboardType = KeyboardType.Text,
+                keyboardType = KeyboardType.Uri,
                 isEnabled = enabled,
                 isValidValue = row.text.isEmpty() || row.canonical() != null,
                 isDigitsOnlyAllowed = false,
@@ -140,49 +197,52 @@ private fun SplitDnsDomainField(
     }
 }
 
+/** Lists the existing Local rules only; choosing one never edits or enables that rule. */
 @Composable
-private fun SplitDnsHomeFields(state: SplitDnsEditorUiState, actions: SplitDnsEditorActions) {
-    CustomTextField(
-        value = state.draft.homeResolver,
-        labelText = stringResource(R.string.split_dns_home_ip),
-        modifier = Modifier.testTag("split_dns_home_ip"),
-        keyboardType = KeyboardType.Text,
-        isEnabled = !state.saving,
-        isValidValue = true,
-        isDigitsOnlyAllowed = false,
-        onValueChanged = { value -> actions.onUpdate { it.copy(homeResolver = value) } },
-        onSubmit = {},
-    )
-    Text(
-        stringResource(R.string.split_dns_home_ip_help),
-        style = MaterialTheme.typography.bodyMedium,
-    )
-    Text(
-        stringResource(R.string.split_dns_home_network),
-        style = MaterialTheme.typography.titleSmall,
-        maxLines = 1,
-        overflow = TextOverflow.Ellipsis,
-    )
-    PrimaryTextButton(
-        text = state.homeNetworkLabel,
-        isEnabled = !state.saving,
-        onClick = actions.onChooseHomeNetwork,
-    )
+private fun SplitDnsHomeNetworkPicker(
+    selectedId: String?,
+    rules: List<LocalBypassRule>,
+    onSelect: (String) -> Unit,
+) {
+    val selected = rules.find { it.id.toString() == selectedId }
+    MullvadExposedDropdownMenuBox(
+        modifier = Modifier.testTag("split_dns_home_network"),
+        label = stringResource(R.string.split_dns_home_network),
+        title = selected?.networkLabel() ?: stringResource(R.string.split_dns_choose_home_network),
+        colors = mullvadDarkTextFieldColors(),
+    ) { close ->
+        rules.forEach { rule ->
+            DropdownMenuItem(
+                modifier = Modifier.testTag("split_dns_home_network_${rule.id}"),
+                colors = menuItemColors,
+                text = { Text(rule.networkLabel(), style = MaterialTheme.typography.bodyLarge) },
+                onClick = {
+                    close()
+                    onSelect(rule.id.toString())
+                },
+            )
+        }
+    }
 }
 
 @Composable
-private fun SplitDnsNotes(onPrivateDnsSettings: () -> Unit) {
-    Text(
-        stringResource(R.string.split_dns_no_fallback),
-        style = MaterialTheme.typography.bodyMedium,
+private fun LocalBypassRule.networkText(): String? =
+    ssidIds
+        .takeIf { it.isNotEmpty() }
+        ?.let { ids ->
+            stringResource(R.string.local_access_wifi, ids.joinToString(", ") { it.displayText() })
+        }
+
+/** The rule as the Local rules list shows it: its name and the network it applies to. */
+@Composable
+internal fun LocalBypassRule.networkLabel(): String =
+    stringResource(
+        R.string.split_dns_rule_network,
+        name.ifEmpty { stringResource(R.string.local_access_unnamed) },
+        networkText() ?: stringResource(R.string.local_access_any_network),
     )
-    Text(stringResource(R.string.split_dns_route_help), style = MaterialTheme.typography.bodyMedium)
-    Text(
-        stringResource(R.string.split_dns_private_dns),
-        style = MaterialTheme.typography.bodyMedium,
-    )
-    PrimaryTextButton(
-        text = stringResource(R.string.split_dns_open_private_dns),
-        onClick = onPrivateDnsSettings,
-    )
-}
+
+@Composable
+private fun LocalBypassRule.usedOn(): String =
+    networkText()?.let { stringResource(R.string.split_dns_used_on, it) }
+        ?: stringResource(R.string.split_dns_used_on_any_network)

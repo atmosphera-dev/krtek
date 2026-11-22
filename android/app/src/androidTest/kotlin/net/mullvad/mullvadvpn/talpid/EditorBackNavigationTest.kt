@@ -16,7 +16,11 @@ import org.junit.jupiter.api.Assertions.assertFalse
 /** Owns the distinction between dismissing input and navigating a dirty editor. */
 @OptIn(ExperimentalTestApi::class)
 internal object EditorBackNavigationTest {
-    fun toDiscardDialog(instrumentation: Instrumentation, compose: ComposeUiTest) {
+    fun toDiscardDialog(
+        instrumentation: Instrumentation,
+        compose: ComposeUiTest,
+        editorField: String = "local_access_name",
+    ) {
         var phase = "before-back"
         var imeBefore: Boolean? = null
         try {
@@ -33,14 +37,7 @@ internal object EditorBackNavigationTest {
             imeBefore = imeVisible(instrumentation)
             if (imeBefore) {
                 phase = "hide-ime"
-                instrumentation.runOnMainSync {
-                    val activity =
-                        ActivityLifecycleMonitorRegistry.getInstance()
-                            .getActivitiesInStage(Stage.RESUMED)
-                            .filterIsInstance<MainActivity>()
-                            .single()
-                    checkNotNull(activity.window.insetsController).hide(WindowInsets.Type.ime())
-                }
+                hideIme(instrumentation)
                 compose.waitUntil(timeoutMillis = 15_000) { !imeVisible(instrumentation) }
             }
             assertFalse(imeVisible(instrumentation), "IME must be hidden before editor Back")
@@ -57,7 +54,7 @@ internal object EditorBackNavigationTest {
                 compose.onNode(hasTestTag(tag), useUnmergedTree = true).assertIsDisplayed()
             }
             // Back reached the editor rather than leaving its route or closing the draft.
-            compose.onNode(hasTestTag("local_access_name"), useUnmergedTree = true).assertExists()
+            compose.onNode(hasTestTag(editorField), useUnmergedTree = true).assertExists()
         } catch (failure: Throwable) {
             if (failure !is AssertionError && failure !is ComposeTimeoutException) throw failure
             // Never export an arbitrary semantics tree, which can contain account data.
@@ -68,7 +65,16 @@ internal object EditorBackNavigationTest {
         }
     }
 
-    private fun imeVisible(instrumentation: Instrumentation): Boolean {
+    fun hideIme(instrumentation: Instrumentation) = instrumentation.runOnMainSync {
+        val activity =
+            ActivityLifecycleMonitorRegistry.getInstance()
+                .getActivitiesInStage(Stage.RESUMED)
+                .filterIsInstance<MainActivity>()
+                .single()
+        checkNotNull(activity.window.insetsController).hide(WindowInsets.Type.ime())
+    }
+
+    fun imeVisible(instrumentation: Instrumentation): Boolean {
         var visible = false
         instrumentation.runOnMainSync {
             val activity =

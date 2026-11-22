@@ -23,6 +23,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
@@ -36,6 +37,7 @@ import net.mullvad.mullvadvpn.core.Navigator
 import net.mullvad.mullvadvpn.lib.common.Lc
 import net.mullvad.mullvadvpn.lib.common.compose.CollectSideEffectWithLifecycle
 import net.mullvad.mullvadvpn.lib.common.compose.unlessIsDetail
+import net.mullvad.mullvadvpn.lib.common.util.openNetworkSettings
 import net.mullvad.mullvadvpn.lib.model.FeatureIndicator
 import net.mullvad.mullvadvpn.lib.ui.component.Accordion
 import net.mullvad.mullvadvpn.lib.ui.component.ScaffoldWithSmallTopBar
@@ -77,6 +79,7 @@ fun SharedTransitionScope.LocalNetworkSharing(
     val viewModel = koinViewModel<LocalNetworkSharingViewModel> { parametersOf(isModal) }
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val requestAccess = localPermissionRequester()
+    val context = LocalContext.current
     CollectSideEffectWithLifecycle(viewModel.uiSideEffect) { requestAccess(it.needsWifi) }
 
     val actions =
@@ -94,6 +97,17 @@ fun SharedTransitionScope.LocalNetworkSharing(
             onCancelDelete = { viewModel.requestDelete(null) },
             onConnectedWifi = viewModel::useConnectedWifi,
             onRequestAccess = requestAccess,
+            splitDns =
+                SplitDnsActions(
+                    onEnabled = { viewModel.onSplitDns(SplitDnsAction.Enabled(it)) },
+                    onEdit = { viewModel.onSplitDns(SplitDnsAction.Edit) },
+                    onUpdate = { viewModel.onSplitDns(SplitDnsAction.Update(it)) },
+                    onSave = { viewModel.onSplitDns(SplitDnsAction.Save) },
+                    onClose = { viewModel.onSplitDns(SplitDnsAction.Close) },
+                    onDiscard = { viewModel.onSplitDns(SplitDnsAction.Discard) },
+                    onKeep = { viewModel.onSplitDns(SplitDnsAction.Keep) },
+                    onPrivateDnsSettings = { context.openNetworkSettings() },
+                ),
         )
 
     LocalNetworkSharingScreen(
@@ -118,9 +132,14 @@ fun LocalNetworkSharingScreen(
     modifier: Modifier = Modifier,
     policyActions: LocalPolicyActions = LocalPolicyActions(),
 ) {
-    val editing = (state as? Lc.Content)?.value?.editor?.draft != null
-    val onBack = { if (editing) policyActions.onClose() else onBackClick() }
-    BackHandler(enabled = editing, onBack = policyActions.onClose)
+    val content = (state as? Lc.Content)?.value
+    val editing = content?.editing == true
+    // The rule editor and the split DNS editor are never open together.
+    val closeEditor =
+        if (content?.editor?.draft == null) policyActions.splitDns.onClose
+        else policyActions.onClose
+    val onBack = { if (editing) closeEditor() else onBackClick() }
+    BackHandler(enabled = editing, onBack = closeEditor)
     ScaffoldWithSmallTopBar(
         appBarTitle = stringResource(id = R.string.local_network_sharing),
         modifier = modifier,
