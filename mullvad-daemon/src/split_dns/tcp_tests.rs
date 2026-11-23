@@ -91,6 +91,8 @@ fn session(
     let sink = capture.capability().sink().unwrap();
     let scope = ReceiveScope::new(source.ip(), resolver.ip(), buffers).unwrap();
     let session = Arc::new(Session {
+        system: None,
+        partial: false,
         live: AtomicBool::new(true),
         flow: Flow {
             source,

@@ -6,6 +6,7 @@ pub type DnsFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// No descriptor access, second reader, route classifier or physical authority.
 pub trait DnsReceiver: Send {
+    fn set_partial(&mut self, _partial: bool) {}
     /// A cheap candidate test, before allocating the demand-bound Local arena.
     fn candidate(&self, bytes: &[u8], advertised: &[IpAddr]) -> bool;
     /// true consumes this packet; false retains its original normal IP path.

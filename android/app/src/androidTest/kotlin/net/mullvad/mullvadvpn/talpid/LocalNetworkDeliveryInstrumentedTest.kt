@@ -3697,10 +3697,26 @@ class LocalNetworkDeliveryInstrumentedTest {
                     }
                     if (
                         frontend &&
-                            routes == expected &&
-                            CaptureReadiness.dnsMatches(
+                            routes ==
+                                expected +
+                                    (if (policy.splitDns.enabled && requiredDns != null)
+                                        requiredDns
+                                            .map {
+                                                canonicalPrefix("$it/${if (':' in it) 128 else 32}")
+                                            }
+                                            .toSet()
+                                    else emptySet()) &&
+                            CaptureReadiness.configurationReady(
+                                true,
                                 dns,
-                                CaptureReadiness.DnsExpectation.Absent,
+                                1280,
+                                routes,
+                                expected,
+                                dnsExpectation =
+                                    if (policy.splitDns.enabled && requiredDns != null)
+                                        CaptureReadiness.DnsExpectation.Present
+                                    else CaptureReadiness.DnsExpectation.Absent,
+                                requiredDns = requiredDns,
                             ) &&
                             iface != null &&
                             netId != null
@@ -3716,7 +3732,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                         report("frontend_interface", iface)
                         report("frontend_net_id", netId)
                         report("frontend_routes", routes.sorted().joinToString(","))
-                        report("frontend_dns", "[]")
+                        report("frontend_dns", dns.ifBlank { "[]" })
                         report(
                             "frontend_bookkeeping_routes",
                             (allRoutes intersect bookkeeping).sorted().joinToString(","),
@@ -3727,7 +3743,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                         return@withTimeout AppliedCapture(
                             addresses,
                             routeTypes.filter { it.prefix !in bookkeeping }.toSet(),
-                            "[]",
+                            dns.ifBlank { "[]" },
                             1280,
                             uids,
                             generation,

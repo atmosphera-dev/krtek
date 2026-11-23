@@ -39,6 +39,15 @@ use tokio::{
 };
 
 pub trait FrontendPlatform: Send + Sync + 'static {
+    fn system_dns(&self) -> Option<SystemDnsSnapshot> {
+        None
+    }
+    fn system_dns_current(&self, _token: i64) -> bool {
+        false
+    }
+    fn prepare_system_dns(&self, _fd: i32, _token: i64) -> io::Result<()> {
+        Err(io::ErrorKind::PermissionDenied.into())
+    }
     fn open(
         &self,
         generation: i64,
@@ -71,6 +80,17 @@ pub trait FrontendPlatform: Send + Sync + 'static {
     /// Release platform ownership after descriptor closure. Must be idempotent:
     /// an error may mean the call never arrived, or that its acknowledgement failed.
     fn closed(&self, generation: i64) -> io::Result<()>;
+}
+
+/// Runtime-only non-VPN resolver snapshot. The token is retired before a
+/// changed/default-lost network can publish a successor with identical values.
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(target_os = "android", derive(jnix::FromJava))]
+#[cfg_attr(target_os = "android", jnix(package = "net.mullvad.talpid.model"))]
+pub struct SystemDnsSnapshot {
+    pub token: i64,
+    pub dns_servers: Vec<std::net::IpAddr>,
+    pub interface_index: i32,
 }
 
 pub struct CaptureHandover {

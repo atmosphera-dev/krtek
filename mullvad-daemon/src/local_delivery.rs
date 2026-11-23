@@ -805,6 +805,9 @@ pub trait DeliveryOwner {
 pub trait FrontendFactory: Send + Sync {
     type Owner: DeliveryOwner + Send;
     fn supported(&self) -> bool;
+    fn partial_dns(&self) -> Vec<IpAddr> {
+        vec![]
+    }
     fn start(
         &self,
         config: DeliveryConfig,
@@ -953,6 +956,9 @@ enum Readiness {
 }
 
 impl<F: FrontendFactory> Delivery<F> {
+    pub fn partial_dns(&self) -> Vec<IpAddr> {
+        self.factory.partial_dns()
+    }
     pub fn supported(&self) -> bool {
         self.factory.supported()
     }

@@ -311,7 +311,9 @@ route/family union added afterward. A missing target family is not advertised
 unless Local needs it; that extra family captures and drops non-Local traffic,
 never enabling a physical internet fallback. For an IPv4-only target below 1280,
 Local IPv6 requires a capture-only MTU floor of 1280; the target/carrier MTU is
-unchanged. Local-only capture uses MTU 1280, enabled CIDRs only and no DNS. The
+unchanged. Partial capture uses MTU 1280 and enabled CIDRs. With split DNS enabled,
+Android 10+ adds the non-VPN default resolver list and its exact host routes;
+Android 9 retains the DNS-free Partial profile. The
 upstream safe blocking MTU is separately 1380. These app-facing address values
 are independent of Mullvad login, key rotation and tunnel assignment.
 Tunnel targets translate to their own assigned addresses; Local uses protected,
@@ -347,6 +349,16 @@ readiness, but does not invalidate an exactly observed Local capture epoch.
 DNS and LAN subtraction use the upstream projection once; DNS resolvers are not
 globally recaptured or reserved from an explicit Local rule. Mullvad's real gateway
 and SOCKS exceptions remain reserved.
+
+Partial unlisted DNS uses its own runtime-only system authority, never a Home
+grant or a saved Mullvad target. A non-VPN default-network incarnation supplies
+the original resolver list. Every query and I/O checks Android's live lockdown
+gate; only an allowed query can protect and bind to that network. Revoked
+incarnations, changed capture sinks and Partial/full transitions retire old work.
+TCP classifies each framed message separately, so blocked Ordinary messages do
+not acquire Home authority. Connected UDP passthrough and unprotected TCP
+upstreams are unchanged. The system authority uses the same joined-preparation
+mechanism and credited message/reply storage, and closes with the capture owner.
 
 Managed selection and current Local routes are initialized before tunnel startup.
 Normal Connect/Reconnect commands go directly to the upstream tunnel state machine;

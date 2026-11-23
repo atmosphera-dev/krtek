@@ -84,7 +84,22 @@ pub(super) async fn exchange<P: RuntimeProvider>(
         return Err(ExchangeError::Malformed);
     }
 
-    let reply = P::Timer::timeout(timeout, async move {
+    let reply = exchange_bytes(provider, resolver, protocol, timeout, bytes).await?;
+
+    restore_client_id(reply, client_id)
+}
+
+/// Ordinary forwarding preserves the complete original wire message, including
+/// its ID and compression. No retry, alternate upstream or TC fallback.
+pub(super) async fn exchange_bytes<P: RuntimeProvider>(
+    provider: P,
+    resolver: SocketAddr,
+    protocol: Protocol,
+    timeout: Duration,
+    bytes: Vec<u8>,
+) -> Result<DnsResponse, ExchangeError> {
+    let request = decode_message(&bytes)?;
+    P::Timer::timeout(timeout, async move {
         match protocol {
             Protocol::Udp => {
                 let ip = if resolver.is_ipv4() {
@@ -121,9 +136,7 @@ pub(super) async fn exchange<P: RuntimeProvider>(
             }
         }
     })
-    .await??;
-
-    restore_client_id(reply, client_id)
+    .await?
 }
 
 /// Decode exactly one complete library message; Hickory's convenience

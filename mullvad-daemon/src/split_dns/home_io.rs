@@ -31,7 +31,7 @@ const CAPABILITY_BYTES: usize = 4096;
 
 /// Private injection seam: production construction below accepts only the
 /// existing Home query grant, not an arbitrary physical resolver address.
-trait Capability: Send + Sync {
+pub(super) trait Capability: Send + Sync {
     fn destination(&self) -> SocketAddr;
     fn permits(&self, tcp: bool) -> bool;
     fn current(&self) -> bool;
@@ -130,7 +130,10 @@ impl HomeIoOwner {
         }
     }
 
-    fn with_capability(&self, capability: Arc<dyn Capability>) -> io::Result<HomeRuntime> {
+    pub(super) fn with_capability(
+        &self,
+        capability: Arc<dyn Capability>,
+    ) -> io::Result<HomeRuntime> {
         if !capability.current() || self.preparations.lock().unwrap().closed {
             return Err(revoked());
         }

@@ -2,6 +2,7 @@ package net.mullvad.talpid
 
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
+import android.os.Build
 import android.os.ParcelFileDescriptor
 import androidx.annotation.CallSuper
 import androidx.core.content.getSystemService
@@ -46,6 +47,7 @@ open class TalpidVpnService : LifecycleVpnService() {
     }
 
     private lateinit var localNetworkWatcher: LocalNetworkWatcher
+    private lateinit var systemDnsAuthority: SystemDnsAuthority
     private val localNetworkDemand = LocalNetworkDemand {
         if (it) localNetworkWatcher.start() else localNetworkWatcher.stop()
     }
@@ -85,12 +87,19 @@ open class TalpidVpnService : LifecycleVpnService() {
             )
         connectivityListener.register(lifecycleScope)
         localNetworkWatcher = LocalNetworkWatcher(AndroidLocalNetworkSource(this), lifecycleScope)
+        systemDnsAuthority =
+            SystemDnsAuthority(
+                { Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || isLockdownEnabled },
+                ::protect,
+            )
+        getSystemService<ConnectivityManager>()?.registerDefaultNetworkCallback(systemDnsAuthority)
     }
 
     @CallSuper
     override fun onDestroy() {
         synchronized(this) { invalidateCaptureObservation() }
         localNetworkWatcher.stop()
+        getSystemService<ConnectivityManager>()?.unregisterNetworkCallback(systemDnsAuthority)
         super.onDestroy()
     }
 
@@ -167,9 +176,10 @@ open class TalpidVpnService : LifecycleVpnService() {
         generation: Long,
         routes: Array<String>,
         excludedPackages: Array<String> = emptyArray(),
+        dnsServers: ArrayList<InetAddress> = arrayListOf(),
     ): CreateTunResult =
         synchronized(this) {
-            val config = LocalFrontendConfig.parse(routes) ?: return EstablishError
+            val config = LocalFrontendConfig.parse(routes, dnsServers) ?: return EstablishError
             openFrontend(generation) {
                 createLocalFrontend(generation, config, excludedPackages) {}
             }
@@ -189,10 +199,11 @@ open class TalpidVpnService : LifecycleVpnService() {
         generation: Long,
         routes: Array<String>,
         excludedPackages: Array<String> = emptyArray(),
+        dnsServers: ArrayList<InetAddress> = arrayListOf(),
     ): CaptureHandoverResult =
         synchronized(this) {
             val config =
-                LocalFrontendConfig.parse(routes)
+                LocalFrontendConfig.parse(routes, dnsServers)
                     ?: return CaptureHandoverResult(
                         EstablishError,
                         localFrontendOwnership.predecessorCurrent(predecessor),
@@ -370,6 +381,7 @@ open class TalpidVpnService : LifecycleVpnService() {
             { builder.addRoute(InetAddress.getByAddress(it.networkBytes()), it.prefix) },
         )
         builder.setMtu(LOCAL_ONLY_MTU)
+        config.dnsServers.forEach { builder.addDnsServer(it) }
         builder.setBlocking(false)
         builder.setMeteredIfSupported(false)
         builder.excludeApplications(excludedPackages.asList())
@@ -413,6 +425,20 @@ open class TalpidVpnService : LifecycleVpnService() {
         }
 
     protected open fun onLocalFrontendChanged(active: Boolean) = Unit
+
+    @Suppress("Unused")
+    fun systemDnsSnapshot(): net.mullvad.talpid.model.SystemDnsSnapshot? =
+        systemDnsAuthority.snapshot()
+
+    @Suppress("Unused")
+    fun systemDnsCurrent(token: Long): Boolean = systemDnsAuthority.current(token)
+
+    @Suppress("Unused")
+    fun prepareSystemDns(fd: Int, token: Long): Int =
+        synchronized(this) {
+            if (localFrontendOwnership.canPrepare) systemDnsAuthority.prepare(fd, token)
+            else LocalSocketPreparation.INACTIVE
+        }
 
     protected fun hasOpenTun(): Boolean = synchronized(this) { activeTunStatus?.isOpen == true }
 

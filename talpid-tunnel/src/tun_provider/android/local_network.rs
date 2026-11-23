@@ -2,7 +2,7 @@
 use super::{Error, VpnServiceConfig};
 use crate::tun_provider::AppliedTun;
 use jnix::{
-    IntoJava, JnixEnv,
+    FromJava, IntoJava, JnixEnv,
     jni::objects::{AutoLocal, JObject, JValue},
 };
 use std::os::fd::RawFd;
@@ -14,7 +14,7 @@ use jni_call::handled;
 pub const METHODS: [(&str, &str); 9] = [
     (
         "openLocalFrontend",
-        "(J[Ljava/lang/String;[Ljava/lang/String;)Lnet/mullvad/talpid/model/CreateTunResult;",
+        "(J[Ljava/lang/String;[Ljava/lang/String;Ljava/util/ArrayList;)Lnet/mullvad/talpid/model/CreateTunResult;",
     ),
     ("finishLocalFrontend", "(J)V"),
     ("isLocalFrontendActive", "()Z"),
@@ -26,7 +26,7 @@ pub const METHODS: [(&str, &str); 9] = [
     ("bindLocalFrontend", "(JLjava/lang/String;)Z"),
     (
         "handoverLocalFrontend",
-        "(JJ[Ljava/lang/String;[Ljava/lang/String;)Lnet/mullvad/talpid/model/CaptureHandoverResult;",
+        "(JJ[Ljava/lang/String;[Ljava/lang/String;Ljava/util/ArrayList;)Lnet/mullvad/talpid/model/CaptureHandoverResult;",
     ),
     (
         "handoverSecuredFrontend",
@@ -110,6 +110,54 @@ pub struct LocalNetworkPlatform {
 }
 
 impl LocalNetworkPlatform {
+    pub fn system_dns_snapshot(
+        &self,
+    ) -> Result<Option<crate::android_frontend::SystemDnsSnapshot>, Error> {
+        let env = JnixEnv::from(
+            self.context
+                .jvm
+                .attach_current_thread_as_daemon()
+                .map_err(Error::AttachJvmToThread)?,
+        );
+        handled(&env, "systemDnsSnapshot", || {
+            let result = env
+                .call_method(
+                    self.context.vpn_service.as_obj(),
+                    "systemDnsSnapshot",
+                    "()Lnet/mullvad/talpid/model/SystemDnsSnapshot;",
+                    &[],
+                )
+                .map_err(|e| Error::CallMethod("systemDnsSnapshot", e))?;
+            Ok(FromJava::from_java(&env, result))
+        })
+    }
+    pub fn system_dns_call(&self, token: i64, fd: Option<i32>) -> Result<bool, Error> {
+        let env = self
+            .context
+            .jvm
+            .attach_current_thread_as_daemon()
+            .map_err(Error::AttachJvmToThread)?;
+        let (name, sig, args) = match fd {
+            None => ("systemDnsCurrent", "(J)Z", vec![JValue::Long(token)]),
+            Some(fd) => (
+                "prepareSystemDns",
+                "(IJ)I",
+                vec![JValue::Int(fd), JValue::Long(token)],
+            ),
+        };
+        handled(&env, name, || {
+            let result = env
+                .call_method(self.context.vpn_service.as_obj(), name, sig, &args)
+                .map_err(|e| Error::CallMethod(name, e))?;
+            match fd {
+                None => result.z().map_err(|e| Error::CallMethod(name, e)),
+                Some(_) => result
+                    .i()
+                    .map(|code| code == 0)
+                    .map_err(|e| Error::CallMethod(name, e)),
+            }
+        })
+    }
     pub fn new(context: AndroidContext) -> Self {
         Self { context }
     }
@@ -148,6 +196,7 @@ impl LocalNetworkPlatform {
         handled(&env, name, || {
             let routes = string_array(&env, name, &config.routes)?;
             let excluded = string_array(&env, name, &config.excluded_packages)?;
+            let dns = config.dns_servers.clone().into_java(&env);
             let result = env
                 .call_method(
                     self.context.vpn_service.as_obj(),
@@ -157,6 +206,7 @@ impl LocalNetworkPlatform {
                         JValue::Long(generation),
                         JValue::Object(routes.as_obj()),
                         JValue::Object(excluded.as_obj()),
+                        JValue::Object(dns.as_obj()),
                     ],
                 )
                 .and_then(|value| value.l())
@@ -259,13 +309,14 @@ impl LocalNetworkPlatform {
                 FrontendHandoverConfig::Secured(_) => 7,
             }];
             handled(&env, name, || {
-                let (argument, excluded) = match config {
+                let (argument, excluded, dns) = match config {
                     FrontendHandoverConfig::Partial(config) => (
                         string_array(&env, name, &config.routes)?,
                         Some(string_array(&env, name, &config.excluded_packages)?),
+                        Some(config.dns_servers.clone().into_java(&env)),
                     ),
                     FrontendHandoverConfig::Secured(config) => {
-                        (VpnServiceConfig::new(config).into_java(&env), None)
+                        (VpnServiceConfig::new(config).into_java(&env), None, None)
                     }
                 };
                 let mut arguments = vec![
@@ -275,6 +326,9 @@ impl LocalNetworkPlatform {
                 ];
                 if let Some(excluded) = &excluded {
                     arguments.push(JValue::Object(excluded.as_obj()));
+                }
+                if let Some(dns) = &dns {
+                    arguments.push(JValue::Object(dns.as_obj()));
                 }
                 let result = env
                     .call_method(

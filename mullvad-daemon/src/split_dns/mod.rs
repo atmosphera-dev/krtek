@@ -1,6 +1,7 @@
-//! Selective connected UDP and per-message TCP DNS. Android's resolver list
-//! stays unchanged; Partial forwarding is a separate integration milestone.
+//! Selective UDP and per-message TCP DNS. Full capture keeps Android's resolver
+//! list; Partial uses the original non-VPN resolvers with a separate OS gate.
 
+mod system;
 mod tcp;
 mod tcp_egress;
 mod tcp_io;

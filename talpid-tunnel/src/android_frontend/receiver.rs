@@ -70,6 +70,7 @@ pub(super) trait Receiver<A: LocalAuthority>: Send {
         false
     }
     fn set_dns_servers(&mut self, _advertised: &[std::net::IpAddr]) {}
+    fn set_dns_partial(&mut self, _partial: bool) {}
     fn write_output(
         &mut self,
         session: Option<(&RelayCapture, &RelaySink)>,
@@ -185,6 +186,11 @@ impl<A: LocalAuthority> Receiver<A> for LocalReceiver<A> {
                 dns.reset_inputs();
             }
             self.dns_servers = advertised.to_vec();
+        }
+    }
+    fn set_dns_partial(&mut self, partial: bool) {
+        if let Some(dns) = &mut self.dns {
+            dns.set_partial(partial);
         }
     }
     fn revalidate(&mut self) {

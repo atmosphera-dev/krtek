@@ -1,6 +1,5 @@
-//! Capture-owned Home work. No task, TUN descriptor or Ordinary capability is
-//! created here. The sole frontend polls this owner and supplies checked writes.
-//! Selected by the full-capture UDP consumer; Partial and TCP are separate work.
+//! Capture-owned UDP work. No task or TUN descriptor is created here. Home and
+//! Partial Ordinary retain separate capabilities through their checked writes.
 
 use std::{
     collections::LinkedList,
@@ -48,6 +47,44 @@ pub(super) struct HomeUdpWork {
 }
 
 impl HomeUdpWork {
+    pub(super) fn submit_system(
+        &mut self,
+        system: Arc<super::system::SystemIo>,
+        input: CompletedDatagram,
+        scope: talpid_lan_forwarder::ReceiveScope,
+    ) -> Result<(), IpError> {
+        self.revalidate();
+        if self.closed || !self.capture.current() {
+            return Err(IpError::Stale);
+        }
+        let capture = self.capture.clone();
+        let buffers = self.buffers.clone();
+        let storage = buffers
+            .try_reserve(4 * (usize::from(u16::MAX) + 1) + 4096)
+            .map_err(|_| IpError::Full)?;
+        let packet = input.packet()?;
+        let flow = packet.flow;
+        let bytes = packet.payload.to_vec();
+        let answer = async move {
+            UdpQuery::system_answer(flow, bytes, scope, &system, capture, storage).await
+        };
+        let charge = self
+            .buffers
+            .try_reserve(
+                std::mem::size_of_val(&answer)
+                    + std::mem::size_of::<Pending>()
+                    + std::mem::size_of::<Output>()
+                    + 2 * BUFFER_OVERHEAD,
+            )
+            .map_err(|_| IpError::Full)?;
+        self.pending.push_back(Pending {
+            input,
+            answer: Box::pin(answer),
+            result: None,
+            charge,
+        });
+        Ok(())
+    }
     /// `replies` is the SAME arena used by Local output, not a new root budget.
     /// Inputs must retain their original immutable capture/policy receive scope.
     pub(super) fn new(

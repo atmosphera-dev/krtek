@@ -1,4 +1,4 @@
-//! Full-capture DNS attachment. Android DNS projection is never changed here.
+//! Capture-owned DNS attachment. Profile projection belongs to its capture owner.
 use super::home_path::HomeDnsPath;
 use super::{
     udp::{self, UdpDecision},
@@ -22,6 +22,7 @@ pub(crate) struct CaptureDns {
     path: Arc<dyn HomeDnsPath>,
     tcp: Option<super::tcp::TcpWork>,
     tcp_next: bool,
+    system: Option<Arc<super::system::SystemIo>>,
 }
 
 impl CaptureDns {
@@ -39,11 +40,30 @@ impl CaptureDns {
             path,
             tcp: None,
             tcp_next: false,
+            system: None,
         }
+    }
+    pub(crate) fn with_system(
+        mut self,
+        platform: Arc<dyn talpid_tunnel::android_frontend::FrontendPlatform>,
+    ) -> Self {
+        self.system = Some(Arc::new(super::system::SystemIo::new(
+            platform,
+            self.buffers.clone(),
+        )));
+        self
     }
 }
 
 impl DnsReceiver for CaptureDns {
+    fn set_partial(&mut self, partial: bool) {
+        if let Some(system) = &self.system {
+            system
+                .partial
+                .store(partial, std::sync::atomic::Ordering::Release);
+        }
+        self.revalidate();
+    }
     fn candidate(&self, bytes: &[u8], advertised: &[IpAddr]) -> bool {
         if let Ok(packet) = talpid_lan_forwarder::packet::parse(bytes)
             && let Some(current) = self.tcp.as_ref().and_then(|tcp| tcp.egress(packet.flow))
@@ -126,6 +146,7 @@ impl DnsReceiver for CaptureDns {
                             self.path.clone(),
                             capture.clone(),
                             mtu,
+                            self.system.clone(),
                         )
                         .ok();
                     }
@@ -146,7 +167,17 @@ impl DnsReceiver for CaptureDns {
             ) {
                 UdpDecision::PassThrough(original) => {
                     debug_assert_eq!(original, packet.payload);
-                    self.original = Some(input);
+                    if let Some(system) = &self.system
+                        && system.is_partial()
+                    {
+                        let _ = self.work.as_mut().expect("DNS work owner").submit_system(
+                            system.clone(),
+                            input,
+                            scope.clone(),
+                        );
+                    } else {
+                        self.original = Some(input);
+                    }
                 }
                 UdpDecision::Drop => {}
                 UdpDecision::Intercept(query) => {
@@ -273,6 +304,9 @@ impl DnsReceiver for CaptureDns {
                 work.close().await?;
             }
             self.receiver.take();
+            if let Some(system) = &self.system {
+                system.io.close().await?;
+            }
             Ok(())
         })
     }

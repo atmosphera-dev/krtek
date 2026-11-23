@@ -38,12 +38,14 @@ type Work = Pin<Box<dyn Future<Output = Result<(), ExchangeError>> + Send>>;
 enum Guard {
     Home(Arc<dyn HomeDnsQuery>),
     Ordinary(Arc<OwnedTcp>),
+    System(Arc<super::system::SystemQuery>),
 }
 impl Guard {
     fn current(&self) -> bool {
         match self {
             Self::Home(home) => home.current(),
             Self::Ordinary(socket) => socket.current(),
+            Self::System(query) => query.current(),
         }
     }
 }
@@ -63,12 +65,18 @@ struct Session {
     capture: RelayCapture,
     sink: RelaySink,
     matcher: Arc<SuffixMatcher>,
+    system: Option<Arc<super::system::SystemIo>>,
+    partial: bool,
     replies: Mutex<Replies>,
     _storage: Arc<dyn RelayBufferReservation>,
 }
 impl Session {
     fn current(&self) -> bool {
         let current = self.live.load(Ordering::Acquire)
+            && self
+                .system
+                .as_ref()
+                .is_none_or(|system| system.is_partial() == self.partial)
             && self.scope.current()
             && self.capture.current()
             && self
@@ -180,6 +188,7 @@ struct Owner {
     capture: RelayCapture,
     path: Arc<dyn HomeDnsPath>,
     registry: Arc<Registry>,
+    system: Option<Arc<super::system::SystemIo>>,
     buffers: Arc<dyn RelayBufferAllocator>,
     sessions: Mutex<HashMap<Flow, Weak<Session>>>,
     pending: Mutex<LinkedList<Pending>>,
@@ -229,6 +238,11 @@ impl LocalAuthority for Owner {
             capture: self.capture.clone(),
             sink,
             matcher,
+            system: self.system.clone(),
+            partial: self
+                .system
+                .as_ref()
+                .is_some_and(|system| system.is_partial()),
             replies: Mutex::new(Replies {
                 end: 0,
                 pending: LinkedList::new(),
@@ -326,11 +340,19 @@ async fn serve(
                 }
             }
             Ok(DnsLane::Ordinary) => {
+                if session.partial {
+                    let system = session.system.as_ref().ok_or(ExchangeError::Closed)?;
+                    // Lockdown denies this message, not Home on the same stream.
+                    let Ok(query) = system.authorize(session.flow.destination, true, session.scope.clone(), session.capture.clone()) else { continue; };
+                    let Ok(reply) = query.exchange(&system.io, bytes).await else { continue; };
+                    (reply, Some(Guard::System(query)))
+                } else {
                 // This branch receives original bytes, not request.to_vec().
                 // It never uses Home preparation or a protected retry.
                 match tokio::time::timeout(DEADLINE, ordinary(&session, &registry, bytes, &request, &*buffers)).await {
                     Ok(Ok((reply, socket))) => (reply, Some(Guard::Ordinary(socket))),
                     _ => (failure(&request, ResponseCode::ServFail)?, None),
+                }
                 }
             }
         };
@@ -397,12 +419,14 @@ impl TcpWork {
         path: Arc<dyn HomeDnsPath>,
         capture: RelayCapture,
         mtu: u16,
+        system: Option<Arc<super::system::SystemIo>>,
     ) -> Result<Self, Refused> {
         let owner = Arc::new(Owner {
             delivery,
             capture,
             path,
             registry: Arc::default(),
+            system,
             buffers: buffers.clone(),
             sessions: Mutex::default(),
             pending: Mutex::default(),

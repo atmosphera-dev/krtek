@@ -18,6 +18,11 @@ impl FrontendFactory for PlatformFactory {
     fn supported(&self) -> bool {
         true
     }
+    fn partial_dns(&self) -> Vec<IpAddr> {
+        self.0
+            .system_dns()
+            .map_or_else(Vec::new, |snapshot| snapshot.dns_servers)
+    }
     fn start(
         &self,
         config: DeliveryConfig,
@@ -33,7 +38,8 @@ impl FrontendFactory for PlatformFactory {
             authority.clone(),
             buffers.clone(),
             home.clone(),
-        );
+        )
+        .with_system(self.0.clone());
         let forwarder = LocalReceiver::new(move |mtu| {
             log::debug!("local-receiver-start capture_mtu={mtu}");
             Forwarder::with_mtu(receiver_authority.clone(), buffers.clone(), mtu)

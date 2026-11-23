@@ -3,13 +3,15 @@
 ## Implementation status
 
 Split DNS is configured in Settings > VPN settings > Local network sharing, below
-the Local rules. In this revision it answers listed names while Krtek's full
-capture is active, that is while Mullvad is connected: plain DNS
-over UDP and TCP port 53 to a resolver Android was given is inspected there.
-While Mullvad is disconnected, Krtek does not yet capture DNS, so listed names
-are resolved the way Android resolves them without split DNS. That state, and
-the matching behavior under "Block connections without VPN", is a separate
-pending integration step. The contract below describes the complete feature.
+the Local rules. Plain UDP/TCP DNS to an advertised resolver is inspected while
+Krtek owns capture. With Mullvad off on Android 10+, Partial capture advertises
+and captures the non-VPN default network's resolver addresses. Listed names use
+the Home path or fail with SERVFAIL. Unlisted queries keep their original bytes
+and destination, using a protected socket bound to that underlying network only
+when Android's current "Block connections without VPN" setting is off. When it
+is on they are dropped, without granting the VPN provider's exemption to apps.
+Android 9 cannot expose this current OS gate: split DNS is paused in Partial,
+with Android handling DNS as for stock Mullvad. Full capture works on Android 9.
 
 ## Settings screen
 
@@ -82,8 +84,7 @@ remain necessary; DNS does not rewrite URLs, SNI or service identity.
   must not change them silently. Strict or Automatic Private DNS observations
   are not a compatibility promise. The settings button opens Android's network
   settings, where Private DNS is found; Android has no public direct link.
-- While Mullvad is disconnected, split DNS is not active yet (see Implementation
-  status).
+- Android 9 pauses split DNS while Mullvad is off; see Implementation status.
 - Apps outside Krtek's captured UID range or using hardcoded resolvers are not
   universally confined by this feature.
 - Android and apps cache answers, so a policy change need not change an app's

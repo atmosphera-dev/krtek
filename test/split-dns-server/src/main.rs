@@ -38,6 +38,8 @@ enum Command {
         nonce: String,
         #[arg(long)]
         id: u16,
+        #[arg(long)]
+        system: bool,
     },
 }
 
@@ -64,8 +66,8 @@ async fn main() -> std::io::Result<()> {
     match Arguments::parse().command {
         Command::Serve(args) => serve(args).await,
         Command::Finish { path, token } => server::publish_finish(&path, &token),
-        Command::TcpVectors { nonce, id } => {
-            println!("{}", tcp_vectors(&nonce, id)?);
+        Command::TcpVectors { nonce, id, system } => {
+            println!("{}", tcp_vectors_for(&nonce, id, system)?);
             Ok(())
         }
     }
@@ -73,7 +75,11 @@ async fn main() -> std::io::Result<()> {
 
 /// Stub-resolver queries, as an app's resolver sends them: recursion desired. A real
 /// ordinary resolver refuses non-recursive questions, and Home goldens echo the flag.
+#[cfg(test)]
 fn tcp_vectors(nonce: &str, id: u16) -> std::io::Result<serde_json::Value> {
+    tcp_vectors_for(nonce, id, false)
+}
+fn tcp_vectors_for(nonce: &str, id: u16, system: bool) -> std::io::Result<serde_json::Value> {
     use hickory_proto::{
         op::{Message, Query},
         rr::{Name, RecordType},
@@ -95,7 +101,14 @@ fn tcp_vectors(nonce: &str, id: u16) -> std::io::Result<serde_json::Value> {
     let mut vectors = Vec::new();
     for (offset, (name, home)) in [
         (format!("{nonce}-first.home."), true),
-        ("example.com.".into(), false),
+        (
+            if system {
+                format!("{nonce}.ordinary.test.")
+            } else {
+                "example.com.".into()
+            },
+            false,
+        ),
         (format!("{nonce}-last.home."), true),
     ]
     .into_iter()
@@ -109,11 +122,19 @@ fn tcp_vectors(nonce: &str, id: u16) -> std::io::Result<serde_json::Value> {
             RecordType::A,
         ));
         let query = request.to_vec().map_err(std::io::Error::other)?;
-        let expected = home.then(|| {
-            fixture::answer(&request, fixture::Role::Home, fixture::Protocol::Tcp)
-                .unwrap()
-                .to_vec()
-                .unwrap()
+        let expected = (home || system).then(|| {
+            fixture::answer(
+                &request,
+                if home {
+                    fixture::Role::Home
+                } else {
+                    fixture::Role::Ordinary
+                },
+                fixture::Protocol::Tcp,
+            )
+            .unwrap()
+            .to_vec()
+            .unwrap()
         });
         vectors.push(serde_json::json!({"query_hex":hex(&query), "expected_hex":expected.map(|bytes| hex(&bytes)), "home":home}));
     }
@@ -158,6 +179,19 @@ async fn serve(args: ServerArguments) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn partial_tcp_vectors_keep_a_distinct_exact_ordinary_answer() {
+        let vectors = super::tcp_vectors_for("systemControl", 65535, true).unwrap();
+        let messages = vectors["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert!(!messages[1]["home"].as_bool().unwrap());
+        assert!(
+            messages
+                .iter()
+                .all(|message| message["expected_hex"].as_str().is_some())
+        );
+        assert_ne!(messages[0]["expected_hex"], messages[1]["expected_hex"]);
+    }
     use hickory_proto::op::{Message, MessageType};
 
     fn decode(hex: &str) -> Message {

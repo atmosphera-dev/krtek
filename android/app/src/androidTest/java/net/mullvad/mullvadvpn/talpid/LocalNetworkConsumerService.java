@@ -1028,11 +1028,13 @@ public final class LocalNetworkConsumerService extends Service {
       socket.getOutputStream().flush();
       socket.shutdownOutput();
       java.io.DataInputStream input = new java.io.DataInputStream(socket.getInputStream());
+      boolean ordinaryBlocked = command.getBoolean("ordinary_blocked", false);
       for (int index = 0; index < 3; index++) {
+        if (ordinaryBlocked && index == 1) continue;
         byte[] reply = new byte[input.readUnsignedShort()];
         input.readFully(reply);
         java.nio.file.Files.write(new java.io.File(directory, "reply-" + index + ".bin").toPath(), reply);
-        if (index != 1) {
+        if (index != 1 || !messages.getJSONObject(index).isNull("expected_hex")) {
           byte[] expected = splitDnsWireBytes(messages.getJSONObject(index).getString("expected_hex"));
           java.nio.file.Files.write(new java.io.File(directory, "expected-" + index + ".bin").toPath(), expected);
           if (!Arrays.equals(reply, expected)) throw new IOException("Home reply differs from fixture-library golden at " + index);
@@ -1043,10 +1045,12 @@ public final class LocalNetworkConsumerService extends Service {
           if (!audit.envelopeValid || !audit.usableA) throw new IOException("Ordinary TCP answer: " + audit.classification);
         }
       }
+      if (ordinaryBlocked && input.read() != -1) throw new IOException("Blocked ordinary query produced a TCP reply");
       Bundle result = outcome("split-dns-tcp");
-      result.putInt("message_count", 3);
+      result.putInt("message_count", ordinaryBlocked ? 2 : 3);
       result.putInt("home_exact", 2);
-      result.putBoolean("ordinary_usable", true);
+      result.putBoolean("ordinary_usable", !ordinaryBlocked);
+      result.putBoolean("ordinary_blocked", ordinaryBlocked);
       result.putInt("local_port", socket.getLocalPort());
       result.putString("local_address", socket.getLocalAddress().getHostAddress());
       result.putString("evidence_dir", directory.getAbsolutePath());

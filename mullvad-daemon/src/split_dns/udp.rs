@@ -104,6 +104,7 @@ pub(super) struct HomeUdpReply {
     reply: UdpReply,
     request: Message,
     leases: [Option<Arc<dyn HomeDnsQuery>>; 2],
+    system: Option<Arc<super::system::SystemQuery>>,
     _storage: Arc<dyn RelayBufferReservation>,
 }
 
@@ -140,7 +141,9 @@ impl HomeUdpReply {
         &self,
         emit: impl FnOnce(SocketAddr, SocketAddr, &[u8]) -> T,
     ) -> Result<T, ExchangeError> {
-        if !self.leases.iter().flatten().all(|lease| lease.current()) {
+        if !self.leases.iter().flatten().all(|lease| lease.current())
+            || self.system.as_ref().is_some_and(|query| !query.current())
+        {
             return Err(ExchangeError::Closed);
         }
         Ok(emit(
@@ -210,6 +213,29 @@ impl HomeUdpOutput {
 }
 
 impl UdpQuery {
+    pub(super) async fn system_answer(
+        flow: talpid_lan_forwarder::Flow,
+        bytes: Vec<u8>,
+        scope: talpid_lan_forwarder::ReceiveScope,
+        system: &super::system::SystemIo,
+        capture: RelayCapture,
+        storage: Arc<dyn RelayBufferReservation>,
+    ) -> Result<HomeUdpReply, ExchangeError> {
+        let request = decode_message(&bytes)?;
+        let query = system.authorize(flow.destination, false, scope, capture)?;
+        let bytes = query.exchange(&system.io, bytes).await?;
+        Ok(HomeUdpReply {
+            reply: UdpReply {
+                source: flow.destination,
+                destination: flow.source,
+                bytes,
+            },
+            request,
+            leases: [None, None],
+            system: Some(query),
+            _storage: storage,
+        })
+    }
     pub(super) fn check_input(&self, input: &CompletedDatagram) -> Result<(), IpError> {
         let packet = input.packet()?;
         if packet.flow.transport != talpid_lan_forwarder::Transport::Udp
@@ -282,6 +308,7 @@ impl UdpQuery {
             reply,
             request: self.request,
             leases,
+            system: None,
             _storage: storage,
         };
         reply.with_current(|_, _, _| ())?;

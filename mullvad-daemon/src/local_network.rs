@@ -202,7 +202,9 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
                     authority.observe(event);
                 }
             }));
-            feed.set_policy_demand(!policy.announced_routes().is_empty());
+            feed.set_policy_demand(
+                policy.split_dns.enabled || !policy.announced_routes().is_empty(),
+            );
         }
         // Startup reconciles before exposing real delivery availability. Do not
         // project a failed/not-yet-started owner from the constructor.
@@ -301,7 +303,10 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
         }
         self.delivery.authority.update_policy(policy);
         if let Some(feed) = &self.feed {
-            feed.set_policy_demand(!self.shutting_down && !policy.announced_routes().is_empty());
+            feed.set_policy_demand(
+                !self.shutting_down
+                    && (policy.split_dns.enabled || !policy.announced_routes().is_empty()),
+            );
         }
         // The platform may synchronously withdraw its observation on the last
         // demand. Do not publish an old physical identity after that withdrawal.
@@ -321,14 +326,25 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
             self.blocking_config = None;
         }
         let partial = || {
-            let routes = policy
+            let mut routes = policy
                 .announced_routes()
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>();
+            let dns_servers = if policy.split_dns.enabled {
+                self.delivery.partial_dns()
+            } else {
+                vec![]
+            };
+            routes.extend(
+                dns_servers
+                    .iter()
+                    .map(|ip| ipnetwork::IpNetwork::from(*ip).to_string()),
+            );
             (!routes.is_empty()).then_some(DeliveryConfig::Partial(
                 talpid_tunnel::tun_provider::PartialConfig {
                     routes,
+                    dns_servers,
                     excluded_packages: if policy.skip_local_rules_for_excluded_apps {
                         self.excluded_packages.clone().unwrap_or_default()
                     } else {

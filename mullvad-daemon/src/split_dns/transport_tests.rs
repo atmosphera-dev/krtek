@@ -196,6 +196,41 @@ async fn hickory_udp_and_tcp_exchange_preserve_complete_message() {
 }
 
 #[tokio::test]
+async fn partial_ordinary_udp_and_tcp_preserve_original_bytes_and_response() {
+    for protocol in [Protocol::Udp, Protocol::Tcp] {
+        let (peer, server) = match protocol {
+            Protocol::Udp => udp_fixture(true).await,
+            Protocol::Tcp => tcp_fixture(true).await,
+        };
+        let mut request = question();
+        request.metadata.id = 65432;
+        let bytes = request.to_vec().unwrap();
+        let received = exchange_bytes(
+            FixtureRuntime::default(),
+            peer,
+            protocol,
+            Duration::from_secs(3),
+            bytes.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            received.as_buffer(),
+            response(request, true).to_vec().unwrap()
+        );
+        let sent = tokio::time::timeout(Duration::from_secs(4), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sent.to_vec().unwrap(),
+            bytes,
+            "Ordinary ID, flags, questions and options must not be rewritten"
+        );
+    }
+}
+
+#[tokio::test]
 async fn hickory_tcp_preserves_large_response() {
     let (peer, server) = tcp_fixture(true).await;
     let mut request = question();
