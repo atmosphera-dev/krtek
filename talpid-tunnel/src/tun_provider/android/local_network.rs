@@ -9,6 +9,7 @@ use std::os::fd::RawFd;
 use talpid_types::android::AndroidContext;
 mod descriptor;
 mod jni_call;
+mod system_dns;
 use jni_call::handled;
 
 pub const METHODS: [(&str, &str); 9] = [
@@ -128,7 +129,17 @@ impl LocalNetworkPlatform {
                     &[],
                 )
                 .map_err(|e| Error::CallMethod("systemDnsSnapshot", e))?;
-            Ok(FromJava::from_java(&env, result))
+            let object = result
+                .l()
+                .map_err(|e| Error::CallMethod("systemDnsSnapshot", e))?;
+            let object = env.auto_local(object);
+            system_dns::decode(&env, object.as_obj(), || {
+                crate::android_frontend::SystemDnsSnapshot::from_java(
+                    &env,
+                    JValue::Object(object.as_obj()),
+                )
+            })
+            .map_err(|()| Error::TunnelDeviceError)
         })
     }
     pub fn system_dns_call(&self, token: i64, fd: Option<i32>) -> Result<bool, Error> {

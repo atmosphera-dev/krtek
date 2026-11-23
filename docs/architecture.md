@@ -351,8 +351,12 @@ globally recaptured or reserved from an explicit Local rule. Mullvad's real gate
 and SOCKS exceptions remain reserved.
 
 Partial unlisted DNS uses its own runtime-only system authority, never a Home
-grant or a saved Mullvad target. A non-VPN default-network incarnation supplies
-the original resolver list. Every query and I/O checks Android's live lockdown
+grant or a saved Mullvad target. A passive NOT_VPN + INTERNET observation supplies
+the resolver list independently of the app default, which can be Krtek's VPN.
+Prefer the Local observer's unambiguous physical network; otherwise prefer
+validated networks, then Wi-Fi/Ethernet, refusing tied candidates. Incomplete
+observations do not select a network, and an empty selected resolver list never
+falls back to another network. Every query and I/O checks Android's live lockdown
 gate; only an allowed query can protect and bind to that network. Revoked
 incarnations, changed capture sinks and Partial/full transitions retire old work.
 TCP classifies each framed message separately, so blocked Ordinary messages do

@@ -25,13 +25,20 @@ class SystemDnsAuthorityTest {
             },
             supported = true,
         )
-    private val network = mockk<Network>()
+    private val network = mockk<Network> { every { networkHandle } returns 7L }
     private val dns = InetAddress.getByName("10.77.10.54")
 
     private fun ready(physical: Boolean = true, authority: SystemDnsAuthority = this.authority) {
-        val capabilities = mockk<NetworkCapabilities>()
+        val capabilities = mockk<NetworkCapabilities>(relaxed = true)
         every { capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) } returns
             physical
+        every { capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) } returns
+            true
+        every { capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_TRUSTED) } returns
+            true
+        every {
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
+        } returns true
         authority.onAvailable(network)
         authority.onCapabilitiesChanged(network, capabilities)
         val links = mockk<LinkProperties>(relaxed = true)

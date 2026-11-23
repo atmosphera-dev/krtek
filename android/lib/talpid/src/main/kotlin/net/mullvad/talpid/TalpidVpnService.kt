@@ -91,15 +91,16 @@ open class TalpidVpnService : LifecycleVpnService() {
             SystemDnsAuthority(
                 { Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || isLockdownEnabled },
                 ::protect,
+                localNetwork = { localNetworkWatcher.physicalNetworkHandle },
             )
-        getSystemService<ConnectivityManager>()?.registerDefaultNetworkCallback(systemDnsAuthority)
+        getSystemService<ConnectivityManager>()?.let(systemDnsAuthority::register)
     }
 
     @CallSuper
     override fun onDestroy() {
         synchronized(this) { invalidateCaptureObservation() }
         localNetworkWatcher.stop()
-        getSystemService<ConnectivityManager>()?.unregisterNetworkCallback(systemDnsAuthority)
+        systemDnsAuthority.close()
         super.onDestroy()
     }
 

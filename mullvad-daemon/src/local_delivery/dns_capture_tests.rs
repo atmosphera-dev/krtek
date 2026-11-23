@@ -1,4 +1,6 @@
 //! Real sole-fd reactor and managed carrier consumer, not a direct work-owner call.
+#[path = "dns_partial_capture_tests.rs"]
+mod partial;
 use super::*;
 use crate::split_dns::{
     ExchangeError, Protocol,

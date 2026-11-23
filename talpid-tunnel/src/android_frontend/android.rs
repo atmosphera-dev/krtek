@@ -9,7 +9,13 @@ use talpid_types::capture_network::{CaptureExpectation, CaptureNetworkFeed, Capt
 
 impl FrontendPlatform for LocalNetworkPlatform {
     fn system_dns(&self) -> Option<super::SystemDnsSnapshot> {
-        self.system_dns_snapshot().ok().flatten()
+        match self.system_dns_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                log::warn!("System DNS snapshot JNI failure: {error:?}");
+                None
+            }
+        }
     }
     fn system_dns_current(&self, token: i64) -> bool {
         self.system_dns_call(token, None).unwrap_or(false)

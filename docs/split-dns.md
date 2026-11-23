@@ -5,13 +5,18 @@
 Split DNS is configured in Settings > VPN settings > Local network sharing, below
 the Local rules. Plain UDP/TCP DNS to an advertised resolver is inspected while
 Krtek owns capture. With Mullvad off on Android 10+, Partial capture advertises
-and captures the non-VPN default network's resolver addresses. Listed names use
-the Home path or fail with SERVFAIL. Unlisted queries keep their original bytes
+and captures the passively selected non-VPN network's resolver addresses. Listed
+names use the Home path or fail with SERVFAIL. Unlisted queries keep their original bytes
 and destination, using a protected socket bound to that underlying network only
 when Android's current "Block connections without VPN" setting is off. When it
 is on they are dropped, without granting the VPN provider's exemption to apps.
 Android 9 cannot expose this current OS gate: split DNS is paused in Partial,
 with Android handling DNS as for stock Mullvad. Full capture works on Android 9.
+
+The physical network is the Local observer's unambiguous selection when available.
+Otherwise Krtek prefers validated networks, then Wi-Fi/Ethernet. Equal candidates
+leave Ordinary DNS unavailable rather than choosing by callback order. Observation
+is passive: Krtek does not request a new connection or add a network permission.
 
 ## Settings screen
 
