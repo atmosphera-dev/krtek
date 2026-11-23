@@ -1,5 +1,6 @@
 package net.mullvad.mullvadvpn.feature.lansharing.impl
 
+import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibilityScope
 import androidx.compose.animation.SharedTransitionScope
@@ -131,6 +132,7 @@ fun LocalNetworkSharingScreen(
     onBackClick: () -> Unit,
     modifier: Modifier = Modifier,
     policyActions: LocalPolicyActions = LocalPolicyActions(),
+    sdkInt: Int = Build.VERSION.SDK_INT,
 ) {
     val content = (state as? Lc.Content)?.value
     val editing = content?.editing == true
@@ -173,6 +175,7 @@ fun LocalNetworkSharingScreen(
                             state = state.value,
                             onLanSharingEnabled = onLocalNetworkSharingEnable,
                             policyActions = policyActions,
+                            sdkInt = sdkInt,
                         )
                     }
                 }
@@ -189,6 +192,7 @@ private fun LocalNetworkSharingContent(
     state: LocalNetworkSharingUiState,
     onLanSharingEnabled: (enable: Boolean) -> Unit,
     policyActions: LocalPolicyActions,
+    sdkInt: Int,
 ) {
     Column(modifier = Modifier.fillMaxWidth().padding(horizontal = Dimens.sideMarginNew)) {
         Image(
@@ -248,7 +252,7 @@ private fun LocalNetworkSharingContent(
             onCellClicked = onLanSharingEnabled,
         )
         HorizontalDivider(modifier = Modifier.padding(bottom = Dimens.mediumPadding))
-        LocalPolicyControls(state, policyActions)
+        LocalPolicyControls(state, policyActions, sdkInt)
     }
 }
 

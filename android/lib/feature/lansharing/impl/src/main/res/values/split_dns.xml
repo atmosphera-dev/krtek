@@ -4,6 +4,8 @@
     <string name="split_dns_enable">Use home DNS for listed domains</string>
     <string name="split_dns_used_on">Used on %1$s</string>
     <string name="split_dns_used_on_any_network">Used on any Wi-Fi or wired network</string>
+    <string name="split_dns_android_9_pause">On Android 9, split DNS pauses while Mullvad is
+    off.</string>
     <string name="split_dns_domains">Domains</string>
     <string name="split_dns_edit">Edit split DNS</string>
     <string name="split_dns_save">Save</string>

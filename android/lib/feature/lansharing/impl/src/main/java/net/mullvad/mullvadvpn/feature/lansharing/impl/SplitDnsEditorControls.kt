@@ -1,5 +1,6 @@
 package net.mullvad.mullvadvpn.feature.lansharing.impl
 
+import android.os.Build
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -33,7 +34,11 @@ import net.mullvad.mullvadvpn.lib.ui.theme.color.menuItemColors
 
 /** Saved split DNS summary below the Local rules. Callbacks decide what each control does. */
 @Composable
-internal fun SplitDnsSection(state: LocalNetworkSharingUiState, actions: SplitDnsActions) {
+internal fun SplitDnsSection(
+    state: LocalNetworkSharingUiState,
+    actions: SplitDnsActions,
+    sdkInt: Int,
+) {
     val split = state.policy.splitDns
     val rule = state.policy.rules.find { it.id == split.localRuleId }
     HorizontalDivider()
@@ -53,8 +58,12 @@ internal fun SplitDnsSection(state: LocalNetworkSharingUiState, actions: SplitDn
     )
     if (split.enabled && rule != null) {
         Text(rule.usedOn(), style = MaterialTheme.typography.bodyMedium)
-        val condition = state.status?.rules?.find { it.id == rule.id }?.state
-        Text(stringResource(condition.message()), style = MaterialTheme.typography.bodyMedium)
+    }
+    if (sdkInt == Build.VERSION_CODES.P) {
+        Text(
+            stringResource(R.string.split_dns_android_9_pause),
+            style = MaterialTheme.typography.bodyMedium,
+        )
     }
     split.homeResolver?.let {
         SplitDnsSummaryValue(R.string.split_dns_home_ip, listOf(it.numericAddress))

@@ -28,7 +28,11 @@ import net.mullvad.mullvadvpn.lib.ui.designsystem.PrimaryTextButton
 import net.mullvad.mullvadvpn.lib.ui.theme.Dimens
 
 @Composable
-internal fun LocalPolicyControls(state: LocalNetworkSharingUiState, actions: LocalPolicyActions) {
+internal fun LocalPolicyControls(
+    state: LocalNetworkSharingUiState,
+    actions: LocalPolicyActions,
+    sdkInt: Int,
+) {
     var confirmEnable by rememberSaveable { mutableStateOf(false) }
     Column(
         Modifier.fillMaxWidth().padding(bottom = Dimens.screenBottomMarginNew),
@@ -42,14 +46,14 @@ internal fun LocalPolicyControls(state: LocalNetworkSharingUiState, actions: Loc
                 ),
                 color = MaterialTheme.colorScheme.error,
             )
-            if (state.splitDnsRepairable) LocalPolicyBody(state, actions)
+            if (state.splitDnsRepairable) LocalPolicyBody(state, actions, sdkInt)
         } else {
             LocalPolicyHeader(
                 state,
                 onEnabled = { if (it) confirmEnable = true else actions.onEnabled(false) },
                 onExcludedAppsSkipLocalRules = actions.onExcludedAppsSkipLocalRules,
             )
-            LocalPolicyBody(state, actions)
+            LocalPolicyBody(state, actions, sdkInt)
         }
     }
     if (confirmEnable && state.policyEditable) {
@@ -70,7 +74,11 @@ internal fun LocalPolicyControls(state: LocalNetworkSharingUiState, actions: Loc
 
 /** Exactly one of: saving notice, rule list with Split DNS summary, rule editor, DNS editor. */
 @Composable
-private fun LocalPolicyBody(state: LocalNetworkSharingUiState, actions: LocalPolicyActions) {
+private fun LocalPolicyBody(
+    state: LocalNetworkSharingUiState,
+    actions: LocalPolicyActions,
+    sdkInt: Int,
+) {
     val dnsDraft = state.splitDnsEditor.draft
     when {
         state.saving -> Text(stringResource(R.string.local_access_saving))
@@ -80,7 +88,7 @@ private fun LocalPolicyBody(state: LocalNetworkSharingUiState, actions: LocalPol
         else -> {
             state.error?.let { Text(stringResource(it), color = MaterialTheme.colorScheme.error) }
             if (state.policyEditable) LocalRuleList(state, actions)
-            SplitDnsSection(state, actions.splitDns)
+            SplitDnsSection(state, actions.splitDns, sdkInt)
         }
     }
 }

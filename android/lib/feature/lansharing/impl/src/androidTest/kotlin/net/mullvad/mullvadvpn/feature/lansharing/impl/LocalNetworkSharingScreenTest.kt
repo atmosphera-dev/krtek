@@ -1,6 +1,9 @@
 package net.mullvad.mullvadvpn.feature.lansharing.impl
 
+import android.os.Build
 import androidx.compose.ui.test.ExperimentalTestApi
+import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsOff
 import androidx.compose.ui.test.assertIsOn
@@ -9,6 +12,7 @@ import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isToggleable
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -20,11 +24,17 @@ import io.mockk.MockKAnnotations
 import java.util.UUID
 import net.mullvad.mullvadvpn.lib.common.Lc
 import net.mullvad.mullvadvpn.lib.common.toLc
+import net.mullvad.mullvadvpn.lib.model.ConnectedWifi
+import net.mullvad.mullvadvpn.lib.model.ForwardingAvailability
 import net.mullvad.mullvadvpn.lib.model.HomeDnsResolver
 import net.mullvad.mullvadvpn.lib.model.LocalBypassRule
 import net.mullvad.mullvadvpn.lib.model.LocalCidr
 import net.mullvad.mullvadvpn.lib.model.LocalNetworkAccess
+import net.mullvad.mullvadvpn.lib.model.LocalNetworkStatus
+import net.mullvad.mullvadvpn.lib.model.LocalRuleState
+import net.mullvad.mullvadvpn.lib.model.LocalRuleStatus
 import net.mullvad.mullvadvpn.lib.model.SplitDnsPolicy
+import net.mullvad.mullvadvpn.lib.model.WifiUnknownReason
 import net.mullvad.mullvadvpn.lib.ui.tag.CIRCULAR_PROGRESS_INDICATOR_TEST_TAG
 import net.mullvad.mullvadvpn.screen.test.createEdgeToEdgeComposeExtension
 import net.mullvad.mullvadvpn.screen.test.setContentWithTheme
@@ -56,6 +66,7 @@ class LocalNetworkSharingScreenTest {
         onLocalNetworkSharingEnable: (Boolean) -> Unit = {},
         onBackClick: () -> Unit = {},
         policyActions: LocalPolicyActions = LocalPolicyActions(),
+        sdkInt: Int = Build.VERSION.SDK_INT,
     ) {
         setContentWithTheme {
             LocalNetworkSharingScreen(
@@ -63,6 +74,7 @@ class LocalNetworkSharingScreenTest {
                 onBackClick = onBackClick,
                 onLocalNetworkSharingEnable = onLocalNetworkSharingEnable,
                 policyActions = policyActions,
+                sdkInt = sdkInt,
             )
         }
     }
@@ -241,6 +253,38 @@ class LocalNetworkSharingScreenTest {
         onNodeWithText(copy(R.string.split_dns_private_dns)).performScrollTo().assertExists()
         onNodeWithTag("split_dns_private_dns_settings").performScrollTo().performClick()
         assertEquals(1, privateDns)
+    }
+
+    @Test fun splitDnsSummaryShouldExplainAndroid9Pause() = assertSplitDnsSummary(sdkInt = 28)
+
+    @Test
+    fun splitDnsSummaryShouldNotShowAndroid9NoteOnAndroid10() = assertSplitDnsSummary(sdkInt = 29)
+
+    @Test
+    fun splitDnsSummaryShouldNotShowAndroid9NoteOnCurrentAndroid() =
+        assertSplitDnsSummary(sdkInt = 37)
+
+    private fun assertSplitDnsSummary(sdkInt: Int) = composeExtension.use {
+        val state =
+            createDefaultUiState()
+                .copy(
+                    policy = LocalNetworkAccess(rules = listOf(homeRule), splitDns = splitDns),
+                    status =
+                        LocalNetworkStatus(
+                            revision = 1uL,
+                            observerAvailable = true,
+                            forwarding = ForwardingAvailability.Active,
+                            currentWifi = ConnectedWifi.Unknown(WifiUnknownReason.NotOnWifi),
+                            rules = listOf(LocalRuleStatus(homeRule.id, LocalRuleState.Forwarding)),
+                        ),
+                )
+        initScreen(state = state.toLc(), sdkInt = sdkInt)
+        // The Local rule keeps its status; the Split DNS summary must not repeat it.
+        onAllNodesWithText(copy(R.string.local_access_forwarding)).assertCountEquals(1)
+        onNodeWithText(copy(R.string.local_access_forwarding)).performScrollTo().assertIsDisplayed()
+        onNodeWithText(copy(R.string.split_dns_used_on_any_network)).assertExists()
+        val note = onNodeWithText(copy(R.string.split_dns_android_9_pause))
+        if (sdkInt == 28) note.performScrollTo().assertIsDisplayed() else note.assertDoesNotExist()
     }
 
     @Test
