@@ -45,7 +45,9 @@ import net.mullvad.talpid.util.UnderlyingConnectivityStatusResolver
 open class TalpidVpnService : LifecycleVpnService() {
     private fun Builder.establishObserved() = run {
         establishEntries.incrementAndGet()
-        establishSafe()
+        // Android's caller-scoped getter reports false before an established VPN
+        // exists. Establishment changes its validity without changing Settings.
+        establishSafe().onRight { lockdownObserver?.refresh() }
     }
 
     private lateinit var localNetworkWatcher: LocalNetworkWatcher

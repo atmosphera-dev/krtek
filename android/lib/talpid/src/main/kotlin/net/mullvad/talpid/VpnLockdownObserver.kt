@@ -29,15 +29,18 @@ internal class VpnLockdownObserver(
                 false,
                 this,
             )
-            onChange(false)
+            refresh()
         } catch (_: RuntimeException) {
             Logger.w("VPN lockdown observation unavailable; retaining blocking DNS coverage")
             publish(true)
         }
     }
 
+    override fun onChange(selfChange: Boolean) = refresh()
+
+    /** Settings and successful capture establishment both change the usable OS view. */
     @Synchronized
-    override fun onChange(selfChange: Boolean) {
+    fun refresh() {
         if (!closed) publish(runCatching(read).getOrDefault(true))
     }
 
