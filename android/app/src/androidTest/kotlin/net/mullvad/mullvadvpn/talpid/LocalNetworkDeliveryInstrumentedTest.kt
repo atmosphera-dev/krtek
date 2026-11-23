@@ -3537,6 +3537,7 @@ class LocalNetworkDeliveryInstrumentedTest {
         fixedCapture: Boolean = true,
         requiredMtu: Int? = null,
         requiredDns: Set<String>? = null,
+        partialLockdown: Boolean = false,
     ): AppliedCapture = runBlocking {
         val expected =
             policy.rules
@@ -3545,6 +3546,18 @@ class LocalNetworkDeliveryInstrumentedTest {
                 .map { canonicalPrefix(it.toString()) }
                 .toSet()
         val id = UUID.randomUUID().toString()
+        val partialRoutes =
+            if (partialLockdown) {
+                check(policy.splitDns.enabled && !requiredDns.isNullOrEmpty())
+                setOf(canonicalPrefix("0.0.0.0/0"), canonicalPrefix("::/0"))
+            } else {
+                expected +
+                    (if (policy.splitDns.enabled && requiredDns != null)
+                        requiredDns
+                            .map { canonicalPrefix("$it/${if (':' in it) 128 else 32}") }
+                            .toSet()
+                    else emptySet())
+            }
         val directory =
             File(target.filesDir, "krtek-probes").apply { check(isDirectory || mkdir()) }
         withTimeout(30_000) {
@@ -3697,15 +3710,9 @@ class LocalNetworkDeliveryInstrumentedTest {
                     }
                     if (
                         frontend &&
-                            routes ==
-                                expected +
-                                    (if (policy.splitDns.enabled && requiredDns != null)
-                                        requiredDns
-                                            .map {
-                                                canonicalPrefix("$it/${if (':' in it) 128 else 32}")
-                                            }
-                                            .toSet()
-                                    else emptySet()) &&
+                            routes == partialRoutes &&
+                            CaptureReadiness.forwardingPrefixes(routeTypes)
+                                .containsAll(partialRoutes) &&
                             CaptureReadiness.configurationReady(
                                 true,
                                 dns,
@@ -3721,7 +3728,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                             iface != null &&
                             netId != null
                     ) {
-                        assertTrue(routes.none { it.endsWith("/0") })
+                        assertEquals(partialLockdown, routes.any { it.endsWith("/0") })
                         assertEquals(1280, checkNotNull(tokenField(agent, "MTU: ")).toInt())
                         val generation = partialCaptureFormat(previousGeneration)
                         if (generation == null) {

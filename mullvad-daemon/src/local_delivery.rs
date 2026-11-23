@@ -808,6 +808,12 @@ pub trait FrontendFactory: Send + Sync {
     fn partial_dns(&self) -> Vec<IpAddr> {
         vec![]
     }
+    fn partial_lockdown(&self) -> bool {
+        true
+    }
+    fn platform_changes(&self) -> Option<watch::Receiver<bool>> {
+        None
+    }
     fn start(
         &self,
         config: DeliveryConfig,
@@ -958,6 +964,9 @@ enum Readiness {
 impl<F: FrontendFactory> Delivery<F> {
     pub fn partial_dns(&self) -> Vec<IpAddr> {
         self.factory.partial_dns()
+    }
+    pub fn partial_lockdown(&self) -> bool {
+        self.factory.partial_lockdown()
     }
     pub fn supported(&self) -> bool {
         self.factory.supported()

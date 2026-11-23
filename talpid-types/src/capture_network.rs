@@ -167,12 +167,14 @@ struct Predecessor {
 pub struct CaptureNetworkFeed {
     registration: i64,
     state: Mutex<State>,
+    lockdown: watch::Sender<bool>,
 }
 
 impl CaptureNetworkFeed {
     pub fn new(registration: i64) -> Arc<Self> {
         Arc::new(Self {
             registration,
+            lockdown: watch::channel(true).0,
             state: Mutex::new(State {
                 closed: registration <= 0,
                 last_generation: 0,
@@ -186,8 +188,30 @@ impl CaptureNetworkFeed {
         self.registration
     }
 
+    /// Platform configuration input, never destination or socket authority.
+    pub fn lockdown(&self) -> bool {
+        *self.lockdown.borrow()
+    }
+
+    pub fn lockdown_changes(&self) -> watch::Receiver<bool> {
+        self.lockdown.subscribe()
+    }
+
+    pub fn publish_lockdown(&self, registration: i64, enabled: bool) {
+        let state = self.state.lock().expect("capture feed");
+        if registration != self.registration || state.closed {
+            return;
+        }
+        self.lockdown.send_if_modified(|current| {
+            let changed = *current != enabled;
+            *current = enabled;
+            changed
+        });
+    }
+
     pub fn register<E>(&self, attach: impl FnOnce(i64) -> Result<bool, E>) -> bool {
-        let attached = !self.state.lock().expect("capture feed").closed
+        let open = !self.state.lock().expect("capture feed").closed;
+        let attached = open
             && matches!(
                 catch_unwind(AssertUnwindSafe(|| attach(self.registration))),
                 Ok(Ok(true))
@@ -441,6 +465,7 @@ impl CaptureNetworkFeed {
     pub fn close(&self) {
         let mut state = self.state.lock().expect("capture feed");
         state.closed = true;
+        self.lockdown.send_replace(true);
         if let Some(mut generation) = state.generation.take() {
             Self::revoke(&mut generation);
             Self::set_state(&generation, CaptureNetworkState::Lost);

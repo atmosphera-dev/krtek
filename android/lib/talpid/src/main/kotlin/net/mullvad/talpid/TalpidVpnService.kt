@@ -3,6 +3,8 @@ package net.mullvad.talpid
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import androidx.annotation.CallSuper
 import androidx.core.content.getSystemService
@@ -48,6 +50,7 @@ open class TalpidVpnService : LifecycleVpnService() {
 
     private lateinit var localNetworkWatcher: LocalNetworkWatcher
     private lateinit var systemDnsAuthority: SystemDnsAuthority
+    private var lockdownObserver: VpnLockdownObserver? = null
     private val localNetworkDemand = LocalNetworkDemand {
         if (it) localNetworkWatcher.start() else localNetworkWatcher.stop()
     }
@@ -101,6 +104,8 @@ open class TalpidVpnService : LifecycleVpnService() {
         synchronized(this) { invalidateCaptureObservation() }
         localNetworkWatcher.stop()
         systemDnsAuthority.close()
+        lockdownObserver?.close()
+        lockdownObserver = null
         super.onDestroy()
     }
 
@@ -152,6 +157,18 @@ open class TalpidVpnService : LifecycleVpnService() {
         synchronized(this) {
             if (registration <= 0 || captureRegistration != 0L) return false
             captureRegistration = registration
+            if (
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && ::systemDnsAuthority.isInitialized
+            ) {
+                lockdownObserver =
+                    VpnLockdownObserver(
+                            contentResolver,
+                            Handler(Looper.getMainLooper()),
+                            { isLockdownEnabled },
+                            { LocalCaptureNetworkBridge.lockdownChanged(registration, it) },
+                        )
+                        .also { it.start() }
+            }
             true
         }
 
@@ -159,6 +176,8 @@ open class TalpidVpnService : LifecycleVpnService() {
     fun detachCaptureNetwork(registration: Long): Boolean =
         synchronized(this) {
             if (captureRegistration != registration) return false
+            lockdownObserver?.close()
+            lockdownObserver = null
             closeCaptureObservation()
             captureRegistration = 0
             true
@@ -379,7 +398,7 @@ open class TalpidVpnService : LifecycleVpnService() {
         val builder = Builder()
         config.configure(
             { address, prefix -> builder.addAddress(address, prefix) },
-            { builder.addRoute(InetAddress.getByAddress(it.networkBytes()), it.prefix) },
+            { builder.addRoute(it.address, it.prefixLength.toInt()) },
         )
         builder.setMtu(LOCAL_ONLY_MTU)
         config.dnsServers.forEach { builder.addDnsServer(it) }

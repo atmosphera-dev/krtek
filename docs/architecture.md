@@ -312,7 +312,13 @@ unless Local needs it; that extra family captures and drops non-Local traffic,
 never enabling a physical internet fallback. For an IPv4-only target below 1280,
 Local IPv6 requires a capture-only MTU floor of 1280; the target/carrier MTU is
 unchanged. Partial capture uses MTU 1280 and enabled CIDRs. With split DNS enabled,
-Android 10+ adds the non-VPN default resolver list and its exact host routes;
+Android 10+ adds the non-VPN default resolver list and its exact host routes.
+With DNS enabled and Android lockdown on, Partial instead captures both default
+routes so Android's normal lookup can see both exposed interface families.
+Capture-owned OS observation reconciles lockdown changes through normal profile
+handover; it does not grant physical or Ordinary authority. Non-Local/non-DNS
+traffic is dropped, and each Ordinary DNS I/O retains its live OS gate.
+Without DNS demand or lockdown, Partial retains host routes only.
 Android 9 retains the DNS-free Partial profile. The
 upstream safe blocking MTU is separately 1380. These app-facing address values
 are independent of Mullvad login, key rotation and tunnel assignment.

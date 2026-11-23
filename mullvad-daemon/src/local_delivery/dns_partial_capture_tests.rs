@@ -44,6 +44,12 @@ impl FrontendPlatform for SystemPlatform {
         generation: i64,
         config: &CaptureConfig,
     ) -> io::Result<talpid_tunnel::tun_provider::AppliedTun> {
+        if self.lockdown.load(SeqCst) {
+            let CaptureConfig::Partial(partial) = config else {
+                panic!("Partial required")
+            };
+            assert_eq!(partial.routes, ["0.0.0.0/0", "::/0"]);
+        }
         self.packet.open(generation, config)
     }
     fn handover(&self, _: i64, _: i64, _: &CaptureConfig) -> CaptureHandover {
@@ -145,7 +151,11 @@ async fn start_partial(
     .unwrap();
     broker.set_mode(AttachmentMode::ManagedRequired).unwrap();
     let config = DeliveryConfig::Partial(talpid_tunnel::tun_provider::PartialConfig {
-        routes: vec![format!("{}/32", resolver.ip())],
+        routes: if platform.lockdown.load(SeqCst) {
+            vec!["0.0.0.0/0".into(), "::/0".into()]
+        } else {
+            vec![format!("{}/32", resolver.ip())]
+        },
         dns_servers: vec![resolver.ip()],
         excluded_packages: vec![],
     });
@@ -204,4 +214,50 @@ async fn split_dns_partial_ambiguous_udp_reactor_returns_to_client_only_when_os_
                 .is_err()
         );
     }
+}
+
+#[tokio::test]
+async fn split_dns_partial_lockdown_defaults_drop_non_local_non_dns_udp_and_tcp() {
+    let platform = Arc::new(SystemPlatform {
+        packet: platform(),
+        checks: AtomicUsize::new(0),
+        prepares: AtomicUsize::new(0),
+        ambiguous: AtomicBool::new(false),
+        lockdown: AtomicBool::new(true),
+    });
+    let resolver: SocketAddr = "127.77.10.54:53".parse().unwrap();
+    let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (mut owner, peer) = start_partial(platform.clone(), resolver).await;
+    let destination = server.local_addr().unwrap();
+    for transport in [Transport::Udp, Transport::Tcp] {
+        let flow = Flow {
+            source: "172.27.1.1:49901".parse().unwrap(),
+            destination,
+            transport,
+        };
+        let bytes = if transport == Transport::Udp {
+            udp_packet(flow, b"non-local-non-dns")
+        } else {
+            tcp_packet(flow, 700, 0, 2, &[])
+        };
+        peer.send(&bytes).await.unwrap();
+    }
+    let mut bytes = [0; 512];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), server.recv_from(&mut bytes))
+            .await
+            .is_err()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), peer.recv(&mut bytes))
+            .await
+            .is_err()
+    );
+    assert_eq!(platform.prepares.load(SeqCst), 0);
+    assert_eq!(
+        platform.checks.load(SeqCst),
+        0,
+        "non-DNS never enters system authority"
+    );
+    owner.stop().await.unwrap();
 }

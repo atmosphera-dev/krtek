@@ -10,6 +10,12 @@ names use the Home path or fail with SERVFAIL. Unlisted queries keep their origi
 and destination, using a protected socket bound to that underlying network only
 when Android's current "Block connections without VPN" setting is off. When it
 is on they are dropped, without granting the VPN provider's exemption to apps.
+DNS-enabled Partial captures both default routes while lockdown is on so Android's
+normal hostname lookup can use its exposed address families. This is still
+Partial: no Mullvad carrier or Ordinary forwarding, and non-Local/non-DNS packets
+are dropped inside Krtek. Lockdown changes rebuild the profile; open Local
+connections may drop during that coverage change. Lockdown off or split DNS
+disabled retains host routes only. No resolver-probe address routes are added.
 Android 9 cannot expose this current OS gate: split DNS is paused in Partial,
 with Android handling DNS as for stock Mullvad. Full capture works on Android 9.
 

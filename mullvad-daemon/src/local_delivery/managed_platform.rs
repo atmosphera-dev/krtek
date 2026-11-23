@@ -23,6 +23,12 @@ impl FrontendFactory for PlatformFactory {
             .system_dns()
             .map_or_else(Vec::new, |snapshot| snapshot.dns_servers)
     }
+    fn partial_lockdown(&self) -> bool {
+        self.0.capture_feed().lockdown()
+    }
+    fn platform_changes(&self) -> Option<watch::Receiver<bool>> {
+        Some(self.0.capture_feed().lockdown_changes())
+    }
     fn start(
         &self,
         config: DeliveryConfig,

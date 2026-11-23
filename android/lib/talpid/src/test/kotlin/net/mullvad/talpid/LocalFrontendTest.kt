@@ -47,13 +47,25 @@ class LocalFrontendTest {
                 listOf("169.254.0.0/16", "fe80::/10"),
             )) {
             val addresses = mutableListOf<Pair<String, Int>>()
-            val announced = mutableListOf<String>()
+            val announced = mutableListOf<net.mullvad.talpid.model.InetNetwork>()
             val config = assertNotNull(LocalFrontendConfig.parse(routes.toTypedArray()))
             config.configure(
                 { address, bits -> addresses += address to bits },
-                { announced += it.toString() },
+                { announced += it },
             )
-            assertEquals(routes, announced)
+            assertEquals(
+                routes.map { text ->
+                    val cidr =
+                        checkNotNull(
+                            net.mullvad.mullvadvpn.lib.model.LocalCidr.parse(text).getOrNull()
+                        )
+                    net.mullvad.talpid.model.InetNetwork(
+                        InetAddress.getByAddress(cidr.networkBytes()),
+                        cidr.prefix.toShort(),
+                    )
+                },
+                announced,
+            )
             assertEquals(
                 listOf(
                     InetAddress.getByName("172.27.1.1") to 32,

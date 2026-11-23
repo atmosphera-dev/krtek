@@ -82,6 +82,7 @@ class SplitDnsPartialInstrumentedTest {
                         ForwardingAvailability.Active,
                         "Disconnected",
                         requiredDns = setOf(checkNotNull(resolver.hostAddress)),
+                        partialLockdown = lockdown,
                     )
                 assertTrue(
                     capture.dns
@@ -139,6 +140,41 @@ class SplitDnsPartialInstrumentedTest {
                 assertEquals(if (lockdown) 2 else 3, tcp.getInt("message_count"))
                 assertEquals(2, tcp.getInt("home_exact"))
                 assertEquals(lockdown, tcp.getBoolean("ordinary_blocked"))
+                if (lockdown) {
+                    // The system resolver is not Local; non-DNS packets to it must
+                    // enter the default capture but never reach the physical fixture.
+                    val destination = checkNotNull(resolver.hostAddress)
+                    assertTrue(
+                        policy.rules
+                            .flatMap { it.cidrs }
+                            .none {
+                                CaptureReadiness.covers(
+                                    it.toString(),
+                                    "$destination/${if (':' in destination) 128 else 32}",
+                                )
+                            }
+                    )
+                    for (transport in listOf("udp", "tcp")) {
+                        val result =
+                            consumer.request(
+                                Bundle().apply {
+                                    putString("transport", transport)
+                                    putString("destination", destination)
+                                    putInt("port", if (transport == "tcp") 18080 else 18081)
+                                    putString("nonce", "krtek-m3-${UUID.randomUUID()}")
+                                    putInt("timeout_ms", 5_000)
+                                }
+                            )
+                        harness.report("split_dns_partial_non_dns_$transport", result)
+                        harness.report(
+                            "socket_report",
+                            checkNotNull(result.getString("socket_report")),
+                        )
+                        assertTrue(harness.uidIncluded(capture.uids, result.getInt("uid")))
+                        assertEquals("failed", result.getString("outcome"))
+                        assertTrue(checkNotNull(result.getString("error_class")).contains('.'))
+                    }
+                }
             } catch (error: Throwable) {
                 failure = error
                 throw error

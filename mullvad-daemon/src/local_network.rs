@@ -91,6 +91,7 @@ pub struct LocalNetworkRuntime<F: FrontendFactory = PlatformFactory> {
     broker: AttachmentBroker,
     broker_updates: watch::Receiver<BrokerSnapshot>,
     release_updates: watch::Receiver<u64>,
+    platform_updates: Option<watch::Receiver<bool>>,
     suspended: bool,
     phase: Option<TunnelPhase>,
     target_config: Option<talpid_tunnel::packet_attachment::PendingCaptureRequest>,
@@ -172,6 +173,7 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
         }
         let broker_updates = broker.changes();
         let release_updates = broker.capture_release_changes();
+        let platform_updates = factory.platform_changes();
         let mut runtime = Self {
             feed: feed.filter(|_| receiver.is_some()),
             receiver,
@@ -188,6 +190,7 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
             broker,
             broker_updates,
             release_updates,
+            platform_updates,
             suspended: false,
             phase: None,
             target_config: None,
@@ -228,6 +231,7 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
                 tokio::select! {
                     _ = self.broker_updates.changed() => {},
                     _ = self.release_updates.changed() => {},
+                    _ = feed_changed(&mut self.platform_updates) => {},
                 }
             },
         )
@@ -341,6 +345,11 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
                     .iter()
                     .map(|ip| ipnetwork::IpNetwork::from(*ip).to_string()),
             );
+            // Partial already exposes both fixed interface families. Route coverage
+            // for Android's platform lookup is separate from Local permission.
+            if !dns_servers.is_empty() && self.delivery.partial_lockdown() {
+                routes = vec!["0.0.0.0/0".into(), "::/0".into()];
+            }
             (!routes.is_empty()).then_some(DeliveryConfig::Partial(
                 talpid_tunnel::tun_provider::PartialConfig {
                     routes,
@@ -648,7 +657,7 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
     }
 }
 
-async fn feed_changed(receiver: &mut Option<watch::Receiver<LocalNetworkFeedState>>) {
+async fn feed_changed<T: Send + Sync>(receiver: &mut Option<watch::Receiver<T>>) {
     match receiver {
         Some(active) => {
             if active.changed().await.is_err() {

@@ -956,6 +956,8 @@ async fn authority_update_revokes_before_notification_and_preparation_retains_se
 }
 
 struct Control {
+    dns: Mutex<Vec<IpAddr>>,
+    lockdown: watch::Sender<bool>,
     history: Mutex<Vec<String>>,
     routes: Mutex<Vec<Vec<String>>>,
     exclusions: Mutex<Vec<Vec<String>>>,
@@ -976,6 +978,8 @@ struct Control {
 impl Default for Control {
     fn default() -> Self {
         Self {
+            dns: Mutex::new(vec![]),
+            lockdown: watch::channel(false).0,
             history: Mutex::new(vec![]),
             routes: Mutex::new(vec![]),
             exclusions: Mutex::new(vec![]),
@@ -1064,6 +1068,15 @@ impl LocalAuthority for LoopbackAuthority {
 
 impl FrontendFactory for FakeFactory {
     type Owner = FakeOwner;
+    fn partial_dns(&self) -> Vec<IpAddr> {
+        self.0.dns.lock().unwrap().clone()
+    }
+    fn partial_lockdown(&self) -> bool {
+        *self.0.lockdown.borrow()
+    }
+    fn platform_changes(&self) -> Option<watch::Receiver<bool>> {
+        Some(self.0.lockdown.subscribe())
+    }
     fn supported(&self) -> bool {
         true
     }
@@ -1332,6 +1345,84 @@ fn make_runtime(
         FakeFactory(control),
         Arc::new(|_, _| Ok(())),
     )
+}
+
+#[tokio::test]
+async fn partial_dns_lockdown_change_wakes_runtime_and_reconciles_coverage_not_authority() {
+    let control = Arc::new(Control::default());
+    *control.dns.lock().unwrap() = vec!["10.77.10.54".parse().unwrap()];
+    let mut runtime = make_runtime(None, control.clone());
+    let mut configured = policy();
+    configured.split_dns.enabled = true;
+    configured.split_dns.suffixes = vec!["home.".into()];
+    configured.split_dns.home_resolver = Some("10.0.2.2".parse().unwrap());
+    configured.split_dns.local_rule_id = Some(configured.rules[0].id);
+    runtime
+        .update(&configured, TargetState::Unsecured, true)
+        .await;
+    let host_routes = control.routes.lock().unwrap().last().unwrap().clone();
+    assert!(host_routes.contains(&"10.77.10.54/32".into()));
+    // Consume earlier broker publications, then prove the independent OS event wakes the actor.
+    while tokio::time::timeout(Duration::from_millis(10), runtime.notifications().2)
+        .await
+        .is_ok()
+    {}
+    {
+        let changes = runtime.notifications().2;
+        tokio::pin!(changes);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut changes)
+                .await
+                .is_err()
+        );
+        control.lockdown.send_replace(true);
+        bounded(changes).await;
+    }
+    runtime
+        .internal_update(
+            &configured,
+            TargetState::Unsecured,
+            crate::local_network::TunnelPhase::Disconnected,
+        )
+        .await;
+    assert_eq!(
+        control.routes.lock().unwrap().last(),
+        Some(&vec!["0.0.0.0/0".into(), "::/0".into()])
+    );
+    assert!(!runtime.broker().snapshot().ordinary_ready);
+    assert!(
+        runtime
+            .broker()
+            .local_routes()
+            .iter()
+            .all(|r| r.prefix() != 0)
+    );
+    control.lockdown.send_replace(false);
+    runtime
+        .update(&configured, TargetState::Unsecured, true)
+        .await;
+    assert_eq!(control.routes.lock().unwrap().last(), Some(&host_routes));
+    control.lockdown.send_replace(true);
+    configured.split_dns.enabled = false;
+    runtime
+        .update(&configured, TargetState::Unsecured, true)
+        .await;
+    assert!(
+        !control
+            .routes
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .iter()
+            .any(|r| r.ends_with("/0"))
+    );
+    assert_eq!(
+        control.starts.load(SeqCst),
+        1,
+        "same owner performs normal profile handovers"
+    );
+    runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test]

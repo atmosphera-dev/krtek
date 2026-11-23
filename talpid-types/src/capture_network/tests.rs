@@ -1,6 +1,33 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[test]
+fn lockdown_configuration_is_registration_owned_and_unknown_defaults_to_blocking() {
+    let feed = CaptureNetworkFeed::new(9);
+    assert!(feed.lockdown());
+    let mut changes = feed.lockdown_changes();
+    assert!(feed.register(|id| {
+        feed.publish_lockdown(id, false);
+        Ok::<_, ()>(true)
+    }));
+    assert!(!feed.lockdown());
+    assert!(changes.has_changed().unwrap());
+    changes.borrow_and_update();
+    feed.publish_lockdown(8, true);
+    assert!(!feed.lockdown());
+    assert!(!changes.has_changed().unwrap());
+    feed.publish_lockdown(9, true);
+    assert!(feed.lockdown());
+    feed.publish_lockdown(9, false);
+    feed.close();
+    assert!(feed.lockdown());
+    feed.publish_lockdown(9, false);
+    assert!(
+        feed.lockdown(),
+        "closed registration cannot revive configuration"
+    );
+}
+
 fn observed() -> CaptureNetworkObservation {
     let prefix = CapturePrefix {
         address: "10.64.0.2".parse().unwrap(),
