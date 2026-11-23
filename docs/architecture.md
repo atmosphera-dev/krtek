@@ -359,6 +359,11 @@ observations do not select a network, and an empty selected resolver list never
 falls back to another network. Every query and I/O checks Android's live lockdown
 gate; only an allowed query can protect and bind to that network. Revoked
 incarnations, changed capture sinks and Partial/full transitions retire old work.
+Complete ambiguous selection has separate reply-only authority when live
+lockdown is off: UDP and each Ordinary TCP message receive immediate SERVFAIL,
+without network I/O. This authority cannot prepare sockets and retains its exact
+ambiguity incarnation, OS gate and output guards; lockdown still drops. Missing
+or incomplete observation does not grant ambiguity reply authority.
 TCP classifies each framed message separately, so blocked Ordinary messages do
 not acquire Home authority. Connected UDP passthrough and unprotected TCP
 upstreams are unchanged. The system authority uses the same joined-preparation

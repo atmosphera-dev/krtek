@@ -45,6 +45,10 @@ pub trait FrontendPlatform: Send + Sync + 'static {
     fn system_dns_current(&self, _token: i64) -> bool {
         false
     }
+    /// Reply-only ambiguity authority; never permission to prepare a socket.
+    fn system_dns_failure_token(&self) -> i64 {
+        0
+    }
     fn prepare_system_dns(&self, _fd: i32, _token: i64) -> io::Result<()> {
         Err(io::ErrorKind::PermissionDenied.into())
     }

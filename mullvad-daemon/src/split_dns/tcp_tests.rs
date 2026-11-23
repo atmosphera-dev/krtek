@@ -369,3 +369,93 @@ fn split_dns_tcp_ack_releases_only_the_completed_reply_guards() {
     app.queued_output(0);
     assert!(session.replies.lock().unwrap().pending.is_empty());
 }
+
+#[tokio::test]
+async fn split_dns_partial_ambiguous_tcp_each_message_is_servfail_or_lockdown_drop() {
+    for ipv6 in [false, true] {
+        for lockdown in [false, true] {
+            let buffers = Arc::new(BufferBudget::new(32 * 1024 * 1024));
+            let resolver = if ipv6 { "[::1]:53" } else { "127.0.0.1:53" }
+                .parse()
+                .unwrap();
+            let (_capture, mut session) = session(resolver, &*buffers);
+            let (system, platform, _unused_capture, _scope) =
+                super::super::system::tests::fixture();
+            platform.ambiguous.store(true, SeqCst);
+            platform.lockdown.store(lockdown, SeqCst);
+            let mutable = Arc::get_mut(&mut session).unwrap();
+            mutable.partial = true;
+            mutable.system = Some(Arc::new(system));
+            let home = Arc::new(Home {
+                calls: Arc::default(),
+                live: Arc::new(AtomicBool::new(true)),
+                fail: false,
+            });
+            let (client, codec) = ServiceStream::pair(&*buffers, 128).unwrap();
+            let worker = tokio::spawn(serve(
+                session.clone(),
+                codec,
+                home.clone(),
+                Arc::default(),
+                buffers,
+            ));
+            let (mut client, mut sender) = TcpStream::from_stream(CodecIo(client), resolver);
+            for (id, name) in [
+                (901, "first.home."),
+                (902, "ordinary.example."),
+                (903, "last.home."),
+                (904, "another.example."),
+            ] {
+                sender
+                    .send(SerialMessage::new(query(name, id), resolver))
+                    .unwrap();
+            }
+            for id in if lockdown {
+                vec![901, 903]
+            } else {
+                vec![901, 902, 903, 904]
+            } {
+                let response = tokio::time::timeout(Duration::from_millis(500), client.next())
+                    .await
+                    .expect("each allowed TCP message must fail fast")
+                    .unwrap()
+                    .unwrap();
+                let response = decode_message(&response.into_parts().0).unwrap();
+                assert_eq!(response.metadata.id, id);
+                let is_home = id == 901 || id == 903;
+                assert_eq!(
+                    response.metadata.response_code,
+                    if is_home {
+                        ResponseCode::NoError
+                    } else {
+                        ResponseCode::ServFail
+                    }
+                );
+                assert_eq!(response.answers.len(), usize::from(is_home));
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), client.next())
+                    .await
+                    .is_err(),
+                "no extra or denied Ordinary reply"
+            );
+            assert_eq!(home.calls.load(SeqCst), 2);
+            assert_eq!(platform.prepares.load(SeqCst), 0);
+            platform.lockdown.store(true, SeqCst);
+            if !lockdown {
+                assert!(
+                    !session.current(),
+                    "queued ambiguity reply retains OS guard"
+                );
+                platform.lockdown.store(false, SeqCst);
+                assert!(!session.current());
+            }
+            drop(client);
+            drop(sender);
+            let _ = tokio::time::timeout(Duration::from_secs(1), worker)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+}

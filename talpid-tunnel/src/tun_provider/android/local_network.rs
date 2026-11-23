@@ -142,6 +142,20 @@ impl LocalNetworkPlatform {
             .map_err(|()| Error::TunnelDeviceError)
         })
     }
+    pub fn system_dns_failure(&self) -> Result<i64, Error> {
+        let env = self
+            .context
+            .jvm
+            .attach_current_thread_as_daemon()
+            .map_err(Error::AttachJvmToThread)?;
+        let name = "systemDnsFailureToken";
+        handled(&env, name, || {
+            env.call_method(self.context.vpn_service.as_obj(), name, "()J", &[])
+                .and_then(|value| value.j())
+                .map_err(|error| Error::CallMethod(name, error))
+        })
+    }
+
     pub fn system_dns_call(&self, token: i64, fd: Option<i32>) -> Result<bool, Error> {
         let env = self
             .context

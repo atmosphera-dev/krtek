@@ -151,6 +151,10 @@ class LocalFrontendTest {
         )
         val type = TalpidVpnService::class.java
         assertEquals(
+            Long::class.javaPrimitiveType,
+            type.getDeclaredMethod("systemDnsFailureToken").returnType,
+        )
+        assertEquals(
             SystemDnsSnapshot::class.java,
             type.getDeclaredMethod("systemDnsSnapshot").returnType,
         )

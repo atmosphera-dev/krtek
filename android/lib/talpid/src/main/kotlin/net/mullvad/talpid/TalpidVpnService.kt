@@ -434,6 +434,8 @@ open class TalpidVpnService : LifecycleVpnService() {
     @Suppress("Unused")
     fun systemDnsCurrent(token: Long): Boolean = systemDnsAuthority.current(token)
 
+    @Suppress("Unused") fun systemDnsFailureToken(): Long = systemDnsAuthority.failureToken()
+
     @Suppress("Unused")
     fun prepareSystemDns(fd: Int, token: Long): Int =
         synchronized(this) {

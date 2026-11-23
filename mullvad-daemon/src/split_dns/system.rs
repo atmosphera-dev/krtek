@@ -57,7 +57,7 @@ impl SystemIo {
 
 pub(super) struct SystemQuery {
     platform: Arc<dyn FrontendPlatform>,
-    token: i64,
+    authority: Authority,
     destination: SocketAddr,
     tcp: bool,
     scope: ReceiveScope,
@@ -66,22 +66,30 @@ pub(super) struct SystemQuery {
     partial: Arc<AtomicBool>,
     live: AtomicBool,
 }
+
+enum Authority {
+    Network(i64),
+    Ambiguous(i64),
+}
 impl Capability for SystemQuery {
     fn destination(&self) -> SocketAddr {
         self.destination
     }
     fn permits(&self, tcp: bool) -> bool {
-        tcp == self.tcp
+        matches!(self.authority, Authority::Network(_)) && tcp == self.tcp
     }
     fn current(&self) -> bool {
         self.current()
     }
     fn prepare(&self, socket: &socket2::Socket) -> io::Result<()> {
+        let Authority::Network(token) = self.authority else {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        };
         if !self.current() {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
         self.platform
-            .prepare_system_dns(socket.as_raw_fd(), self.token)?;
+            .prepare_system_dns(socket.as_raw_fd(), token)?;
         if self.current() {
             Ok(())
         } else {
@@ -98,20 +106,31 @@ impl SystemQuery {
         capture: RelayCapture,
         partial: Arc<AtomicBool>,
     ) -> Result<Arc<Self>, ExchangeError> {
-        let snapshot = platform.system_dns().ok_or(ExchangeError::Closed)?;
-        if !snapshot.dns_servers.contains(&resolver.ip()) || resolver.port() != 53 {
+        if resolver.port() != 53 {
             return Err(ExchangeError::Closed);
         }
         let mut destination = resolver;
-        if let SocketAddr::V6(address) = &mut destination
-            && address.ip().is_unicast_link_local()
-        {
-            let index = u32::try_from(snapshot.interface_index)
-                .ok()
-                .filter(|index| *index != 0)
-                .ok_or(ExchangeError::Closed)?;
-            address.set_scope_id(index);
-        }
+        let authority = if let Some(snapshot) = platform.system_dns() {
+            if !snapshot.dns_servers.contains(&resolver.ip()) {
+                return Err(ExchangeError::Closed);
+            }
+            if let SocketAddr::V6(address) = &mut destination
+                && address.ip().is_unicast_link_local()
+            {
+                let index = u32::try_from(snapshot.interface_index)
+                    .ok()
+                    .filter(|index| *index != 0)
+                    .ok_or(ExchangeError::Closed)?;
+                address.set_scope_id(index);
+            }
+            Authority::Network(snapshot.token)
+        } else {
+            let token = platform.system_dns_failure_token();
+            if token <= 0 {
+                return Err(ExchangeError::Closed);
+            }
+            Authority::Ambiguous(token)
+        };
         let sink = capture.sink().ok_or(ExchangeError::Closed)?;
         if scope.destination() != resolver.ip() || !sink.identity().sources.contains(scope.source())
         {
@@ -119,7 +138,7 @@ impl SystemQuery {
         }
         let query = Arc::new(Self {
             platform,
-            token: snapshot.token,
+            authority,
             destination,
             tcp,
             scope,
@@ -143,7 +162,10 @@ impl SystemQuery {
                 .capture
                 .sink()
                 .is_some_and(|sink| sink.same_sink(&self.sink))
-            && self.platform.system_dns_current(self.token);
+            && match self.authority {
+                Authority::Network(token) => self.platform.system_dns_current(token),
+                Authority::Ambiguous(token) => self.platform.system_dns_failure_token() == token,
+            };
         if !current {
             self.live.store(false, Ordering::Release);
         }
@@ -154,6 +176,26 @@ impl SystemQuery {
         owner: &HomeIoOwner,
         bytes: Vec<u8>,
     ) -> Result<Vec<u8>, ExchangeError> {
+        if !self.current() {
+            return Err(ExchangeError::Closed);
+        }
+        if matches!(self.authority, Authority::Ambiguous(_)) {
+            use hickory_proto::op::{Message, MessageType, Metadata, ResponseCode};
+            let request = transport::decode_message(&bytes)?;
+            if request.metadata.message_type != MessageType::Query {
+                return Err(ExchangeError::Malformed);
+            }
+            let mut reply = Message::response(request.metadata.id, request.metadata.op_code);
+            reply.metadata = Metadata::response_from_request(&request.metadata);
+            reply.metadata.response_code = ResponseCode::ServFail;
+            reply.queries = request.queries;
+            let bytes = reply.to_vec().map_err(|_| ExchangeError::Malformed)?;
+            return if self.current() {
+                Ok(bytes)
+            } else {
+                Err(ExchangeError::Closed)
+            };
+        }
         let runtime: HomeRuntime = owner.with_capability(self.clone())?;
         let reply = transport::exchange_bytes(
             runtime,
@@ -176,4 +218,4 @@ impl SystemQuery {
 
 #[cfg(test)]
 #[path = "system_tests.rs"]
-mod tests;
+pub(crate) mod tests;

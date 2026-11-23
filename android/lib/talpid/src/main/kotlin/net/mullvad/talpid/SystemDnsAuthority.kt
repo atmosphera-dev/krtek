@@ -23,6 +23,7 @@ internal class SystemDnsAuthority(
     private val networks = mutableMapOf<Network, Observation>()
     private val initial = mutableSetOf<Network>()
     private var selected: Binding? = null
+    private var ambiguous: Map<Network, Observation> = emptyMap()
 
     @Synchronized
     @Suppress("DEPRECATION") // Complete the passive callback's initial set on every supported API.
@@ -114,17 +115,31 @@ internal class SystemDnsAuthority(
         }
     }
 
+    /** Reply-only capability: no selected network, no protect/bind permission. */
+    @Synchronized
+    fun failureToken(): Long {
+        refresh()
+        return if (ambiguous.isNotEmpty() && runCatching { !lockdown() }.getOrDefault(false)) token
+        else 0L
+    }
+
     private fun refresh() {
         initial.removeAll { networks[it]?.complete == true }
         val candidates = networks.values.filter { it.eligible && it.complete }
+        val ready = supported && !closed && initial.isEmpty() && networks.values.all { it.complete }
         val handle =
-            if (supported && !closed && initial.isEmpty() && networks.values.all { it.complete })
+            if (ready)
                 selectSystemDnsNetwork(candidates.mapNotNull { it.candidate }, localNetwork())
             else null
         val next = candidates.singleOrNull { it.candidate?.handle == handle }?.binding
-        if (selected != next) {
+        val tied =
+            if (ready && next == null && candidates.size > 1)
+                candidates.associateBy { checkNotNull(it.binding).network }
+            else emptyMap()
+        if (selected != next || ambiguous != tied) {
             token++
             selected = next
+            ambiguous = tied
         }
     }
 

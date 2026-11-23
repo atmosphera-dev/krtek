@@ -15,7 +15,9 @@ with Android handling DNS as for stock Mullvad. Full capture works on Android 9.
 
 The physical network is the Local observer's unambiguous selection when available.
 Otherwise Krtek prefers validated networks, then Wi-Fi/Ethernet. Equal candidates
-leave Ordinary DNS unavailable rather than choosing by callback order. Observation
+return immediate SERVFAIL for Ordinary UDP and each TCP message when lockdown is
+off, rather than choosing by callback order. With lockdown on they still drop.
+Missing or incomplete observation remains unavailable. Observation
 is passive: Krtek does not request a new connection or add a network permission.
 
 ## Settings screen
