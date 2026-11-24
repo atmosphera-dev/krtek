@@ -3,9 +3,12 @@
 mod partial;
 use super::*;
 use crate::split_dns::{
-    ExchangeError, Protocol,
-    capture::CaptureDns,
-    home_path::{HomeDnsPath, HomeDnsQuery, PathFuture},
+    platform::{
+        capture::CaptureDns,
+        home_path::{HomeDnsPath, HomeDnsQuery, PathFuture},
+        local_home_path,
+    },
+    transport::{ExchangeError, Protocol, decode_message},
 };
 use hickory_proto::{
     op::{DnsResponse, Message, Query, ResponseCode},
@@ -157,7 +160,7 @@ async fn full_capture(home: bool, ipv6: bool, malformed: bool, tcp: bool) {
             input_id: input_id.clone(),
         })
     } else {
-        crate::split_dns::local_home_path(authority.clone(), buffers.local.clone())
+        local_home_path(authority.clone(), buffers.local.clone())
     };
     let dns = CaptureDns::new(authority.clone(), buffers.local.clone(), path);
     let engine_authority = authority.clone();
@@ -210,7 +213,7 @@ async fn full_capture(home: bool, ipv6: bool, malformed: bool, tcp: bool) {
     let parsed = talpid_lan_forwarder::packet::parse(&answer).unwrap();
     assert_eq!(parsed.flow.source, resolver);
     assert_eq!(parsed.flow.destination, client);
-    let response = crate::split_dns::decode_message(parsed.payload).unwrap();
+    let response = decode_message(parsed.payload).unwrap();
     assert_eq!(response.metadata.id, 701);
     if home {
         assert_eq!(response.answers[0].ttl, 741);
@@ -415,7 +418,7 @@ async fn tcp_consumer(peer: &UnixDatagram, client: SocketAddr, resolver: SocketA
             if received.len() < size + 2 {
                 break;
             }
-            let reply = crate::split_dns::decode_message(&received[2..size + 2]).unwrap();
+            let reply = decode_message(&received[2..size + 2]).unwrap();
             assert_eq!(reply.metadata.id, 811 + decoded);
             assert_eq!(reply.answers[0].ttl, 741);
             assert_eq!(

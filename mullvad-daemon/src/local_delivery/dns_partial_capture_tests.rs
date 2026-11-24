@@ -97,9 +97,7 @@ async fn split_dns_live_partial_ordinary_udp_reaches_system_and_original_client(
         let (length, client) = server.recv_from(&mut bytes).await.unwrap();
         bytes.truncate(length);
         assert_eq!(bytes, packet::parse(&input).unwrap().payload);
-        let mut response = crate::split_dns::decode_message(&bytes)
-            .unwrap()
-            .into_response();
+        let mut response = decode_message(&bytes).unwrap().into_response();
         response.add_answer(Record::from_rdata(
             response.queries[0].name().clone(),
             741,
@@ -195,12 +193,12 @@ async fn split_dns_partial_ambiguous_udp_reactor_returns_to_client_only_when_os_
             let packet = packet::parse(&bytes).unwrap();
             assert_eq!(packet.flow.source, resolver);
             assert_eq!(packet.flow.destination, "172.27.1.1:49900".parse().unwrap());
-            let response = crate::split_dns::decode_message(packet.payload).unwrap();
+            let response = decode_message(packet.payload).unwrap();
             assert_eq!(response.metadata.id, 703);
             assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
             assert_eq!(
                 response.queries,
-                crate::split_dns::decode_message(packet::parse(&input).unwrap().payload)
+                decode_message(packet::parse(&input).unwrap().payload)
                     .unwrap()
                     .queries
             );
