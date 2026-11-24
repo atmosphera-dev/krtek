@@ -40,7 +40,6 @@ import androidx.compose.ui.test.v2.AndroidComposeUiTestEnvironment
 import androidx.compose.ui.test.v2.runEmptyComposeUiTest
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.test.platform.app.InstrumentationRegistry
-import androidx.test.runner.lifecycle.ActivityLifecycleCallback
 import androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry
 import androidx.test.runner.lifecycle.Stage
 import java.security.MessageDigest
@@ -48,7 +47,6 @@ import java.util.ArrayDeque
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -84,38 +82,14 @@ class LocalNetworkEditorInstrumentedTest {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
     private val target = instrumentation.targetContext
 
-    private fun withLiveActivity(block: (MainActivity) -> Unit) {
-        val lifecycle = ActivityLifecycleMonitorRegistry.getInstance()
-        val created = AtomicReference<MainActivity?>()
-        val resumed = CountDownLatch(1)
-        instrumentation.runOnMainSync {
-            check(
-                Stage.values().all { stage ->
-                    lifecycle.getActivitiesInStage(stage).none { it is MainActivity }
-                }
-            ) {
-                "Preserve an existing activity instead of reusing or clearing it"
-            }
-        }
-        val callback = ActivityLifecycleCallback { activity, stage ->
-            if (activity is MainActivity && stage == Stage.PRE_ON_CREATE)
-                created.compareAndSet(null, activity)
-            if (stage == Stage.RESUMED && activity === created.get()) resumed.countDown()
-        }
-        lifecycle.addLifecycleCallback(callback)
-        try {
-            target.startActivity(
-                Intent(target, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            )
-            check(resumed.await(10, TimeUnit.SECONDS)) {
-                "Owned real activity did not reach resumed state"
-            }
-            compose.waitForIdle()
-            block(checkNotNull(created.get()))
-        } finally {
-            lifecycle.removeLifecycleCallback(callback)
-            created.get()?.let { activity -> instrumentation.runOnMainSync { activity.finish() } }
-        }
+    private fun withLiveActivity(block: () -> Unit) = withResumedMainActivity {
+        compose.waitForIdle()
+        block()
+    }
+
+    internal fun withForegroundActivity(block: () -> Unit) = runEmptyComposeUiTest {
+        compose = this
+        withLiveActivity { block() }
     }
 
     private fun nodes(): List<AccessibilityNodeInfo> {
