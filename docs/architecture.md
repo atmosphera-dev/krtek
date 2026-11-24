@@ -383,7 +383,10 @@ The daemon's Android DNS adapter has a separate grant from app forwarding. With
 Mullvad off, the service's capture owner grants stock default-network I/O only
 for a confirmed idle epoch; otherwise the adapter uses the passive system DNS
 authority's exact physical-network token and protects and binds UDP/TCP before
-I/O. Missing or changed authority fails closed. A stock TCP operation already
+I/O. A prepared socket survives a capture handover only while that token is
+still current and the capture owner allows physical DNS. The capture monitor
+covers validation and each nonblocking poll; rejected I/O closes the prepared
+socket without fallback. A stock TCP operation already
 submitted to Android is not cancelled when capture appears; new I/O does not
 use the retired grant. Mullvad on uses the upstream default-network resolver
 and socket provider. A daemon target epoch fences results from older attempts.

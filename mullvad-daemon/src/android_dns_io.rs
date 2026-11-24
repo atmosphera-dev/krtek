@@ -11,7 +11,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     os::fd::{AsFd, BorrowedFd},
     pin::Pin,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     task::{Context, Poll},
     time::Duration,
 };
@@ -125,9 +125,33 @@ impl<P: DnsPlatform> DnsRuntime<P> {
                     Err(unavailable())
                 }
             }),
-            Route::Physical { epoch, token, .. } => {
-                self.check_socket(epoch, token, None)?;
+            Route::Physical { token, .. } => self.platform.with_capture(|current| {
+                // A capture handover does not change the binding of a prepared socket.
+                // The current owner must still allow physical DNS, and the original
+                // network token must still be live. Check both before polling I/O.
+                if current >= 0 {
+                    return Err(unavailable());
+                }
+                self.check_socket(current, token, None)?;
                 action()
+            }),
+        }
+    }
+
+    fn poll_socket<S, T>(
+        &self,
+        socket: &mut Option<S>,
+        action: impl FnOnce(&mut S) -> Poll<io::Result<T>>,
+    ) -> Poll<io::Result<T>> {
+        let live = socket.as_mut().ok_or_else(unavailable)?;
+        match self.run(|| Ok(action(live))) {
+            Ok(poll) => poll,
+            Err(err) => {
+                if matches!(self.route, Route::Physical { .. }) {
+                    // No later poll can revive a socket after authority rejected it.
+                    *socket = None;
+                }
+                Poll::Ready(Err(err))
             }
         }
     }
@@ -201,7 +225,10 @@ impl<P: DnsPlatform> RuntimeProvider for DnsRuntime<P> {
                     .guarded(runtime.upstream.connect_tcp(server, bind, timeout))
                     .await?
             };
-            Ok(DnsTcp { socket, runtime })
+            Ok(DnsTcp {
+                socket: Some(socket),
+                runtime,
+            })
         })
     }
 
@@ -229,13 +256,17 @@ impl<P: DnsPlatform> RuntimeProvider for DnsRuntime<P> {
                     .guarded(runtime.upstream.bind_udp(local, server))
                     .await?
             };
-            Ok(DnsUdp { socket, runtime })
+            Ok(DnsUdp {
+                socket: Mutex::new(Some(socket)),
+                runtime,
+            })
         })
     }
 }
 
 pub(super) struct DnsUdp<P> {
-    socket: UdpSocket,
+    // Hickory polls UDP via &self. Serialize the nonblocking poll and any fd drop.
+    socket: Mutex<Option<UdpSocket>>,
     runtime: DnsRuntime<P>,
 }
 
@@ -248,11 +279,10 @@ impl<P: DnsPlatform> DnsUdpSocket for DnsUdp<P> {
         bytes: &[u8],
         server: SocketAddr,
     ) -> Poll<io::Result<usize>> {
-        self.runtime.run(|| {
-            Ok(self
-                .socket
-                .poll_send_to(cx, bytes, self.runtime.scoped(server)))
-        })?
+        self.runtime
+            .poll_socket(&mut self.socket.lock().unwrap(), |socket| {
+                socket.poll_send_to(cx, bytes, self.runtime.scoped(server))
+            })
     }
 
     fn poll_recv_from(
@@ -261,12 +291,14 @@ impl<P: DnsPlatform> DnsUdpSocket for DnsUdp<P> {
         bytes: &mut [u8],
     ) -> Poll<io::Result<(usize, SocketAddr)>> {
         self.runtime
-            .run(|| Ok(DnsUdpSocket::poll_recv_from(&self.socket, cx, bytes)))?
+            .poll_socket(&mut self.socket.lock().unwrap(), |socket| {
+                DnsUdpSocket::poll_recv_from(socket, cx, bytes)
+            })
     }
 }
 
 pub(super) struct DnsTcp<P> {
-    socket: AsyncIoTokioAsStd<TcpStream>,
+    socket: Option<AsyncIoTokioAsStd<TcpStream>>,
     runtime: DnsRuntime<P>,
 }
 
@@ -281,8 +313,9 @@ impl<P: DnsPlatform> AsyncRead for DnsTcp<P> {
         bytes: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        this.runtime
-            .run(|| Ok(Pin::new(&mut this.socket).poll_read(cx, bytes)))?
+        this.runtime.poll_socket(&mut this.socket, |socket| {
+            Pin::new(socket).poll_read(cx, bytes)
+        })
     }
 }
 
@@ -293,18 +326,22 @@ impl<P: DnsPlatform> AsyncWrite for DnsTcp<P> {
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        this.runtime
-            .run(|| Ok(Pin::new(&mut this.socket).poll_write(cx, bytes)))?
+        this.runtime.poll_socket(&mut this.socket, |socket| {
+            Pin::new(socket).poll_write(cx, bytes)
+        })
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         this.runtime
-            .run(|| Ok(Pin::new(&mut this.socket).poll_flush(cx)))?
+            .poll_socket(&mut this.socket, |socket| Pin::new(socket).poll_flush(cx))
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.socket).poll_close(cx)
+        match self.socket.as_mut() {
+            Some(socket) => Pin::new(socket).poll_close(cx),
+            None => Poll::Ready(Ok(())),
+        }
     }
 }
 
