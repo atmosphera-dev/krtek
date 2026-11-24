@@ -14,10 +14,12 @@ internal class VpnLockdownObserver(
     private val publish: (Boolean) -> Unit,
 ) : ContentObserver(handler) {
     private var closed = false
+    private var registered = false
 
     @Synchronized
     fun start() {
         check(!closed)
+        if (registered) return
         try {
             resolver.registerContentObserver(
                 Settings.Secure.getUriFor("always_on_vpn_lockdown"),
@@ -29,11 +31,11 @@ internal class VpnLockdownObserver(
                 false,
                 this,
             )
-            refresh()
+            registered = true
         } catch (_: RuntimeException) {
             Logger.w("VPN lockdown observation unavailable; retaining blocking DNS coverage")
-            publish(true)
         }
+        refresh()
     }
 
     override fun onChange(selfChange: Boolean) = refresh()
@@ -41,7 +43,7 @@ internal class VpnLockdownObserver(
     /** Settings and successful capture establishment both change the usable OS view. */
     @Synchronized
     fun refresh() {
-        if (!closed) publish(runCatching(read).getOrDefault(true))
+        if (!closed) publish(!registered || runCatching(read).getOrDefault(true))
     }
 
     @Synchronized

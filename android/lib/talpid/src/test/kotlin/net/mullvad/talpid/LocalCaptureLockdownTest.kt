@@ -26,6 +26,7 @@ import org.junit.jupiter.api.Test
 class LocalCaptureLockdownTest {
     private lateinit var service: TalpidVpnService
     private lateinit var observer: VpnLockdownObserver
+    private val resolver = mockk<ContentResolver>(relaxed = true)
     private var established = false
     private var lockdown = true
     private val published = mutableListOf<Boolean>()
@@ -62,7 +63,7 @@ class LocalCaptureLockdownTest {
         // even when the OS lockdown setting is already ON.
         observer =
             VpnLockdownObserver(
-                mockk<ContentResolver>(relaxed = true),
+                resolver,
                 mockk<Handler>(),
                 { established && lockdown },
                 published::add,
@@ -71,8 +72,6 @@ class LocalCaptureLockdownTest {
             isAccessible = true
             set(service, observer)
         }
-        observer.start()
-        assertEquals(listOf(false), published)
     }
 
     @AfterEach fun cleanup() = unmockkAll()
@@ -86,6 +85,7 @@ class LocalCaptureLockdownTest {
 
     @Test
     fun `should publish lockdown after first Partial establish without a settings event`() {
+        observer.start()
         assertTrue(open(1).isOpen)
         assertEquals(listOf(false, true), published)
         service.finishLocalFrontend(1)
@@ -93,6 +93,7 @@ class LocalCaptureLockdownTest {
 
     @Test
     fun `should observe lockdown switched on while Partial is running`() {
+        observer.start()
         lockdown = false
         assertTrue(open(1).isOpen)
         assertEquals(listOf(false, false), published)
@@ -107,6 +108,7 @@ class LocalCaptureLockdownTest {
 
     @Test
     fun `should resample on successful handover but not failed establish`() {
+        observer.start()
         assertTrue(open(1).isOpen)
         lockdown = false
         assertTrue(service.handoverLocalFrontend(1, 2, arrayOf("10.77.10.1/32")).result.isOpen)
@@ -117,5 +119,19 @@ class LocalCaptureLockdownTest {
         assertEquals(listOf(false, true, false), published)
         service.finishLocalFrontend(2)
         service.finishLocalFrontend(3)
+    }
+
+    @Test
+    fun `should retain blocking coverage after establish when only one setting is observed`() {
+        val alwaysOnApp = mockk<Uri>()
+        every { Settings.Secure.getUriFor("always_on_vpn_app") } returns alwaysOnApp
+        every { resolver.registerContentObserver(alwaysOnApp, false, observer) } throws
+            IllegalStateException("registration unavailable")
+        lockdown = false
+        observer.start()
+        assertEquals(listOf(true), published)
+        assertTrue(open(1).isOpen)
+        assertEquals(listOf(true, true), published)
+        service.finishLocalFrontend(1)
     }
 }

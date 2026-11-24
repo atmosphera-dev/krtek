@@ -53,14 +53,19 @@ class VpnLockdownObserverTest {
     }
 
     @Test
-    fun `should retain blocking coverage on registration failure and ignore late callbacks`() {
+    fun `should retain blocking coverage on registration failure until registration succeeds`() {
         every { resolver.registerContentObserver(any(), false, any()) } throws
             IllegalStateException("registration unavailable")
         val observer = observer { false }
         observer.start()
         assertEquals(listOf(true), values)
+        observer.onChange(false)
+        assertEquals(listOf(true, true), values)
+        every { resolver.registerContentObserver(any(), false, any()) } returns Unit
+        observer.start()
+        assertEquals(listOf(true, true, false), values)
         observer.close()
         observer.onChange(false)
-        assertEquals(listOf(true), values)
+        assertEquals(listOf(true, true, false), values)
     }
 }

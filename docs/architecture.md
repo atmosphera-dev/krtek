@@ -318,6 +318,8 @@ routes so Android's normal lookup can see both exposed interface families.
 Capture-owned OS observation reconciles lockdown changes through normal profile
 handover. The caller-scoped OS getter is resampled after every successful Builder
 establishment: its pre-establish false is not a lasting lockdown observation.
+If either settings observer registration fails, capture observation keeps
+blocking DNS coverage through callbacks and establishment until both register.
 This does not grant physical or Ordinary authority. Non-Local/non-DNS
 traffic is dropped, and each Ordinary DNS I/O retains its live OS gate.
 Without DNS demand or lockdown, Partial retains host routes only.
