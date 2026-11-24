@@ -276,9 +276,10 @@ class LocalNetworkEditorInstrumentedTest {
     }
 
     /** One Back per acknowledged system window; resumption forbids further navigation. */
-    internal fun returnFromSystemSettings(step: String) {
+    internal fun returnFromSystemSettings(step: String, requireSettingsVisit: Boolean = false) {
         val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15)
         var departingWindow: Int? = null
+        var observedSettings = false
         fun record(action: String, window: Int) {
             instrumentation.sendStatus(
                 0,
@@ -289,7 +290,11 @@ class LocalNetworkEditorInstrumentedTest {
             val root = instrumentation.uiAutomation.rootInActiveWindow
             val owner = root?.packageName?.toString()
             val resumed = mainActivityResumed()
-            if (resumed && owner == target.packageName) {
+            if (
+                resumed &&
+                    owner == target.packageName &&
+                    (!requireSettingsVisit || observedSettings)
+            ) {
                 compose.waitForIdle()
                 assertTrue(
                     compose
@@ -316,11 +321,15 @@ class LocalNetworkEditorInstrumentedTest {
                 if (root.windowId != departingWindow && root.refresh() && !mainActivityResumed()) {
                     departingWindow?.let { record("ack", it) }
                     departingWindow = root.windowId
+                    if (owner == "com.android.settings") observedSettings = true
                     record("back", root.windowId)
                     EditorBackNavigationTest.systemBack(instrumentation)
                 }
             }
             Thread.sleep(25)
+        }
+        check(!requireSettingsVisit || observedSettings) {
+            "Android Settings window was not observed"
         }
         error("System return transition was not acknowledged on the original route")
     }

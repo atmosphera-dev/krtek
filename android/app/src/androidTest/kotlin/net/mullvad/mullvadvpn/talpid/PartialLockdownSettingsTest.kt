@@ -12,6 +12,7 @@ import org.junit.jupiter.api.Assertions.assertEquals
 internal class PartialLockdownSettingsTest(private val shell: (String) -> String) {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
     private val app = instrumentation.targetContext.packageName
+    private val settings = "com.android.settings"
 
     fun read(): Boolean =
         when (val value = shell("settings get secure always_on_vpn_lockdown")) {
@@ -22,9 +23,28 @@ internal class PartialLockdownSettingsTest(private val shell: (String) -> String
 
     fun set(enabled: Boolean) {
         if (read() == enabled) return
+        await("Krtek window before opening VPN Settings") {
+            true.takeIf { automation.rootInActiveWindow?.packageName == app }
+        }
         val previousEvent = latestModeChange()
-        val launch = shell("am start -W -f 0x10008000 -a android.settings.VPN_SETTINGS")
-        check("Status: ok" in launch) { "Could not open Android VPN Settings: $launch" }
+        var failure: Throwable? = null
+        try {
+            val launch = shell("am start -W -f 0x10008000 -a android.settings.VPN_SETTINGS")
+            check("Status: ok" in launch) { "Could not open Android VPN Settings: $launch" }
+            changeLockdown(enabled, previousEvent)
+        } catch (error: Throwable) {
+            failure = error
+            throw error
+        } finally {
+            try {
+                closeVpnSettings()
+            } catch (cleanup: Throwable) {
+                failure?.addSuppressed(cleanup) ?: throw cleanup
+            }
+        }
+    }
+
+    private fun changeLockdown(enabled: Boolean, previousEvent: String?) {
         settleSettingsTransition()
         // The Settings setter changes the framework mode as well as persisting the secure key.
         val appLabel =
@@ -77,14 +97,25 @@ internal class PartialLockdownSettingsTest(private val shell: (String) -> String
             }
         }
         assertEquals(app, shell("settings get secure always_on_vpn_app"))
-        shell("input keyevent KEYCODE_BACK")
-        await("VPN Settings list") {
-            settingsNodes().firstOrNull {
-                it.viewIdResourceName == "com.android.settings:id/settings_button"
+    }
+
+    private fun closeVpnSettings() {
+        var departingWindow: Int? = null
+        await("Krtek window after VPN Settings") {
+            val root = automation.rootInActiveWindow ?: return@await null
+            if (root.packageName == app) return@await true
+            // Wait for each Back to be acknowledged before sending another one.
+            if (
+                root.packageName == settings && root.windowId != departingWindow && root.refresh()
+            ) {
+                val current = automation.rootInActiveWindow
+                if (current?.packageName == settings && current.windowId == root.windowId) {
+                    departingWindow = root.windowId
+                    EditorBackNavigationTest.systemBack(instrumentation)
+                }
             }
+            null
         }
-        shell("input keyevent KEYCODE_BACK")
-        await("Krtek window") { true.takeIf { automation.rootInActiveWindow?.packageName == app } }
     }
 
     private val automation
@@ -149,7 +180,7 @@ internal class PartialLockdownSettingsTest(private val shell: (String) -> String
     private fun settingsNodes(
         root: AccessibilityNodeInfo? = automation.rootInActiveWindow
     ): List<AccessibilityNodeInfo> {
-        if (root == null || root.packageName != "com.android.settings") return emptyList()
+        if (root == null || root.packageName != settings) return emptyList()
         return buildList {
             add(root)
             var index = 0

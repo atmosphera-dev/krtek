@@ -445,7 +445,7 @@ class SplitDnsInstrumentedTest {
                 "split_dns_private_dns_settings",
                 ui.copy(R.string.split_dns_open_private_dns),
             )
-            ui.returnFromSystemSettings("split-dns-private-dns")
+            ui.returnFromSystemSettings("split-dns-private-dns", requireSettingsVisit = true)
             ui.requireToggle("split_dns_enabled", true)
             harness.report("split_dns_settings_private_dns_note", "PASS")
         }
