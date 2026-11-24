@@ -18,6 +18,7 @@ import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
 import android.system.StructTimeval;
+import android.util.Log;
 import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
 import java.io.FileDescriptor;
@@ -173,8 +174,8 @@ public final class LocalNetworkConsumerService extends Service {
     Runnable deadline =
         () -> {
           if (completed.compareAndSet(false, true)) {
-             task.cancel(true);
-             ProbeResources active = ownedResources.get();
+            task.cancel(true);
+            ProbeResources active = ownedResources.get();
             if (active != null) active.close();
             send(reply, command, outcome("deadline"));
           }
@@ -202,15 +203,7 @@ public final class LocalNetworkConsumerService extends Service {
     if ("lookup".equals(transport)) return lookup(command);
     if ("split-dns-lookup".equals(transport)) return splitDnsLookup(command);
     if ("split-dns-tcp".equals(transport)) {
-      ProbeResources resources = new ProbeResources();
-      ownedResources.set(resources);
-      activeProbe = resources;
-      try {
-        return splitDnsTcp(command, resources);
-      } finally {
-        resources.close();
-        activeProbe = null;
-      }
+      return withProbeResources(ownedResources, resources -> splitDnsTcp(command, resources));
     }
     if ("gateway-echo".equals(transport)) {
       int family = command.getInt("family");
@@ -219,16 +212,8 @@ public final class LocalNetworkConsumerService extends Service {
           || !(family == 4 || family == 6) || !(size == 32 || size == 3072)) {
         return outcome("invalid");
       }
-      ProbeResources resources = new ProbeResources();
-      ownedResources.set(resources);
-      activeProbe = resources;
-      try {
-        if (Thread.currentThread().isInterrupted()) return outcome("deadline");
-        return LargeEchoProbe.run(family, size, resources::icmpSocket);
-      } finally {
-        resources.close();
-        activeProbe = null;
-      }
+      return withProbeResources(ownedResources,
+          resources -> LargeEchoProbe.run(family, size, resources::icmpSocket));
     }
     if ("local-udp-echo".equals(transport) || "local-udp-reply-limit".equals(transport)) {
       String destination = command.getString("destination");
@@ -237,50 +222,27 @@ public final class LocalNetworkConsumerService extends Service {
           || !command.containsKey("payload_size") || destination == null
           || !InetAddresses.isNumericAddress(destination) || size < 0 || size > 65508)
         return outcome("invalid");
-      ProbeResources resources = new ProbeResources();
-      ownedResources.set(resources);
-      activeProbe = resources;
-      try {
-        if (Thread.currentThread().isInterrupted()) return outcome("deadline");
-        if ("local-udp-reply-limit".equals(transport)) {
-          int maximum = InetAddresses.parseNumericAddress(destination).getAddress().length == 4
-              ? 65507 : 65487;
-          if (size != maximum + 1) return outcome("invalid");
-          return LocalUdpProbe.replyLimit(destination, size, resources::icmpSocket);
+      return withProbeResources(ownedResources, resources -> {
+        if (!"local-udp-reply-limit".equals(transport)) {
+          return LocalUdpProbe.run(destination, size, resources::icmpSocket);
         }
-        return LocalUdpProbe.run(destination, size, resources::icmpSocket);
-      } finally {
-        resources.close();
-        activeProbe = null;
-      }
+        int maximum = InetAddresses.parseNumericAddress(destination).getAddress().length == 4
+            ? 65507 : 65487;
+        if (size != maximum + 1) return outcome("invalid");
+        return LocalUdpProbe.replyLimit(destination, size, resources::icmpSocket);
+      });
     }
     if ("fragmented-udp".equals(transport)) {
       int family = command.getInt("family");
       if (command.size() != 3 || !command.containsKey("request_id")
           || !(family == 4 || family == 6)) return outcome("invalid");
-      ProbeResources resources = new ProbeResources();
-      ownedResources.set(resources);
-      activeProbe = resources;
-      try {
-        if (Thread.currentThread().isInterrupted()) return outcome("deadline");
-        return FragmentedUdpProbe.run(getFilesDir(), family, resources::icmpSocket);
-      } finally {
-        resources.close();
-        activeProbe = null;
-      }
+      return withProbeResources(ownedResources,
+          resources -> FragmentedUdpProbe.run(getFilesDir(), family, resources::icmpSocket));
     }
     if ("exit-check".equals(transport) || "icmp-check".equals(transport)) {
       if (command.size() != 2 || !command.containsKey("request_id")) return outcome("invalid");
-      ProbeResources resources = new ProbeResources();
-      ownedResources.set(resources);
-      activeProbe = resources;
-      try {
-        if (Thread.currentThread().isInterrupted()) return outcome("deadline");
-        return "exit-check".equals(transport) ? exitCheck(resources) : icmpCheck(resources);
-      } finally {
-        resources.close();
-        activeProbe = null;
-      }
+      return withProbeResources(ownedResources,
+          resources -> "exit-check".equals(transport) ? exitCheck(resources) : icmpCheck(resources));
     }
     String destination = command.getString("destination");
     String nonce = command.getString("nonce");
@@ -1045,7 +1007,7 @@ public final class LocalNetworkConsumerService extends Service {
           if (!audit.envelopeValid || !audit.usableA) throw new IOException("Ordinary TCP answer: " + audit.classification);
         }
       }
-      if (ordinaryBlocked && input.read() != -1) throw new IOException("Blocked ordinary query produced a TCP reply");
+      if (input.read() != -1) throw new IOException("Unexpected bytes after expected DNS TCP replies");
       Bundle result = outcome("split-dns-tcp");
       result.putInt("message_count", ordinaryBlocked ? 2 : 3);
       result.putInt("home_exact", 2);
@@ -1074,6 +1036,25 @@ public final class LocalNetworkConsumerService extends Service {
     return bytes;
   }
 
+  @FunctionalInterface
+  private interface ResourceProbe {
+    Bundle run(ProbeResources resources);
+  }
+
+  private Bundle withProbeResources(AtomicReference<ProbeResources> ownedResources, ResourceProbe probe) {
+    ProbeResources resources = new ProbeResources();
+    ownedResources.set(resources);
+    activeProbe = resources;
+    // Teardown or deadline sees the published owner, or interrupts before this check.
+    try (ProbeResources ignored = resources) {
+      if (Thread.currentThread().isInterrupted()) return outcome("deadline");
+      return probe.run(resources);
+    } finally {
+      activeProbe = null;
+      ownedResources.set(null);
+    }
+  }
+
   private static final class ProbeResources implements AutoCloseable {
     private boolean closed;
     private HttpsURLConnection connection;
@@ -1098,17 +1079,30 @@ public final class LocalNetworkConsumerService extends Service {
     @Override public synchronized void close() {
       closed = true;
       if (tcpSocket != null) {
-        try { tcpSocket.close(); } catch (IOException error) { throw new IllegalStateException("TCP probe close failed", error); }
+        Socket socket = tcpSocket;
         tcpSocket = null;
+        try {
+          socket.close();
+        } catch (IOException | RuntimeException error) {
+          Log.w("LocalNetworkConsumer", "TCP probe close failed", error);
+        }
       }
-      if (connection != null) { connection.disconnect(); connection = null; }
+      if (connection != null) {
+        HttpsURLConnection https = connection;
+        connection = null;
+        try {
+          https.disconnect();
+        } catch (RuntimeException error) {
+          Log.w("LocalNetworkConsumer", "HTTPS probe disconnect failed", error);
+        }
+      }
       if (icmpSocket != null) {
         FileDescriptor socket = icmpSocket;
         icmpSocket = null;
         try {
           Os.close(socket);
-        } catch (ErrnoException error) {
-          throw new IllegalStateException("ICMP socket close failed", error);
+        } catch (ErrnoException | RuntimeException error) {
+          Log.w("LocalNetworkConsumer", "ICMP socket close failed", error);
         }
       }
     }
