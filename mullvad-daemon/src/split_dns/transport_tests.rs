@@ -18,6 +18,27 @@ use hickory_proto::{
 };
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
+#[test]
+fn section_wire_bound_counts_questions_and_all_record_sections() {
+    let counts = HeaderCounts {
+        queries: 2,
+        answers: 3,
+        authorities: 4,
+        additionals: 5,
+    };
+    assert_eq!(minimum_section_bytes(counts), 142);
+}
+
+#[test]
+fn decode_accepts_minimum_wire_question_and_opt() {
+    let mut request = Message::query();
+    request.add_query(Query::query(Name::root(), RecordType::A));
+    request.edns = Some(Edns::new());
+    let bytes = request.to_vec().unwrap();
+    assert_eq!(bytes.len(), 12 + 5 + 11);
+    assert_eq!(decode_message(&bytes).unwrap(), request);
+}
+
 /// Records the exact resolver passed to both Hickory injection seams. Production
 /// must replace the fixture runtime with its grant/carrier-bound implementation.
 #[derive(Clone, Default)]
