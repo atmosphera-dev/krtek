@@ -480,7 +480,7 @@ impl<A: LocalAuthority> Forwarder<A> {
         match refusal {
             Refused::UnsupportedMtu => self.stats.unsupported_mtu += 1,
             Refused::Denied => self.stats.denied += 1,
-            Refused::Stale => self.stats.stale += 1,
+            Refused::Stale | Refused::AwaitingConfirmation => self.stats.stale += 1,
             Refused::Full => self.stats.full += 1,
             Refused::PreparationFailed => self.stats.preparation_failed += 1,
         }
@@ -928,7 +928,9 @@ impl<A: LocalAuthority> Forwarder<A> {
             Ok(grant) => Arc::new(grant),
             Err(reason) => {
                 self.refused(reason);
-                if flow.transport == Transport::Tcp && reason != Refused::Stale {
+                if flow.transport == Transport::Tcp
+                    && !matches!(reason, Refused::Stale | Refused::AwaitingConfirmation)
+                {
                     self.reset(bytes);
                 }
                 return;
@@ -1175,6 +1177,11 @@ impl<A: LocalAuthority> Forwarder<A> {
                 pending.grant = grant;
                 pending.attempt_revision = self.revision;
                 pending.retried = true;
+                self.pending.insert(flow, pending);
+            }
+            Err(Refused::AwaitingConfirmation) => {
+                // No transport attempt was made. Keep the original scope,
+                // datagrams, retry budget and deadline until the next event.
                 self.pending.insert(flow, pending);
             }
             Err(reason) => self.refused(reason),

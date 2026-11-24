@@ -2,7 +2,9 @@
 //! the loss/off state: the real feed/settings producer must retain revocation.
 use super::*;
 use mullvad_types::settings::local_network_access::split_dns::SplitDnsPolicy;
-use talpid_types::local_network::{LocalPhysicalAddress, LocalPhysicalNetwork};
+use talpid_types::local_network::{
+    AuthorityObservation, LocalPhysicalAddress, LocalPhysicalNetwork,
+};
 
 fn configured() -> LocalNetworkAccess {
     let mut on = policy();
@@ -58,6 +60,138 @@ fn home_flow() -> Flow {
     request
 }
 
+#[test]
+fn pr20_witness_cannot_revive_a_transport_whose_receive_scope_stays_live() {
+    let mut on = configured();
+    let mut fallback = on.rules[0].clone();
+    fallback.id = "00000000-0000-0000-0000-000000000002".parse().unwrap();
+    fallback.ssid_ids.clear();
+    on.rules.push(fallback);
+    let feed = LocalNetworkFeed::new(1);
+    assert!(feed.publish(1, snapshot(9)));
+    let authority = authority();
+    authority.update_policy(&on);
+    let observe = authority.clone();
+    feed.observe_authority(Arc::new(move |event| observe.observe(event)));
+    let flow = home_flow();
+    let buffers = BufferBudget::new(65536);
+    let scope = authority
+        .receive(flow.source.ip(), flow.destination.ip(), &buffers)
+        .unwrap();
+    let issued = authority.authorize_received(flow, &scope).unwrap();
+    assert_eq!(issued.physical.rule_ids.len(), 2);
+
+    let mut refresh = snapshot(9);
+    refresh.authority_revision = 1;
+    assert!(feed.revalidate(1, refresh.clone()));
+    assert!(
+        authority.current(&issued),
+        "same facts at the same sequence keep the grant"
+    );
+
+    let mut changed = refresh.clone();
+    changed.authority_revision = 2;
+    changed.networks[0].ssid_hex = Some("6f74686572".into());
+    assert!(feed.revalidate(1, changed));
+    assert!(
+        scope.current(),
+        "the fallback rule keeps the receive scope live"
+    );
+    assert!(!authority.current(&issued));
+
+    refresh.authority_revision = 3;
+    assert!(feed.revalidate(1, refresh.clone()));
+    assert!(scope.current());
+    assert!(
+        !authority.current(&issued),
+        "returned witness revived a retired transport"
+    );
+    refresh.sequence += 1;
+    assert!(feed.publish(1, refresh));
+    assert!(!authority.current(&issued));
+    let confirmed = authority.authorize_received(flow, &scope).unwrap();
+    assert!(authority.current(&confirmed));
+    assert_eq!(confirmed.physical.rule_ids, issued.physical.rule_ids);
+}
+
+#[tokio::test]
+async fn pr20_witness_keeps_only_live_unexpired_held_udp_until_confirmation() {
+    for (retire, expire) in [(false, false), (true, false), (false, true)] {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let preparations = Arc::new(AtomicUsize::new(0));
+        let called = preparations.clone();
+        let on = policy();
+        let authority = Arc::new(DeliveryAuthority::new(
+            &on,
+            Arc::new(move |_, _| {
+                if called.fetch_add(1, SeqCst) == 0 {
+                    Err(Refused::Stale)
+                } else {
+                    Ok(())
+                }
+            }),
+        ));
+        authority.observe(AuthorityObservation::Published(Some(Arc::new(snapshot(9)))));
+        let mut forwarder = Forwarder::new(
+            Arc::new(LoopbackAuthority {
+                authority: authority.clone(),
+                peer: Some((peer_addr, peer_addr)),
+            }),
+            DeliveryBuffers::new().local,
+        )
+        .unwrap();
+        forwarder.ingest(&udp_packet(home_flow(), b"held across confirmation"));
+        while forwarder.stats().stale == 0 {
+            bounded(forwarder.wait()).await;
+        }
+        tokio::time::pause();
+        let mut witness = snapshot(9);
+        witness.authority_revision = 1;
+        witness.local_ready = !retire;
+        authority.observe(AuthorityObservation::Revalidate(Arc::new(witness)));
+        forwarder.revalidate();
+        assert_eq!(
+            preparations.load(SeqCst),
+            1,
+            "a witness cannot prepare a new socket"
+        );
+        if expire {
+            tokio::time::advance(Duration::from_secs(2)).await;
+        }
+        authority.observe(AuthorityObservation::Published(Some(Arc::new(snapshot(
+            10,
+        )))));
+        forwarder.revalidate();
+        let mut buffer = [0; 32];
+        if !retire && !expire {
+            tokio::time::resume();
+            let length = bounded(async {
+                loop {
+                    tokio::select! {
+                        length = peer.recv(&mut buffer) => break length.unwrap(),
+                        _ = forwarder.wait() => {},
+                    }
+                }
+            })
+            .await;
+            assert_eq!(&buffer[..length], b"held across confirmation");
+        }
+        forwarder.close_all().await;
+        assert_eq!(
+            preparations.load(SeqCst),
+            if retire || expire { 1 } else { 2 }
+        );
+        assert!(
+            peer.try_recv(&mut buffer).is_err(),
+            "held UDP delivered more than once or after retirement"
+        );
+        if retire || expire {
+            tokio::time::resume();
+        }
+    }
+}
+
 #[tokio::test]
 async fn split_dns_publication_witness_retains_benign_scopes_but_cannot_grant_or_revive_work() {
     let on = configured();
@@ -104,7 +238,7 @@ async fn split_dns_publication_witness_retains_benign_scopes_but_cannot_grant_or
     assert!(
         matches!(
             authority.authorize_received(home_flow(), &local),
-            Err(Refused::Stale)
+            Err(Refused::AwaitingConfirmation)
         ),
         "the retained scope alone cannot issue a new transport from incomplete facts"
     );

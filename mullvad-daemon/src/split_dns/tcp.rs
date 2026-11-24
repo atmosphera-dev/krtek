@@ -208,9 +208,6 @@ impl LocalAuthority for Owner {
             .dns_input(source, destination, buffers)
             .map(|(_, scope)| scope)
     }
-    fn authorize(&self, _: Flow) -> Result<Self::Grant, Refused> {
-        Err(Refused::Denied)
-    }
     fn authorize_received(&self, flow: Flow, scope: &ReceiveScope) -> Result<Self::Grant, Refused> {
         if flow.transport != talpid_lan_forwarder::Transport::Tcp
             || flow.destination.port() != 53

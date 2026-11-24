@@ -1044,9 +1044,6 @@ impl LocalAuthority for LoopbackAuthority {
     fn disposition(&self, destination: IpAddr) -> Disposition {
         self.authority.disposition(destination)
     }
-    fn authorize(&self, flow: Flow) -> Result<DeliveryGrant, Refused> {
-        self.authority.authorize(flow)
-    }
     fn prepare(&self, socket: &socket2::Socket, grant: &DeliveryGrant) -> Result<(), Refused> {
         self.authority.prepare(socket, grant)
     }

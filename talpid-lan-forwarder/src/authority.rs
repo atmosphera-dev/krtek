@@ -138,6 +138,9 @@ pub enum Refused {
     UnsupportedMtu,
     Denied,
     Stale,
+    /// The original receive scope is still valid; a complete observation must
+    /// confirm it before a fresh transport can be issued.
+    AwaitingConfirmation,
     Full,
     PreparationFailed,
 }
@@ -166,8 +169,6 @@ pub trait LocalAuthority: Send + Sync + 'static {
     ) -> Result<Self::Grant, Refused> {
         Err(Refused::Denied)
     }
-    /// Decide without creating, preparing or connecting a socket.
-    fn authorize(&self, flow: Flow) -> Result<Self::Grant, Refused>;
     /// Protect and bind under the platform's admission check. Runs off the owner task.
     fn prepare(&self, socket: &socket2::Socket, grant: &Self::Grant) -> Result<(), Refused>;
     /// Re-evaluate the grant against the latest inputs.

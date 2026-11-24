@@ -51,7 +51,7 @@ impl DeliveryAuthority {
         buffers: &dyn RelayBufferAllocator,
     ) -> Result<(Arc<SuffixMatcher>, ReceiveScope), Refused> {
         let mut inputs = self.inputs.write().unwrap();
-        inputs.revalidate_receive();
+        inputs.revalidate_receive(None, None);
         let dns = &inputs.policy.split_dns;
         if !dns.enabled {
             return Err(Refused::Denied);

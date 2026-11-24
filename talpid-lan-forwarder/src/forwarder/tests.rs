@@ -1044,21 +1044,18 @@ impl LocalAuthority for Authority {
         {
             return Err(Refused::Stale);
         }
-        self.authorize(flow)
+        self.authorizations.fetch_add(1, Ordering::SeqCst);
+        if self.deny.load(Ordering::SeqCst) {
+            Err(Refused::Denied)
+        } else {
+            Ok(())
+        }
     }
     fn disposition(&self, _: std::net::IpAddr) -> Disposition {
         if self.drop.load(Ordering::SeqCst) {
             Disposition::Drop
         } else {
             Disposition::Local
-        }
-    }
-    fn authorize(&self, _: Flow) -> Result<(), Refused> {
-        self.authorizations.fetch_add(1, Ordering::SeqCst);
-        if self.deny.load(Ordering::SeqCst) {
-            Err(Refused::Denied)
-        } else {
-            Ok(())
         }
     }
     fn prepare(&self, socket: &Socket, _: &()) -> Result<(), Refused> {

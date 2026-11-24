@@ -451,9 +451,12 @@ Physical observation has two publication responsibilities. Under its event lock,
 the watcher hands a monotone, revocation-only witness to the same Rust authority
 before coalescing callbacks into a complete status sample. The shared eligibility
 evaluator retires affected receive scopes immediately; harmless refreshes retain
-eligible scopes. A witness cannot admit new work, replace status, prepare a socket
-or call the platform. Its revision fences late complete samples and stale
-callbacks. New work waits for a complete sample at the current fence. JNI witness
+eligible scopes. A change in the matching transport lease retires its incarnation
+even if the receive scope stays eligible. A witness cannot admit new work, replace
+status, prepare a socket or call the platform. Its revision fences late complete samples and stale
+callbacks. New work waits for a complete sample at the current fence. UDP already
+held for a stale preparation can wait for confirmation without resetting its scope,
+single retry or deadline. JNI witness
 conversion failure closes authority immediately; platform demand cleanup is
 deferred to the async owner outside the event lock. Committed settings publish
 their exact Local policy to that same authority before asynchronous listeners or
