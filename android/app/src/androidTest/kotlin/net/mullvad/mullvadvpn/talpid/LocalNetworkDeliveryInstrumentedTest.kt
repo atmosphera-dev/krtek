@@ -3574,6 +3574,12 @@ class LocalNetworkDeliveryInstrumentedTest {
             File(target.filesDir, "krtek-probes").apply { check(isDirectory || mkdir()) }
         withTimeout(30_000) {
             while (isActive) {
+                val partialBefore =
+                    if (
+                        expectedTunnel == "Disconnected" && forwarding != ForwardingAvailability.Off
+                    )
+                        CaptureReadiness.partialReceipt(daemonTailOrEmpty(), previousGeneration)
+                    else null
                 val vpn = shell("dumpsys vpn_management")
                 val connectivity = shell("dumpsys connectivity")
                 File(directory, "$id-vpn.txt").writeText(vpn)
@@ -3742,11 +3748,19 @@ class LocalNetworkDeliveryInstrumentedTest {
                     ) {
                         assertEquals(partialLockdown, routes.any { it.endsWith("/0") })
                         assertEquals(1280, checkNotNull(tokenField(agent, "MTU: ")).toInt())
-                        val generation = partialCaptureFormat(previousGeneration)
-                        if (generation == null) {
+                        val receipt =
+                            CaptureReadiness.matchingPartialReceipt(
+                                partialBefore,
+                                daemonTailOrEmpty(),
+                                previousGeneration,
+                            )
+                        if (receipt == null) {
                             delay(100)
                             continue
                         }
+                        report("capture_generation", receipt.generation)
+                        report("capture_session_generation", receipt.session)
+                        report("capture_format", receipt.format)
                         report("frontend", "present")
                         report("frontend_interface", iface)
                         report("frontend_net_id", netId)
@@ -3765,7 +3779,7 @@ class LocalNetworkDeliveryInstrumentedTest {
                             dns.ifBlank { "[]" },
                             1280,
                             uids,
-                            generation,
+                            receipt.generation,
                             null,
                             iface,
                             netId,
@@ -3785,15 +3799,8 @@ class LocalNetworkDeliveryInstrumentedTest {
             ByteArray(size).also { log.readFully(it) }.toString(Charsets.UTF_8)
         }
 
-    private fun partialCaptureFormat(previousGeneration: String?): String? {
-        if (!File(target.filesDir, "daemon.log").isFile) return null
-        val receipt =
-            CaptureReadiness.partialReceipt(daemonTail(), previousGeneration) ?: return null
-        report("capture_generation", receipt.generation)
-        report("capture_session_generation", receipt.session)
-        report("capture_format", receipt.format)
-        return receipt.generation
-    }
+    private fun daemonTailOrEmpty(): String =
+        if (File(target.filesDir, "daemon.log").isFile) daemonTail() else ""
 
     private fun captureReceipt(
         iface: String,
