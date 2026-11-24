@@ -407,8 +407,9 @@ fn stock_lwip_wrapper_timer_survives_runtime_loss_with_another_handle_alive() {
     drop(scope);
     drop(first);
     api.0.lock().unwrap().expires = core.now().0 + 1;
+    // The weak scope stops upgrading before its destructor refunds the charge.
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
-    while weak.upgrade().is_some() && std::time::Instant::now() < deadline {
+    while budget.used() != NATIVE_RESERVATION && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(
