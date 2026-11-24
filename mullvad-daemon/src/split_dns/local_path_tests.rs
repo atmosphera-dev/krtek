@@ -9,7 +9,7 @@ use mullvad_types::settings::local_network_access::{
     split_dns::{SplitDnsPolicy, SuffixMatcher},
 };
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-use talpid_lan_forwarder::ReceiveScope;
+use talpid_lan_forwarder::{ReceiveScope, Refused};
 use talpid_netstack::buffer_budget::BufferBudget;
 
 fn configured() -> LocalNetworkAccess {
@@ -151,6 +151,56 @@ async fn split_dns_home_path_local_close_retires_existing_leases_and_refuses_new
             .is_err()
     );
     path.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn split_dns_home_path_local_exchange_reuses_admitted_runtime_credit() {
+    for protocol in [Protocol::Udp, Protocol::Tcp] {
+        assert_exchange_reuses_admitted_runtime_credit(protocol).await;
+    }
+}
+
+async fn assert_exchange_reuses_admitted_runtime_credit(protocol: Protocol) {
+    let on = configured();
+    let budget = Arc::new(BufferBudget::new(256 * 1024));
+    let preparation_headroom = Arc::new(AtomicUsize::new(usize::MAX));
+    let authority = Arc::new(DeliveryAuthority::new(
+        &on,
+        Arc::new({
+            let budget = budget.clone();
+            let preparation_headroom = preparation_headroom.clone();
+            move |_, _| {
+                preparation_headroom.store(budget.limit() - budget.used(), SeqCst);
+                // Observe socket preparation without allowing physical I/O.
+                Err(Refused::Denied)
+            }
+        }),
+    ));
+    authority.update(&on, Some(observation()));
+    let path = LocalHomeDnsPath::new(authority.clone(), budget.clone());
+    let input = input(&authority);
+
+    let query = path.authorize(&input, client(), protocol).unwrap();
+    // Enough for the 16 KiB preparation, but not a second 4 KiB runtime.
+    let filler = budget
+        .reserve(budget.limit() - budget.used() - 18 * 1024)
+        .unwrap();
+    assert!(
+        query
+            .exchange(Duration::from_secs(1), message())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        preparation_headroom.load(SeqCst),
+        2 * 1024,
+        "{protocol:?}: admitted query must reach separately charged preparation"
+    );
+    drop(filler);
+    drop(query);
+    path.close().await.unwrap();
+    authority.update(&on, Some(observation()));
+    assert_eq!(budget.used(), 0);
 }
 
 #[tokio::test]

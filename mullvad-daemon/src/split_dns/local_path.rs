@@ -95,10 +95,14 @@ impl HomeDnsQuery for LocalQuery {
         message: Message,
     ) -> PathFuture<'_, Result<DnsResponse, ExchangeError>> {
         Box::pin(async move {
+            let protocol = match self.grant.transport() {
+                Transport::Udp => Protocol::Udp,
+                Transport::Tcp => Protocol::Tcp,
+            };
             tokio::select! {
                 biased;
                 _ = self.retired() => Err(io::Error::new(io::ErrorKind::PermissionDenied, "Home path retired").into()),
-                result = self.io.exchange(self.authority.clone(), &self.grant, timeout, message) => result,
+                result = self.runtime.exchange(protocol, timeout, message) => result,
             }
         })
     }

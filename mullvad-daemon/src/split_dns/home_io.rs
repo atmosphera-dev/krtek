@@ -26,6 +26,8 @@ use tokio::{
     task::JoinSet,
 };
 
+use super::transport::{self, ExchangeError, Protocol};
+
 const PREPARATION_BYTES: usize = 16 * 1024;
 const CAPABILITY_BYTES: usize = 4096;
 
@@ -123,32 +125,6 @@ impl HomeIoOwner {
         self.with_capability(Arc::new(HomeCapability { authority, grant }))
     }
 
-    /// Cancellation drops only nonblocking I/O. Blocking platform work remains
-    /// in this owner and must be joined by close before capture-owner release.
-    pub(crate) async fn exchange(
-        &self,
-        authority: Arc<crate::local_delivery::DeliveryAuthority>,
-        grant: &crate::local_delivery::home_dns::HomeDnsGrant,
-        timeout: Duration,
-        message: hickory_proto::op::Message,
-    ) -> Result<hickory_proto::op::DnsResponse, super::transport::ExchangeError> {
-        let runtime = self.runtime(authority.clone(), grant.clone())?;
-        let protocol = match grant.transport() {
-            talpid_lan_forwarder::Transport::Udp => super::transport::Protocol::Udp,
-            talpid_lan_forwarder::Transport::Tcp => super::transport::Protocol::Tcp,
-        };
-        let result = tokio::select! {
-            biased;
-            _ = authority.home_dns_retired(grant) => Err(revoked().into()),
-            result = super::transport::exchange(runtime, grant.destination(), protocol, timeout, message) => result,
-        };
-        if authority.home_dns_current(grant) {
-            result
-        } else {
-            Err(revoked().into())
-        }
-    }
-
     pub(super) fn with_capability(
         &self,
         capability: Arc<dyn Capability>,
@@ -182,6 +158,7 @@ impl HomeIoOwner {
         }
     }
 
+    // A cancelled exchange drops the waiter, not the blocking work owned here.
     async fn prepare(&self, runtime: HomeRuntime, tcp: bool) -> io::Result<socket2::Socket> {
         runtime.check(runtime.capability.destination())?;
         if !runtime.capability.permits(tcp) {
@@ -246,6 +223,19 @@ pub(crate) struct HomeRuntime {
 impl HomeRuntime {
     pub(crate) fn current(&self) -> bool {
         self.check(self.capability.destination()).is_ok()
+    }
+
+    pub(crate) async fn exchange(
+        &self,
+        protocol: Protocol,
+        timeout: Duration,
+        message: hickory_proto::op::Message,
+    ) -> Result<hickory_proto::op::DnsResponse, ExchangeError> {
+        let server = self.capability.destination();
+        self.check(server)?;
+        let result = transport::exchange(self.clone(), server, protocol, timeout, message).await;
+        self.check(server)?;
+        result
     }
 
     fn check(&self, server: SocketAddr) -> io::Result<()> {

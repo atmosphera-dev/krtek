@@ -242,7 +242,7 @@ fn split_dns_home_query_app_and_home_address_families_are_independent() {
 
 #[tokio::test]
 async fn split_dns_home_query_hickory_runtime_retains_exact_resolver_and_revocation_fence() {
-    use crate::split_dns::home_io::HomeIoOwner;
+    use crate::split_dns::{home_io::HomeIoOwner, transport::Protocol};
     use hickory_net::runtime::RuntimeProvider;
     let prepared = Arc::new(AtomicUsize::new(0));
     let count = prepared.clone();
@@ -306,13 +306,8 @@ async fn split_dns_home_query_hickory_runtime_retains_exact_resolver_and_revocat
         hickory_proto::rr::RecordType::A,
     ));
     assert!(
-        owner
-            .exchange(
-                authority.clone(),
-                &grant,
-                std::time::Duration::from_secs(2),
-                request
-            )
+        runtime
+            .exchange(Protocol::Udp, std::time::Duration::from_secs(2), request)
             .await
             .is_err()
     );
