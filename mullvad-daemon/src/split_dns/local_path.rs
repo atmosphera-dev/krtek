@@ -6,7 +6,10 @@ use hickory_proto::op::{DnsResponse, Message};
 use talpid_lan_forwarder::Transport;
 use talpid_types::relay_flow::RelayBufferAllocator;
 
-use crate::local_delivery::{DeliveryAuthority, home_dns::HomeDnsGrant};
+use crate::local_delivery::{
+    DeliveryAuthority,
+    home_dns::{DnsInput, HomeDnsGrant},
+};
 
 use super::{
     home_io::HomeIoOwner,
@@ -36,6 +39,7 @@ impl LocalHomeDnsPath {
 impl HomeDnsPath for LocalHomeDnsPath {
     fn authorize(
         &self,
+        input: &DnsInput,
         client: SocketAddr,
         protocol: Protocol,
     ) -> Result<Box<dyn HomeDnsQuery>, ExchangeError> {
@@ -45,7 +49,7 @@ impl HomeDnsPath for LocalHomeDnsPath {
         };
         let grant = self
             .authority
-            .home_dns_authorize_configured(client, transport, &*self.buffers)
+            .home_dns_authorize_configured(input, client, transport, &*self.buffers)
             .map_err(|error| io::Error::other(format!("Home path refused: {error:?}")))?;
         // Owner closure and resource admission are checked before issuing a lease,
         // not delayed until the consumer first polls its exchange future.

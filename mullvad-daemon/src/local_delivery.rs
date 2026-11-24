@@ -581,13 +581,13 @@ impl DeliveryAuthority {
 
     fn receive_for(
         &self,
+        inputs: &mut Inputs,
         source: IpAddr,
         destination: IpAddr,
         purpose: ReceivePurpose,
         buffers: &dyn RelayBufferAllocator,
     ) -> Result<ReceiveScope, Refused> {
-        let mut inputs = self.inputs.write().unwrap();
-        self.reclaim_receive(&mut inputs);
+        self.reclaim_receive(inputs);
         let key = (source, destination, purpose);
         let grant = match inputs.grant_for(source, destination, purpose) {
             Ok(grant) => grant,
@@ -677,12 +677,11 @@ impl DeliveryAuthority {
     }
 
     fn authorize_received_for(
-        &self,
+        inputs: &Inputs,
         flow: Flow,
         scope: &ReceiveScope,
         purpose: ReceivePurpose,
     ) -> Result<DeliveryGrant, Refused> {
-        let inputs = self.inputs.read().unwrap();
         if !scope.current()
             || scope.source() != flow.source.ip()
             || scope.destination() != flow.destination.ip()
@@ -762,7 +761,13 @@ impl LocalAuthority for DeliveryAuthority {
         destination: IpAddr,
         buffers: &dyn RelayBufferAllocator,
     ) -> Result<ReceiveScope, Refused> {
-        self.receive_for(source, destination, ReceivePurpose::Local, buffers)
+        self.receive_for(
+            &mut self.inputs.write().unwrap(),
+            source,
+            destination,
+            ReceivePurpose::Local,
+            buffers,
+        )
     }
 
     fn authorize_received(
@@ -770,7 +775,12 @@ impl LocalAuthority for DeliveryAuthority {
         flow: Flow,
         scope: &ReceiveScope,
     ) -> Result<DeliveryGrant, Refused> {
-        self.authorize_received_for(flow, scope, ReceivePurpose::Local)
+        Self::authorize_received_for(
+            &self.inputs.read().unwrap(),
+            flow,
+            scope,
+            ReceivePurpose::Local,
+        )
     }
 
     fn prepare(&self, socket: &socket2::Socket, grant: &DeliveryGrant) -> Result<(), Refused> {

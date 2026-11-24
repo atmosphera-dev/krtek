@@ -10,6 +10,7 @@ use std::{future::Future, io, net::SocketAddr, pin::Pin, time::Duration};
 use hickory_proto::op::{DnsResponse, Message};
 
 use super::transport::{ExchangeError, Protocol};
+use crate::local_delivery::home_dns::DnsInput;
 
 pub(crate) type PathFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -18,6 +19,7 @@ pub(crate) trait HomeDnsPath: Send + Sync {
     /// The path selects its configured Home resolver and authorizes the request.
     fn authorize(
         &self,
+        input: &DnsInput,
         client: SocketAddr,
         protocol: Protocol,
     ) -> Result<Box<dyn HomeDnsQuery>, ExchangeError>;

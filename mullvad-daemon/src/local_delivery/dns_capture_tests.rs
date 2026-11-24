@@ -13,15 +13,25 @@ use hickory_proto::{
 };
 use talpid_tunnel::android_frontend::LocalReceiver;
 
-struct Home(Arc<AtomicUsize>);
+#[derive(Clone)]
+struct Home {
+    calls: Arc<AtomicUsize>,
+    input_id: Arc<std::sync::atomic::AtomicU64>,
+}
 impl HomeDnsPath for Home {
     fn authorize(
         &self,
+        input: &super::home_dns::DnsInput,
         _: SocketAddr,
         _: Protocol,
     ) -> Result<Box<dyn HomeDnsQuery>, ExchangeError> {
-        self.0.fetch_add(1, SeqCst);
-        Ok(Box::new(Home(self.0.clone())))
+        assert_eq!(
+            input.scope().id(),
+            self.input_id.load(SeqCst),
+            "must authorize with the captured policy context"
+        );
+        self.calls.fetch_add(1, SeqCst);
+        Ok(Box::new(self.clone()))
     }
     fn close(&self) -> PathFuture<'_, io::Result<()>> {
         Box::pin(async { Ok(()) })
@@ -140,8 +150,12 @@ async fn full_capture(home: bool, ipv6: bool, malformed: bool, tcp: bool) {
     authority.install(delivery.authority(&broker));
     let config = delivery.into_frontend(authority.clone());
     let calls = Arc::new(AtomicUsize::new(0));
+    let input_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let path: Arc<dyn HomeDnsPath> = if home {
-        Arc::new(Home(calls.clone()))
+        Arc::new(Home {
+            calls: calls.clone(),
+            input_id: input_id.clone(),
+        })
     } else {
         crate::split_dns::local_home_path(authority.clone(), buffers.local.clone())
     };
@@ -164,6 +178,10 @@ async fn full_capture(home: bool, ipv6: bool, malformed: bool, tcp: bool) {
     let receipt = bounded(requested.configured()).await.unwrap();
     let mut pair = broker.acquire(&receipt).unwrap();
     pair.control.activate().unwrap();
+    let input = authority
+        .dns_input(client.ip(), resolver.ip(), &*buffers.local)
+        .unwrap();
+    input_id.store(input.scope().id(), SeqCst);
     let peer = UnixDatagram::from_std(platform.peer.lock().unwrap().take().unwrap()).unwrap();
     if tcp {
         use futures::FutureExt;
@@ -276,14 +294,14 @@ async fn full_capture(home: bool, ipv6: bool, malformed: bool, tcp: bool) {
     }
     assert_eq!(calls.load(SeqCst), 2 * usize::from(home));
     // OFF/ON before notification consumption must never revive old input scopes.
-    let (_, scope) = authority
+    let input = authority
         .dns_input(client.ip(), resolver.ip(), &*buffers.local)
         .unwrap();
     policy.split_dns.enabled = false;
     authority.update_policy(&policy);
     policy.split_dns.enabled = true;
     authority.update_policy(&policy);
-    assert!(!scope.current());
+    assert!(!input.scope().current());
     requested.transport_joined();
     pair.control.detach();
     owner.stop().await.unwrap();

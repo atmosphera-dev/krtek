@@ -107,7 +107,7 @@ impl DnsReceiver for CaptureDns {
         let Ok(Some((source, destination))) = dns_endpoints(bytes) else {
             return true;
         };
-        let Ok((matcher, scope)) = self
+        let Ok(context) = self
             .authority
             .dns_input(source, destination, &*self.buffers)
         else {
@@ -128,7 +128,7 @@ impl DnsReceiver for CaptureDns {
             }
         }
         let receiver = self.receiver.as_mut().expect("DNS input owner");
-        if let Ok(Some(input)) = receiver.ingest(&scope, bytes)
+        if let Ok(Some(input)) = receiver.ingest(context.scope(), bytes)
             && let Ok(packet) = input.packet()
         {
             if packet.flow.transport == Transport::Tcp {
@@ -159,7 +159,7 @@ impl DnsReceiver for CaptureDns {
                 return true;
             }
             match udp::inspect(
-                Some(&matcher),
+                Some(&context),
                 advertised,
                 packet.flow.source,
                 packet.flow.destination,
@@ -173,7 +173,7 @@ impl DnsReceiver for CaptureDns {
                         let _ = self.work.as_mut().expect("DNS work owner").submit_system(
                             system.clone(),
                             input,
-                            scope.clone(),
+                            context.scope().clone(),
                         );
                     } else {
                         self.original = Some(input);

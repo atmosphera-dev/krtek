@@ -32,6 +32,7 @@ struct Lease {
 impl HomeDnsPath for Arc<Path> {
     fn authorize(
         &self,
+        _: &crate::local_delivery::home_dns::DnsInput,
         client: SocketAddr,
         _: Protocol,
     ) -> Result<Box<dyn HomeDnsQuery>, ExchangeError> {
@@ -141,12 +142,13 @@ impl Fixture {
         request.set_edns(edns);
         let bytes = request.to_vec().unwrap();
         let matcher = SuffixMatcher::compile(["home"]).unwrap();
+        let scope = ReceiveScope::new(client.ip(), resolver.ip(), &*self.buffers).unwrap();
+        let context = crate::local_delivery::home_dns::DnsInput::for_test(matcher, scope.clone());
         let UdpDecision::Intercept(query) =
-            inspect(Some(&matcher), &[resolver.ip()], client, resolver, &bytes)
+            inspect(Some(&context), &[resolver.ip()], client, resolver, &bytes)
         else {
             panic!("Home query");
         };
-        let scope = ReceiveScope::new(client.ip(), resolver.ip(), &*self.buffers).unwrap();
         let wire = packet::udp_reply(
             Flow {
                 source: resolver,

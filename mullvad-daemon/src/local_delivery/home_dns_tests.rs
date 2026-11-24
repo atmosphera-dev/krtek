@@ -27,6 +27,76 @@ fn query_flow(transport: Transport) -> Flow {
 }
 
 #[test]
+fn split_dns_configured_home_requires_the_original_classification_context() {
+    use hickory_proto::{
+        op::{Message, Query},
+        rr::{Name, RecordType},
+    };
+    use mullvad_types::settings::local_network_access::split_dns::DnsLane;
+
+    let on = configured();
+    let source = query_flow(Transport::Udp).source;
+    let resolver = "192.0.2.53".parse().unwrap();
+    let buffers = BufferBudget::new(128 * 1024);
+    let prepared = Arc::new(AtomicUsize::new(0));
+    let count = prepared.clone();
+    let authority = DeliveryAuthority::new(
+        &on,
+        Arc::new(move |_, _| {
+            count.fetch_add(1, SeqCst);
+            Ok(())
+        }),
+    );
+    let mut replacement = on.clone();
+    // The physical resolver remains identical. Only the classification changes.
+    replacement.split_dns.suffixes = vec!["new.home.".into()];
+    let request = |name: &str| {
+        let mut request = Message::query();
+        request.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
+        request
+    };
+    for transport in [Transport::Udp, Transport::Tcp] {
+        authority.update(&on, Some(observation()));
+        let input = authority
+            .dns_input(source.ip(), resolver, &buffers)
+            .unwrap();
+        assert_eq!(
+            input.matcher().classify(&request("old.home.")).unwrap(),
+            DnsLane::Home
+        );
+        authority.update_policy(&replacement);
+        assert!(!input.scope().current());
+        assert!(
+            authority
+                .home_dns_authorize_configured(&input, source, transport, &buffers)
+                .is_err(),
+            "classification under a retired policy issued a configured Home grant for {transport:?}"
+        );
+        let input = authority
+            .dns_input(source.ip(), resolver, &buffers)
+            .unwrap();
+        assert_eq!(
+            input.matcher().classify(&request("old.home.")).unwrap(),
+            DnsLane::Ordinary
+        );
+        assert_eq!(
+            input.matcher().classify(&request("new.home.")).unwrap(),
+            DnsLane::Home
+        );
+        let query = authority
+            .home_dns_authorize_configured(&input, source, transport, &buffers)
+            .unwrap();
+        let (kind, protocol) = match transport {
+            Transport::Udp => (socket2::Type::DGRAM, socket2::Protocol::UDP),
+            Transport::Tcp => (socket2::Type::STREAM, socket2::Protocol::TCP),
+        };
+        let socket = socket2::Socket::new(socket2::Domain::IPV4, kind, Some(protocol)).unwrap();
+        authority.home_dns_prepare(&socket, &query).unwrap();
+    }
+    assert_eq!(prepared.load(SeqCst), 2);
+}
+
+#[test]
 fn split_dns_home_query_app_and_home_address_families_are_independent() {
     for home_v6 in [false, true] {
         for client_v6 in [false, true] {
@@ -52,8 +122,14 @@ fn split_dns_home_query_app_and_home_address_families_are_independent() {
             }
             .parse()
             .unwrap();
+            let resolver = if client_v6 { "fd00::53" } else { "192.0.2.53" }
+                .parse()
+                .unwrap();
+            let input = authority
+                .dns_input(source.ip(), resolver, &buffers)
+                .unwrap();
             let query = authority
-                .home_dns_authorize_configured(source, Transport::Udp, &buffers)
+                .home_dns_authorize_configured(&input, source, Transport::Udp, &buffers)
                 .expect("Home's two legs must not require one IP packet family");
             assert_eq!(query.0.scope.source(), source.ip());
             assert_eq!(query.0.scope.destination(), home);

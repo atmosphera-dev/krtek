@@ -70,6 +70,11 @@ struct ReceiverLifetime {
 }
 
 impl CompletedDatagram {
+    /// The caller's admission scope, not the receiver's reassembly identity.
+    pub fn parent_scope_id(&self) -> u64 {
+        self.pending.parent.id()
+    }
+
     pub fn tcp_packet(&self, buffers: &dyn RelayBufferAllocator) -> Result<RelayBuffer, IpError> {
         if !self.current() {
             return Err(IpError::Stale);

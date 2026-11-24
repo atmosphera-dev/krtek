@@ -57,9 +57,9 @@ fn intercepted(request: &Message, ipv6: bool) -> UdpQuery {
     }
     .parse()
     .unwrap();
-    let matcher = SuffixMatcher::compile(["home", "my-matrix-server.com"]).unwrap();
+    let input = test_input(client, resolver, ["home", "my-matrix-server.com"]);
     match inspect(
-        Some(&matcher),
+        Some(&input),
         &[resolver.ip()],
         client,
         resolver,
@@ -68,6 +68,21 @@ fn intercepted(request: &Message, ipv6: bool) -> UdpQuery {
         UdpDecision::Intercept(query) => *query,
         _ => panic!("listed question was not intercepted"),
     }
+}
+
+fn test_input<const N: usize>(
+    client: SocketAddr,
+    resolver: SocketAddr,
+    suffixes: [&str; N],
+) -> DnsInput {
+    use mullvad_types::settings::local_network_access::split_dns::SuffixMatcher;
+    use talpid_lan_forwarder::ReceiveScope;
+    use talpid_netstack::buffer_budget::BufferBudget;
+
+    DnsInput::for_test(
+        SuffixMatcher::compile(suffixes).unwrap(),
+        ReceiveScope::new(client.ip(), resolver.ip(), &BufferBudget::new(1024)).unwrap(),
+    )
 }
 
 fn check_reply(reply: &UdpReply, original: &Message, ipv6: bool) -> Message {
@@ -99,9 +114,9 @@ fn check_reply(reply: &UdpReply, original: &Message, ipv6: bool) -> Message {
 
 #[test]
 fn split_dns_udp_unlisted_and_out_of_scope_keep_original_bytes() {
-    let matcher = SuffixMatcher::compile(["home"]).unwrap();
     let client = "172.27.1.1:49152".parse().unwrap();
     let resolver: SocketAddr = "100.64.0.3:53".parse().unwrap();
+    let input = test_input(client, resolver, ["home"]);
     for (name, enabled, destination, advertised) in [
         ("outside.example.", true, resolver, true),
         ("myhome.", true, resolver, true),
@@ -117,7 +132,7 @@ fn split_dns_udp_unlisted_and_out_of_scope_keep_original_bytes() {
             vec![]
         };
         let UdpDecision::PassThrough(original) = inspect(
-            enabled.then_some(&matcher),
+            enabled.then_some(&input),
             &servers,
             client,
             destination,
@@ -273,9 +288,9 @@ async fn split_dns_udp_ambiguous_and_unsupported_listed_messages_never_dispatch(
 
 #[test]
 fn split_dns_udp_malformed_or_response_payload_cannot_authorize_forwarding() {
-    let matcher = SuffixMatcher::compile(["home"]).unwrap();
     let source = "172.27.1.1:49152".parse().unwrap();
     let resolver: SocketAddr = "100.64.0.3:53".parse().unwrap();
+    let input = test_input(source, resolver, ["home"]);
     let good = request("nas.home.", RecordType::A, None).to_vec().unwrap();
     let mut trailing = good.clone();
     trailing.push(42);
@@ -291,7 +306,7 @@ fn split_dns_udp_malformed_or_response_payload_cannot_authorize_forwarding() {
         response,
     ] {
         assert!(matches!(
-            inspect(Some(&matcher), &[resolver.ip()], source, resolver, &bytes),
+            inspect(Some(&input), &[resolver.ip()], source, resolver, &bytes),
             UdpDecision::Drop
         ));
     }

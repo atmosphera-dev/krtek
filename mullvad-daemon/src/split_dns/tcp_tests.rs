@@ -4,6 +4,7 @@ use hickory_proto::{
     op::{DnsResponse, Query},
     rr::{Name, RData, Record, RecordType, rdata::A},
 };
+use mullvad_types::settings::local_network_access::split_dns::SuffixMatcher;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use talpid_netstack::buffer_budget::BufferBudget;
 use talpid_types::relay_flow::{RelayCaptureGeneration, RelayCaptureOwner, RelaySources};
@@ -17,6 +18,7 @@ struct Home {
 impl HomeDnsPath for Home {
     fn authorize(
         &self,
+        _: &DnsInput,
         _: SocketAddr,
         protocol: Protocol,
     ) -> Result<Box<dyn HomeDnsQuery>, ExchangeError> {
@@ -99,10 +101,9 @@ fn session(
             destination: resolver,
             transport: talpid_lan_forwarder::Transport::Tcp,
         },
-        scope,
+        input: DnsInput::for_test(SuffixMatcher::compile(["home"]).unwrap(), scope),
         capture: capture.capability(),
         sink,
-        matcher: Arc::new(SuffixMatcher::compile(["home"]).unwrap()),
         replies: Mutex::new(Replies {
             end: 0,
             pending: LinkedList::new(),

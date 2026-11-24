@@ -6,11 +6,11 @@ use super::{
     tcp_io::CodecIo,
     transport::{ExchangeError, Protocol, decode_message},
 };
-use crate::local_delivery::DeliveryAuthority;
+use crate::local_delivery::{DeliveryAuthority, home_dns::DnsInput};
 use futures::StreamExt;
 use hickory_net::{tcp::TcpStream, xfer::DnsStreamHandle};
 use hickory_proto::op::{Message, MessageType, Metadata, ResponseCode, SerialMessage};
-use mullvad_types::settings::local_network_access::split_dns::{DnsLane, SuffixMatcher};
+use mullvad_types::settings::local_network_access::split_dns::DnsLane;
 use std::{
     collections::{HashMap, LinkedList},
     future::Future,
@@ -61,10 +61,9 @@ struct Replies {
 struct Session {
     live: AtomicBool,
     flow: Flow,
-    scope: ReceiveScope,
+    input: DnsInput,
     capture: RelayCapture,
     sink: RelaySink,
-    matcher: Arc<SuffixMatcher>,
     system: Option<Arc<super::system::SystemIo>>,
     partial: bool,
     replies: Mutex<Replies>,
@@ -77,7 +76,7 @@ impl Session {
                 .system
                 .as_ref()
                 .is_none_or(|system| system.is_partial() == self.partial)
-            && self.scope.current()
+            && self.input.scope().current()
             && self.capture.current()
             && self
                 .capture
@@ -206,7 +205,7 @@ impl LocalAuthority for Owner {
     ) -> Result<ReceiveScope, Refused> {
         self.delivery
             .dns_input(source, destination, buffers)
-            .map(|(_, scope)| scope)
+            .map(|input| input.scope().clone())
     }
     fn authorize_received(&self, flow: Flow, scope: &ReceiveScope) -> Result<Self::Grant, Refused> {
         if flow.transport != talpid_lan_forwarder::Transport::Tcp
@@ -215,10 +214,10 @@ impl LocalAuthority for Owner {
         {
             return Err(Refused::Denied);
         }
-        let (matcher, current) =
+        let input =
             self.delivery
                 .dns_input(flow.source.ip(), flow.destination.ip(), &*self.buffers)?;
-        if current.id() != scope.id() {
+        if input.scope().id() != scope.id() {
             return Err(Refused::Stale);
         }
         let sink = self.capture.sink().ok_or(Refused::Stale)?;
@@ -231,10 +230,9 @@ impl LocalAuthority for Owner {
         let session = Arc::new(Session {
             live: AtomicBool::new(true),
             flow,
-            scope: scope.clone(),
+            input,
             capture: self.capture.clone(),
             sink,
-            matcher,
             system: self.system.clone(),
             partial: self
                 .system
@@ -275,7 +273,7 @@ impl TcpService for Owner {
             .get(&flow)
             .and_then(Weak::upgrade)
             .ok_or(Refused::Stale)?;
-        if !session.current() || session.scope.id() != scope.id() {
+        if !session.current() || session.input.scope().id() != scope.id() {
             return Err(Refused::Stale);
         }
         // Same ring size as the shared endpoint. This is backpressure, not a
@@ -321,11 +319,11 @@ async fn serve(
         if request.metadata.message_type != MessageType::Query {
             return Err(ExchangeError::Malformed);
         }
-        let result = match session.matcher.classify(&request) {
+        let result = match session.input.matcher().classify(&request) {
             Err(mullvad_types::settings::local_network_access::split_dns::QuestionError::Unsupported) => (failure(&request, ResponseCode::NotImp)?, None),
             Err(_) => (failure(&request, ResponseCode::FormErr)?, None),
             Ok(DnsLane::Home) => {
-                match path.authorize(session.flow.source, Protocol::Tcp) {
+                match path.authorize(&session.input, session.flow.source, Protocol::Tcp) {
                     Err(_) => (failure(&request, ResponseCode::ServFail)?, None),
                     Ok(lease) => {
                         let lease: Arc<dyn HomeDnsQuery> = lease.into();
@@ -340,7 +338,7 @@ async fn serve(
                 if session.partial {
                     let system = session.system.as_ref().ok_or(ExchangeError::Closed)?;
                     // Lockdown denies this message, not Home on the same stream.
-                    let Ok(query) = system.authorize(session.flow.destination, true, session.scope.clone(), session.capture.clone()) else { continue; };
+                    let Ok(query) = system.authorize(session.flow.destination, true, session.input.scope().clone(), session.capture.clone()) else { continue; };
                     let Ok(reply) = query.exchange(&system.io, bytes).await else { continue; };
                     (reply, Some(Guard::System(query)))
                 } else {
@@ -370,7 +368,7 @@ async fn ordinary(
         .connect(
             session.flow.source,
             session.flow.destination,
-            session.scope.clone(),
+            session.input.scope().clone(),
             session.capture.clone(),
             buffers,
         )

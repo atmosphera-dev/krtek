@@ -17,6 +17,7 @@ struct State {
     live: tokio::sync::watch::Sender<bool>,
     active: AtomicUsize,
     protocols: Mutex<Vec<Protocol>>,
+    contexts: Mutex<Vec<u64>>,
     truncate: bool,
     pending: bool,
     deny: bool,
@@ -35,6 +36,7 @@ impl Path {
             live: tokio::sync::watch::channel(true).0,
             active: AtomicUsize::new(0),
             protocols: Mutex::new(Vec::new()),
+            contexts: Mutex::new(Vec::new()),
             truncate,
             pending,
             deny,
@@ -46,10 +48,12 @@ impl Path {
 impl HomeDnsPath for Path {
     fn authorize(
         &self,
+        input: &DnsInput,
         _: SocketAddr,
         protocol: Protocol,
     ) -> Result<Box<dyn HomeDnsQuery>, ExchangeError> {
         self.0.protocols.lock().unwrap().push(protocol);
+        self.0.contexts.lock().unwrap().push(input.scope().id());
         if self.0.deny || !*self.0.live.borrow() {
             return Err(ExchangeError::Closed);
         }
@@ -114,17 +118,42 @@ impl HomeDnsQuery for Lease {
 }
 
 fn query() -> UdpQuery {
+    query_for_family(false)
+}
+
+fn query_for_family(ipv6: bool) -> UdpQuery {
     let mut request = Message::query();
     request.add_query(Query::query(
         Name::from_ascii("nonce.home.").unwrap(),
         RecordType::A,
     ));
-    UdpQuery {
-        client: "172.27.1.1:49152".parse().unwrap(),
-        resolver: "10.64.0.1:53".parse().unwrap(),
-        request,
-        error: None,
-    }
+    let (client, resolver) = if ipv6 {
+        ("[fdf0:ce4a:801d::172:27:1:1]:49152", "[fd00::53]:53")
+    } else {
+        ("172.27.1.1:49152", "10.64.0.1:53")
+    };
+    let client: SocketAddr = client.parse().unwrap();
+    let resolver: SocketAddr = resolver.parse().unwrap();
+    let context = DnsInput::for_test(
+        mullvad_types::settings::local_network_access::split_dns::SuffixMatcher::compile(["home"])
+            .unwrap(),
+        talpid_lan_forwarder::ReceiveScope::new(
+            client.ip(),
+            resolver.ip(),
+            &BufferBudget::new(1024),
+        )
+        .unwrap(),
+    );
+    let UdpDecision::Intercept(query) = inspect(
+        Some(&context),
+        &[resolver.ip()],
+        client,
+        resolver,
+        &request.to_vec().unwrap(),
+    ) else {
+        panic!("Home query");
+    };
+    *query
 }
 
 #[tokio::test]
@@ -132,11 +161,17 @@ async fn split_dns_udp_path_retains_both_transport_leases_through_reply_retries(
     for truncate in [false, true] {
         let path = Path::new(truncate, false, false);
         let budget = BufferBudget::new(256 * 1024);
-        let reply = query()
+        let query = query();
+        let context_id = query.context.scope().id();
+        let reply = query
             .answer(Some(&path), Duration::from_secs(1), true, 65507, &budget)
             .await
             .unwrap();
         assert_eq!(path.0.active.load(SeqCst), if truncate { 2 } else { 1 });
+        assert_eq!(
+            *path.0.contexts.lock().unwrap(),
+            vec![context_id; if truncate { 2 } else { 1 }]
+        );
         assert!(budget.used() > usize::from(u16::MAX));
         for _ in 0..2 {
             let result = reply
@@ -270,11 +305,12 @@ struct FreshTcp(Arc<AtomicUsize>);
 impl HomeDnsPath for RacingPath {
     fn authorize(
         &self,
+        input: &DnsInput,
         client: SocketAddr,
         protocol: Protocol,
     ) -> Result<Box<dyn HomeDnsQuery>, ExchangeError> {
         if protocol == Protocol::Udp {
-            return self.original.authorize(client, protocol);
+            return self.original.authorize(input, client, protocol);
         }
         // A policy replacement races between the consumer's currentness check
         // and obtaining TCP authority. The successor must never perform I/O.
@@ -326,11 +362,8 @@ async fn split_dns_udp_path_tc_cannot_cross_into_successor_authority() {
 fn capture_input(
     query: &UdpQuery,
     receiver: &mut PacketReceiver,
-    buffers: &BufferBudget,
 ) -> (talpid_lan_forwarder::ReceiveScope, CompletedDatagram) {
-    let scope =
-        talpid_lan_forwarder::ReceiveScope::new(query.client.ip(), query.resolver.ip(), buffers)
-            .unwrap();
+    let scope = query.context.scope().clone();
     let wire = talpid_lan_forwarder::packet::udp_reply(
         talpid_lan_forwarder::Flow {
             source: query.resolver,
@@ -371,11 +404,7 @@ async fn split_dns_udp_output_home_bytes_reach_native_consumer_through_checked_s
             let path = Path::new(truncate, false, false);
             path.0.answer_bytes.store(12000, SeqCst);
             let buffers = Arc::new(BufferBudget::new(32 * 1024 * 1024));
-            let mut query = query();
-            if ipv6 {
-                query.client = "[fdf0:ce4a:801d::172:27:1:1]:49152".parse().unwrap();
-                query.resolver = "[fd00::53]:53".parse().unwrap();
-            }
+            let mut query = query_for_family(ipv6);
             let mut edns = hickory_proto::op::Edns::new();
             edns.set_max_payload(16000);
             query.request.set_edns(edns);
@@ -385,7 +414,7 @@ async fn split_dns_udp_output_home_bytes_reach_native_consumer_through_checked_s
             let capture = owner.capability();
             let sink = capture.sink().unwrap();
             let mut receiver = PacketReceiver::new(buffers.clone(), 1280).unwrap();
-            let (_scope, input) = capture_input(&query, &mut receiver, &buffers);
+            let (_scope, input) = capture_input(&query, &mut receiver);
             let reply = query
                 .answer(
                     Some(&path),
@@ -459,7 +488,7 @@ async fn split_dns_udp_output_revocation_discards_tail_and_refunds_home_storage(
         let capture = owner.capability();
         let sink = capture.sink().unwrap();
         let mut receiver = PacketReceiver::new(buffers.clone(), 1280).unwrap();
-        let (_scope, input) = capture_input(&query, &mut receiver, &buffers);
+        let (_scope, input) = capture_input(&query, &mut receiver);
         let reply = query
             .answer(
                 Some(&path),
@@ -510,6 +539,7 @@ async fn split_dns_udp_output_cannot_emit_through_another_capture_sink_or_tuple(
         let other_sink = other.capability().sink().unwrap();
         let mut receiver = PacketReceiver::new(buffers.clone(), 1280).unwrap();
         let mut input_query = UdpQuery {
+            context: query.context.clone(),
             client: query.client,
             resolver: query.resolver,
             request: query.request.clone(),
@@ -521,7 +551,7 @@ async fn split_dns_udp_output_cannot_emit_through_another_capture_sink_or_tuple(
         if mismatch == "message" {
             input_query.request.metadata.id ^= 1;
         }
-        let (_scope, input) = capture_input(&input_query, &mut receiver, &buffers);
+        let (_scope, input) = capture_input(&input_query, &mut receiver);
         let reply = query
             .answer(
                 Some(&path),
@@ -556,7 +586,7 @@ async fn split_dns_udp_output_unavailable_home_servfail_reaches_native_consumer(
     let capture = owner.capability();
     let sink = capture.sink().unwrap();
     let mut receiver = PacketReceiver::new(buffers.clone(), 1280).unwrap();
-    let (_scope, input) = capture_input(&query, &mut receiver, &buffers);
+    let (_scope, input) = capture_input(&query, &mut receiver);
     let reply = query
         .answer(None, Duration::from_secs(1), true, 65507, buffers.as_ref())
         .await
@@ -586,14 +616,12 @@ async fn split_dns_udp_output_sink_family_loss_discards_without_a_write() {
     use talpid_types::relay_flow::{RelayCaptureGeneration, RelaySources};
     let path = Path::new(false, false, false);
     let buffers = Arc::new(BufferBudget::new(32 * 1024 * 1024));
-    let mut query = query();
-    query.client = "[fdf0:ce4a:801d::172:27:1:1]:49152".parse().unwrap();
-    query.resolver = "[fd00::53]:53".parse().unwrap();
+    let query = query_for_family(true);
     let owner = capture_owner(&query, &buffers);
     let capture = owner.capability();
     let old = capture.sink().unwrap();
     let mut receiver = PacketReceiver::new(buffers.clone(), 1280).unwrap();
-    let (scope, input) = capture_input(&query, &mut receiver, &buffers);
+    let (scope, input) = capture_input(&query, &mut receiver);
     let reply = query
         .answer(
             Some(&path),

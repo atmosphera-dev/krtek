@@ -13,11 +13,12 @@ use std::{
     time::Duration,
 };
 
+use crate::local_delivery::home_dns::DnsInput;
 use hickory_proto::{
     op::{DnsResponse, Message, MessageType, Metadata, ResponseCode},
     serialize::binary::{BinEncodable, BinEncoder},
 };
-use mullvad_types::settings::local_network_access::split_dns::{DnsLane, SuffixMatcher};
+use mullvad_types::settings::local_network_access::split_dns::DnsLane;
 use talpid_lan_forwarder::packet_receiver::{
     CompletedDatagram, DatagramReply, IpError, PacketReceiver,
 };
@@ -37,6 +38,7 @@ pub(super) enum UdpDecision<'a> {
 }
 
 pub(super) struct UdpQuery {
+    context: DnsInput,
     client: SocketAddr,
     resolver: SocketAddr,
     request: Message,
@@ -47,15 +49,16 @@ pub(super) struct UdpQuery {
 /// list belonging to the same capture generation. No Home eligibility decision
 /// occurs here: a listed name stays intercepted even when Home is ineligible.
 pub(super) fn inspect<'a>(
-    matcher: Option<&SuffixMatcher>,
+    context: Option<&DnsInput>,
     advertised: &[IpAddr],
     client: SocketAddr,
     resolver: SocketAddr,
     bytes: &'a [u8],
 ) -> UdpDecision<'a> {
-    let Some(matcher) = matcher else {
+    let Some(context) = context else {
         return UdpDecision::PassThrough(bytes);
     };
+    let matcher = context.matcher();
     if resolver.port() != 53 || !advertised.contains(&resolver.ip()) {
         return UdpDecision::PassThrough(bytes);
     }
@@ -81,6 +84,7 @@ pub(super) fn inspect<'a>(
         None
     };
     UdpDecision::Intercept(Box::new(UdpQuery {
+        context: context.clone(),
         client,
         resolver,
         request,
@@ -237,6 +241,9 @@ impl UdpQuery {
         })
     }
     pub(super) fn check_input(&self, input: &CompletedDatagram) -> Result<(), IpError> {
+        if input.parent_scope_id() != self.context.scope().id() {
+            return Err(IpError::Stale);
+        }
         let packet = input.packet()?;
         if packet.flow.transport != talpid_lan_forwarder::Transport::Udp
             || packet.flow.source != self.client
@@ -273,7 +280,7 @@ impl UdpQuery {
                     let previous = leases[0].clone();
                     let query = if leases.iter().flatten().all(|lease| lease.current()) {
                         path.ok_or(ExchangeError::Closed)
-                            .and_then(|path| path.authorize(client, protocol))
+                            .and_then(|path| path.authorize(&self.context, client, protocol))
                             .map(Arc::<dyn HomeDnsQuery>::from)
                     } else {
                         Err(ExchangeError::Closed)
