@@ -77,6 +77,25 @@ struct Preparations {
     tasks: JoinSet<()>,
 }
 
+impl Preparations {
+    fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            match std::task::ready!(self.tasks.poll_join_next(cx)) {
+                Some(result) => self.failed |= result.is_err(),
+                None => {
+                    // Keep the failure across cancellation while joins remain,
+                    // but let the owner retry once cleanup has finished.
+                    return Poll::Ready(if std::mem::take(&mut self.failed) {
+                        Err(io::Error::other("Home DNS preparation panicked"))
+                    } else {
+                        Ok(())
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// This is owned alongside the capture service, never by an individual waiter.
 /// Closing is cancellation-safe: handles stay here until poll_join_next removes
 /// their terminal result, not in a detached future's local JoinSet.
@@ -151,16 +170,7 @@ impl HomeIoOwner {
     pub(crate) async fn close(&self) -> io::Result<()> {
         self.preparations.lock().unwrap().closed = true;
         self.closed.send_replace(true);
-        while let Some(result) =
-            poll_fn(|cx| self.preparations.lock().unwrap().tasks.poll_join_next(cx)).await
-        {
-            self.preparations.lock().unwrap().failed |= result.is_err();
-        }
-        if self.preparations.lock().unwrap().failed {
-            Err(io::Error::other("Home DNS preparation panicked"))
-        } else {
-            Ok(())
-        }
+        poll_fn(|cx| self.preparations.lock().unwrap().poll_close(cx)).await
     }
 
     pub(crate) async fn closed(&self) {
