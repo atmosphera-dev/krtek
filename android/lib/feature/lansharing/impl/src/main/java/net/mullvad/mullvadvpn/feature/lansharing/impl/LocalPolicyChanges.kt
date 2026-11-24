@@ -15,12 +15,13 @@ internal class LocalPolicyChanges(
     private val editorOpen: () -> Boolean,
     private val onSaved: suspend (closeEditor: Boolean, requestWifi: Boolean?) -> Unit,
 ) {
+    /** If the caller has already checked the policy, pass that same snapshot as [current]. */
     fun change(
         closeEditor: Boolean = false,
         requestWifi: Boolean? = null,
+        current: LocalNetworkAccess? = settingsRepository.settingsUpdates.value?.localNetworkAccess,
         update: (LocalNetworkAccess) -> LocalNetworkAccess,
     ) {
-        val current = settingsRepository.settingsUpdates.value?.localNetworkAccess
         if (saving.value || current == null) return
         // Only an explicit editor replacement may repair a representable invalid policy.
         // Switches cannot turn an unreadable/invalid policy into an editable default.

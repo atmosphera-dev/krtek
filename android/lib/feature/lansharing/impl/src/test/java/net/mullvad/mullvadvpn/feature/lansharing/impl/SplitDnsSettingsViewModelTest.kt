@@ -202,6 +202,47 @@ class SplitDnsSettingsViewModelTest {
     }
 
     @Test
+    fun `should reject a DNS change published after reading the save snapshot`() = runTest {
+        val original = policy.copy(splitDns = configured)
+        val concurrent = original.copy(splitDns = configured.copy(suffixes = listOf("other.")))
+        publish(original)
+        val originalSettings = assertNotNull(settings.value)
+        coEvery { repository.setLocalNetworkAccess(any(), any()) } coAnswers
+            {
+                if (secondArg<LocalNetworkAccess>() == settings.value?.localNetworkAccess) {
+                    Unit.right()
+                } else {
+                    SetLocalNetworkAccessError.Conflict.left()
+                }
+            }
+        viewModel.uiState.test {
+            awaitItem()
+            dns(SplitDnsAction.Edit)
+            update { it.copy(enabled = true) }
+            runCurrent()
+            val draft = content().splitDnsEditor.draft
+
+            every { originalSettings.localNetworkAccess } answers
+                {
+                    publish(concurrent)
+                    original
+                }
+            dns(SplitDnsAction.Save)
+            runCurrent()
+
+            assertEquals(R.string.local_access_conflict, content().error)
+            assertEquals(draft, content().splitDnsEditor.draft)
+            coVerify(exactly = 1) {
+                repository.setLocalNetworkAccess(
+                    original.copy(splitDns = configured.copy(enabled = true)),
+                    original,
+                )
+            }
+            cancelAndIgnoreRemainingEvents()
+        }
+    }
+
+    @Test
     fun `should need a second save when saved DNS changed behind the draft`() = runTest {
         coEvery { repository.setLocalNetworkAccess(any(), any()) } returns Unit.right()
         viewModel.uiState.test {

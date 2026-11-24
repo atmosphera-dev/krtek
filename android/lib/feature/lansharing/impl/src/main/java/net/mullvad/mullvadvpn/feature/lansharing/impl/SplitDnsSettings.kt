@@ -88,7 +88,7 @@ internal class SplitDnsSettings(
             }
             problem != null || replacement == null ->
                 error.value = problem ?: R.string.split_dns_invalid
-            else -> changes.change(closeEditor = true) { it.copy(splitDns = replacement.splitDns) }
+            else -> changes.change(closeEditor = true, current = current) { replacement }
         }
     }
 
