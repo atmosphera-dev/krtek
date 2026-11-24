@@ -14,6 +14,7 @@ struct Home {
     calls: Arc<AtomicUsize>,
     live: Arc<AtomicBool>,
     fail: bool,
+    on_exchange: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 impl HomeDnsPath for Home {
     fn authorize(
@@ -31,6 +32,7 @@ impl HomeDnsPath for Home {
             calls: self.calls.clone(),
             live: self.live.clone(),
             fail: false,
+            on_exchange: self.on_exchange.clone(),
         }))
     }
     fn close(&self) -> PathFuture<'_, io::Result<()>> {
@@ -50,6 +52,9 @@ impl HomeDnsQuery for Home {
         message: Message,
     ) -> PathFuture<'_, Result<DnsResponse, ExchangeError>> {
         Box::pin(async move {
+            if let Some(on_exchange) = &self.on_exchange {
+                on_exchange();
+            }
             let mut reply = message.into_response();
             reply.add_answer(Record::from_rdata(
                 reply.queries[0].name().clone(),
@@ -153,6 +158,7 @@ async fn split_dns_tcp_hickory_partial_frames_alternate_home_ordinary_home_both_
             calls: Arc::default(),
             live: Arc::new(AtomicBool::new(true)),
             fail: false,
+            on_exchange: None,
         });
         let registry = Arc::new(Registry::default());
         let (client, codec) = ServiceStream::pair(&*buffers, 1).unwrap();
@@ -249,6 +255,7 @@ async fn split_dns_tcp_unavailable_home_is_servfail_without_ordinary_capability(
         calls: Arc::default(),
         live: Arc::new(AtomicBool::new(true)),
         fail: true,
+        on_exchange: None,
     });
     let (client, codec) = ServiceStream::pair(&*buffers, 3).unwrap();
     let worker = tokio::spawn(serve(session, codec, home.clone(), Arc::default(), buffers));
@@ -302,6 +309,72 @@ async fn split_dns_tcp_unavailable_home_is_servfail_without_ordinary_capability(
     );
 }
 
+#[tokio::test]
+async fn split_dns_tcp_review_retired_home_fails_only_a_current_session() {
+    let resolver = "127.0.0.1:53".parse().unwrap();
+    for revoke_input in [false, true] {
+        let buffers = Arc::new(BufferBudget::new(32 * 1024 * 1024));
+        let (_capture, session) = session(resolver, &*buffers);
+        let live = Arc::new(AtomicBool::new(true));
+        let scope = session.input.scope().clone();
+        let home = Arc::new(Home {
+            calls: Arc::default(),
+            live: live.clone(),
+            fail: false,
+            on_exchange: Some(Arc::new(move || {
+                live.store(false, SeqCst);
+                if revoke_input {
+                    scope.revoke();
+                }
+            })),
+        });
+        let (client, codec) = ServiceStream::pair(&*buffers, 1024).unwrap();
+        let worker = tokio::spawn(serve(
+            session.clone(),
+            codec,
+            home.clone(),
+            Arc::default(),
+            buffers,
+        ));
+        let (mut client, mut sender) = TcpStream::from_stream(CodecIo(client), resolver);
+        let wire = query("retiring.home.", 951);
+        let request = decode_message(&wire).unwrap();
+        sender.send(SerialMessage::new(wire, resolver)).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), client.next())
+            .await
+            .unwrap();
+        assert_eq!(home.calls.load(SeqCst), 1);
+        if revoke_input {
+            assert!(response.is_none(), "revoked input received a reply");
+        } else {
+            let (bytes, _) = response
+                .expect("current session must receive SERVFAIL")
+                .unwrap()
+                .into_parts();
+            let reply = decode_message(&bytes).unwrap();
+            assert_eq!(reply.metadata.response_code, ResponseCode::ServFail);
+            assert_eq!(reply.metadata.id, 951);
+            assert_eq!(reply.queries, request.queries);
+            assert!(reply.answers.is_empty());
+            assert!(
+                session.current(),
+                "synthetic failure must not retain the retired lease"
+            );
+        }
+        drop(client);
+        drop(sender);
+        let result = tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        if revoke_input {
+            assert!(matches!(result, Err(ExchangeError::Closed)));
+        } else {
+            result.unwrap();
+        }
+    }
+}
+
 #[test]
 fn split_dns_tcp_reply_guard_lives_until_ack_and_revocation_cannot_revive() {
     let buffers = BufferBudget::new(32 * 1024 * 1024);
@@ -314,6 +387,7 @@ fn split_dns_tcp_reply_guard_lives_until_ack_and_revocation_cannot_revive() {
                 calls: Arc::default(),
                 live: live.clone(),
                 fail: false,
+                on_exchange: None,
             }))),
             &buffers,
         )
@@ -414,6 +488,7 @@ async fn split_dns_partial_ambiguous_tcp_each_message_is_servfail_or_lockdown_dr
                 calls: Arc::default(),
                 live: Arc::new(AtomicBool::new(true)),
                 fail: false,
+                on_exchange: None,
             });
             let (client, codec) = ServiceStream::pair(&*buffers, 128).unwrap();
             let worker = tokio::spawn(serve(

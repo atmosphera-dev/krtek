@@ -76,6 +76,21 @@ pub(crate) fn policy() -> LocalNetworkAccess {
     }
 }
 
+pub(crate) fn partial_dns_authority() -> Arc<DeliveryAuthority> {
+    let mut policy = policy();
+    policy.split_dns.enabled = true;
+    policy.split_dns.suffixes = vec!["home".into()];
+    policy.split_dns.home_resolver = Some("10.0.2.2".parse().unwrap());
+    policy.split_dns.local_rule_id = Some(policy.rules[0].id);
+    assert!(policy.validate().is_ok());
+    let authority = Arc::new(DeliveryAuthority::new(
+        &policy,
+        Arc::new(|_, _| panic!("fixture must not prepare a local socket")),
+    ));
+    authority.install(CaptureAuthority::partial());
+    authority
+}
+
 pub(crate) fn observation() -> NetworkObservation {
     NetworkObservation {
         sequence: 9,

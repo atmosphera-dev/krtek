@@ -170,6 +170,7 @@ impl DnsReceiver for CaptureDns {
                 UdpDecision::PassThrough(original) => {
                     debug_assert_eq!(original, packet.payload);
                     if let Some(system) = &self.system
+                        && packet.flow.destination.port() == 53
                         && system.is_partial()
                     {
                         let _ = self.work.as_mut().expect("DNS work owner").submit_system(
@@ -302,14 +303,20 @@ impl DnsReceiver for CaptureDns {
             if let Some(tcp) = &mut self.tcp {
                 tcp.close().await;
             }
-            if let Some(work) = &mut self.work {
-                work.close().await?;
-            }
+            let home = match &mut self.work {
+                Some(work) => work.close().await,
+                None => Ok(()),
+            };
             self.receiver.take();
-            if let Some(system) = &self.system {
-                system.io.close().await?;
-            }
-            Ok(())
+            let system = match &self.system {
+                Some(system) => system.io.close().await,
+                None => Ok(()),
+            };
+            home.and(system)
         })
     }
 }
+
+#[cfg(test)]
+#[path = "capture_tests.rs"]
+mod tests;
