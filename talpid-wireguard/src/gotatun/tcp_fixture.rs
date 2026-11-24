@@ -87,9 +87,6 @@ async fn managed_route_timeout_preserves_upstream_recoverable_start_cause() {
         fn disposition(&self, _: std::net::IpAddr) -> Disposition {
             Disposition::Drop
         }
-        fn authorize(&self, _: Flow) -> Result<(), Refused> {
-            Err(Refused::Denied)
-        }
         fn prepare(&self, _: &socket2::Socket, _: &()) -> Result<(), Refused> {
             panic!("Local not requested")
         }
@@ -106,7 +103,7 @@ async fn managed_route_timeout_preserves_upstream_recoverable_start_cause() {
         generation: AtomicI64,
         bound: tokio::sync::Notify,
         waiting: tokio::sync::Notify,
-        post_bind: Mutex<Option<Arc<(Mutex<bool>, std::sync::Condvar)>>>,
+        post_bind: Mutex<Option<SetupHold>>,
         peers: Mutex<Vec<std::os::unix::net::UnixDatagram>>,
     }
     impl Routes {
@@ -1839,7 +1836,7 @@ async fn managed_monitor_disconnect_waits_for_cancelled_owner_and_actual_joined_
 struct SetupBypass {
     hits: std::sync::atomic::AtomicUsize,
     entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    hold: Option<Arc<(Mutex<bool>, std::sync::Condvar)>>,
+    hold: Option<SetupHold>,
 }
 impl SocketBypass for SetupBypass {
     fn bypass_socket(
@@ -1867,7 +1864,9 @@ impl SocketBypass for SetupBypass {
         Ok(())
     }
 }
-struct ReleaseSetup(Arc<(Mutex<bool>, std::sync::Condvar)>);
+type SetupHold = Arc<(Mutex<bool>, std::sync::Condvar)>;
+
+struct ReleaseSetup(SetupHold);
 impl Drop for ReleaseSetup {
     fn drop(&mut self) {
         *self.0.0.lock().unwrap() = true;
