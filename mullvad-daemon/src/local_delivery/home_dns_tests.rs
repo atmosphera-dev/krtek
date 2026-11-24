@@ -26,6 +26,88 @@ fn query_flow(transport: Transport) -> Flow {
     flow
 }
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
+#[test]
+fn split_dns_admission_revalidates_only_its_key_against_the_current_capture() {
+    use crate::local_delivery::tests::broker;
+    use talpid_tunnel::tun_provider::transport::ROUTER_SOURCES;
+
+    let on = configured();
+    let authority = DeliveryAuthority::new(&on, Arc::new(|_, _| Ok(())));
+    authority.update(&on, Some(observation()));
+    let broker = broker();
+    let open = || {
+        let lease = broker.open_capture(None).unwrap();
+        lease
+            .bind_observed_identity("tun-owned", 101_u64 << 32, ROUTER_SOURCES, 1280)
+            .unwrap();
+        lease
+    };
+    let first = open();
+    let local = flow(Transport::Udp, 49152);
+    let source = local.source.ip();
+    let resolver = "192.0.2.53".parse().unwrap();
+    let other = "192.0.2.54".parse().unwrap();
+    authority.install(CaptureAuthority::new(
+        vec![source],
+        Some(broker.clone()),
+        vec![],
+    ));
+    let budget = BufferBudget::new(65536);
+    let old = authority.dns_input(source, resolver, &budget).unwrap();
+    let local_scope = authority
+        .receive_for(
+            &mut authority.inputs.write().unwrap(),
+            source,
+            local.destination.ip(),
+            ReceivePurpose::Local,
+            &budget,
+        )
+        .unwrap();
+
+    first.retire();
+    let successor = open();
+    assert_ne!(first.generation(), successor.generation());
+    let unrelated = authority.dns_input(source, other, &budget).unwrap();
+    assert!(
+        local_scope.current(),
+        "DNS admission swept Local registrations"
+    );
+    assert!(
+        old.scope().current(),
+        "DNS admission swept unrelated live DNS registrations"
+    );
+
+    let current = authority.dns_input(source, resolver, &budget).unwrap();
+    assert_ne!(old.scope().id(), current.scope().id());
+    assert!(
+        !old.scope().current(),
+        "the old registration must be revoked before replacement"
+    );
+    // A late last-guard drop must not evict the new registration for this key.
+    drop(old);
+    let same = authority.dns_input(source, resolver, &budget).unwrap();
+    assert_eq!(current.scope().id(), same.scope().id());
+
+    authority.endpoint(false);
+    assert!(!local_scope.current());
+    assert!(!current.scope().current());
+    assert!(!unrelated.scope().current());
+}
+
+#[test]
+fn split_dns_admission_reclaims_dropped_registrations_across_keys() {
+    let authority = DeliveryAuthority::new(&configured(), Arc::new(|_, _| Ok(())));
+    let source = query_flow(Transport::Udp).source.ip();
+    let budget = BufferBudget::new(1024);
+    for host in 1..=16 {
+        let resolver = std::net::Ipv4Addr::new(192, 0, 2, host).into();
+        let input = authority.dns_input(source, resolver, &budget).unwrap();
+        assert!(input.scope().current());
+        assert_eq!(authority.inputs.read().unwrap().dns_inputs.len(), 1);
+    }
+}
+
 #[test]
 fn split_dns_configured_home_requires_the_original_classification_context() {
     use hickory_proto::{

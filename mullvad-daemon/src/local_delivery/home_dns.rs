@@ -77,31 +77,43 @@ impl DeliveryAuthority {
         buffers: &dyn RelayBufferAllocator,
     ) -> Result<DnsInput, Refused> {
         let mut inputs = self.inputs.write().unwrap();
-        inputs.revalidate_receive(None, None);
-        let dns = &inputs.policy.split_dns;
-        if !dns.enabled {
-            return Err(Refused::Denied);
-        }
-        let matcher = inputs.dns_matcher.clone().ok_or(Refused::Denied)?;
-        let capture = inputs.capture.as_ref().ok_or(Refused::Denied)?;
-        if !inputs.endpoint || !capture.sources.contains(&source) {
-            return Err(Refused::Denied);
-        }
-        let identity = capture.identity;
-        let generation = capture.generation()?;
+        inputs.reclaim_dns_inputs();
+        // The broker advances independently of the authority lock. Reuse and
+        // replacement must both use the same generation read for admission.
+        let identity = inputs.dns_capture().and_then(|(capture, identity)| {
+            capture
+                .sources
+                .contains(&source)
+                .then_some(identity)
+                .ok_or(Refused::Denied)
+        });
         let key = (source, resolver);
-        if let Some(scope) = inputs.dns_inputs.get(&key).and_then(|r| r.scope.upgrade()) {
+        let current = inputs
+            .dns_inputs
+            .get(&key)
+            .and_then(|record| record.revalidate(identity.ok()));
+        if current.is_none() {
+            inputs.dns_inputs.remove(&key);
+        }
+        let identity = identity?;
+        let matcher = inputs.dns_matcher.clone().ok_or(Refused::Denied)?;
+        if let Some(scope) = current {
             return Ok(DnsInput { matcher, scope });
         }
-        let scope = ReceiveScope::new(source, resolver, buffers)?;
-        let revision = inputs.dns_revision;
+
+        let retired = Arc::downgrade(&inputs.retired_dns_inputs);
+        let notify = Box::new(move |id, charge| {
+            if let Some(retired) = retired.upgrade() {
+                retired.lock().unwrap().push((key, id, charge));
+            }
+        });
+        let scope = ReceiveScope::new_notifying(source, resolver, buffers, Some(notify))?;
         inputs.dns_inputs.insert(
             key,
             DnsInputScope {
+                id: scope.id(),
                 scope: scope.downgrade(),
-                revision,
-                capture: identity,
-                generation,
+                identity,
                 _charge: scope.registration_credit(),
             },
         );
@@ -130,15 +142,10 @@ impl DeliveryAuthority {
             .dns_inputs
             .get(&(classification.source(), classification.destination()))
             .ok_or(Refused::Stale)?;
-        if record.revision != inputs.dns_revision
-            || !record
-                .scope
-                .upgrade()
-                .is_some_and(|registered| registered.id() == classification.id())
-        {
+        if record.identity.revision != inputs.dns_revision || record.id != classification.id() {
             return Err(Refused::Stale);
         }
-        let expected = (record.capture, record.generation, record.revision);
+        let expected = record.identity;
         let destination = inputs
             .policy
             .split_dns
@@ -157,7 +164,12 @@ impl DeliveryAuthority {
             buffers,
         )?;
         let grant = Self::authorize_received_for(&inputs, flow, &scope, ReceivePurpose::HomeDns)?;
-        if expected != (grant.capture, grant.generation, grant.dns_revision)
+        if expected
+            != (DnsInputIdentity {
+                capture: grant.capture,
+                generation: grant.generation,
+                revision: grant.dns_revision,
+            })
             || !classification.current()
         {
             return Err(Refused::Stale);

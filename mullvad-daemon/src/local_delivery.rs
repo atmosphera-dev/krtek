@@ -111,7 +111,8 @@ struct Inputs {
     receive: BTreeMap<ReceiveKey, ReceiveRecord>,
     dns_revision: u64,
     dns_matcher: Option<Arc<SuffixMatcher>>,
-    dns_inputs: BTreeMap<(IpAddr, IpAddr), DnsInputScope>,
+    dns_inputs: BTreeMap<DnsInputKey, DnsInputScope>,
+    retired_dns_inputs: Arc<Mutex<Vec<RetiredDnsInput>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -133,12 +134,31 @@ type ReceiveKey = (IpAddr, IpAddr, ReceivePurpose);
 #[cfg(any(target_os = "android", test))]
 pub(crate) mod home_dns;
 
-struct DnsInputScope {
-    scope: WeakReceiveScope,
+type DnsInputKey = (IpAddr, IpAddr);
+type RetiredDnsInput = (DnsInputKey, u64, Arc<dyn RelayBufferReservation>);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DnsInputIdentity {
     revision: u64,
     capture: u64,
     generation: Option<u64>,
+}
+
+struct DnsInputScope {
+    id: u64,
+    scope: WeakReceiveScope,
+    identity: DnsInputIdentity,
     _charge: Arc<dyn RelayBufferReservation>,
+}
+
+impl DnsInputScope {
+    fn revalidate(&self, identity: Option<DnsInputIdentity>) -> Option<ReceiveScope> {
+        let scope = self.scope.upgrade()?;
+        if identity != Some(self.identity) {
+            scope.revoke();
+        }
+        scope.current().then_some(scope)
+    }
 }
 
 /// Fixed non-transport facts, deliberately without NetworkLease's rule-ID Vec.
@@ -204,6 +224,34 @@ impl Inputs {
             .map(Arc::new)
     }
 
+    fn dns_capture(&self) -> Result<(&CaptureAuthority, DnsInputIdentity), Refused> {
+        if !self.endpoint || self.dns_matcher.is_none() {
+            return Err(Refused::Denied);
+        }
+        let capture = self.capture.as_ref().ok_or(Refused::Denied)?;
+        let identity = DnsInputIdentity {
+            revision: self.dns_revision,
+            capture: capture.identity,
+            generation: capture.generation()?,
+        };
+        Ok((capture, identity))
+    }
+
+    fn reclaim_dns_inputs(&mut self) {
+        // Drop notifications can run under the authority lock. Drain only
+        // reported retirements and never remove a replacement for the same key.
+        let retired = std::mem::take(&mut *self.retired_dns_inputs.lock().unwrap());
+        for (key, id, _charge) in retired {
+            if self
+                .dns_inputs
+                .get(&key)
+                .is_some_and(|record| record.id == id)
+            {
+                self.dns_inputs.remove(&key);
+            }
+        }
+    }
+
     fn grant_for(
         &self,
         source: IpAddr,
@@ -264,22 +312,18 @@ impl Inputs {
         previous_policy: Option<&LocalNetworkAccess>,
         previous_observation: Option<&NetworkObservation>,
     ) {
-        self.dns_inputs.retain(|(source, _), record| {
-            let Some(scope) = record.scope.upgrade() else {
-                return false;
-            };
-            let current = self.endpoint
-                && self.dns_revision == record.revision
-                && self.capture.as_ref().is_some_and(|capture| {
-                    capture.identity == record.capture
-                        && capture.sources.contains(source)
-                        && capture.generation().is_ok_and(|g| g == record.generation)
-                });
-            if !current {
-                scope.revoke();
-            }
-            scope.current()
-        });
+        let mut dns_inputs = std::mem::take(&mut self.dns_inputs);
+        if !dns_inputs.is_empty() {
+            let capture = self.dns_capture().ok();
+            dns_inputs.retain(|(source, _), record| {
+                let identity = capture
+                    .filter(|(capture, _)| capture.sources.contains(source))
+                    .map(|(_, identity)| identity);
+                record.revalidate(identity).is_some()
+            });
+        }
+        self.dns_inputs = dns_inputs;
+        self.reclaim_dns_inputs();
         let mut records = std::mem::take(&mut self.receive);
         records.retain(|_, record| {
             let Some(scope) = record.scope.upgrade() else {
@@ -411,6 +455,7 @@ impl DeliveryAuthority {
                 dns_revision: 1,
                 dns_matcher: Inputs::compile_dns(policy),
                 dns_inputs: BTreeMap::new(),
+                retired_dns_inputs: Arc::default(),
             }),
             preparer,
             revalidate: watch::channel(0).0,

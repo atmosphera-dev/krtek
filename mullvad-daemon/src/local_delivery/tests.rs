@@ -521,7 +521,7 @@ async fn intentional_handover_is_paused_but_an_unacknowledged_release_is_failed(
     assert!(!runtime.has_owner());
 }
 
-fn broker() -> AttachmentBroker {
+pub(super) fn broker() -> AttachmentBroker {
     let pools = DeliveryBuffers::new();
     let broker = AttachmentBroker::new(pools._application, pools._capture, pools._control).unwrap();
     broker.set_mode(AttachmentMode::ManagedRequired).unwrap();
