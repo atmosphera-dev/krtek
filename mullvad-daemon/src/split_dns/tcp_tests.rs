@@ -1,7 +1,7 @@
 use super::super::home_path::PathFuture;
 use super::*;
 use hickory_proto::{
-    op::{DnsResponse, Query},
+    op::{DnsResponse, Edns, Query},
     rr::{Name, RData, Record, RecordType, rdata::A},
 };
 use mullvad_types::settings::local_network_access::split_dns::SuffixMatcher;
@@ -254,19 +254,42 @@ async fn split_dns_tcp_unavailable_home_is_servfail_without_ordinary_capability(
     let worker = tokio::spawn(serve(session, codec, home.clone(), Arc::default(), buffers));
     let (mut client, mut sender) =
         TcpStream::from_stream(CodecIo(client), "127.0.0.1:53".parse().unwrap());
-    sender
-        .send(SerialMessage::new(
-            query("unreachable.home.", 904),
-            "127.0.0.1:53".parse().unwrap(),
-        ))
-        .unwrap();
-    let response = tokio::time::timeout(Duration::from_secs(1), client.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let response = decode_message(&response.into_parts().0).unwrap();
-    assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
+    let mut request = decode_message(&query("unreachable.home.", 904)).unwrap();
+    request.set_edns(Edns::new());
+    let mut mixed = request.clone();
+    mixed.metadata.id += 1;
+    mixed.add_query(Query::query(
+        Name::from_ascii("outside.example.").unwrap(),
+        RecordType::A,
+    ));
+    for (request, code) in [
+        (request, ResponseCode::ServFail),
+        (mixed, ResponseCode::FormErr),
+    ] {
+        sender
+            .send(SerialMessage::new(
+                request.to_vec().unwrap(),
+                "127.0.0.1:53".parse().unwrap(),
+            ))
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let bytes = response.into_parts().0;
+        let response = decode_message(&bytes).unwrap();
+        assert_eq!(response.metadata.response_code, code);
+        assert_eq!(response.metadata.id, request.metadata.id);
+        assert_eq!(response.metadata.message_type, MessageType::Response);
+        if code == ResponseCode::FormErr {
+            assert!(response.queries.is_empty());
+            assert_eq!(&bytes[4..6], &[0, 0]);
+        } else {
+            assert_eq!(response.queries, request.queries);
+        }
+        assert_eq!(response.edns.unwrap().max_payload(), 1232);
+    }
     assert_eq!(home.calls.load(SeqCst), 1);
     drop(client);
     drop(sender);

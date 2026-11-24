@@ -2,6 +2,7 @@
 //! admission. Every query and I/O reads Android's current lockdown state.
 use super::{
     home_io::{Capability, HomeIoOwner, HomeRuntime},
+    response::failure,
     transport::{self, ExchangeError, Protocol},
 };
 use std::{
@@ -180,16 +181,12 @@ impl SystemQuery {
             return Err(ExchangeError::Closed);
         }
         if matches!(self.authority, Authority::Ambiguous(_)) {
-            use hickory_proto::op::{Message, MessageType, Metadata, ResponseCode};
+            use hickory_proto::op::{MessageType, ResponseCode};
             let request = transport::decode_message(&bytes)?;
             if request.metadata.message_type != MessageType::Query {
                 return Err(ExchangeError::Malformed);
             }
-            let mut reply = Message::response(request.metadata.id, request.metadata.op_code);
-            reply.metadata = Metadata::response_from_request(&request.metadata);
-            reply.metadata.response_code = ResponseCode::ServFail;
-            reply.queries = request.queries;
-            let bytes = reply.to_vec().map_err(|_| ExchangeError::Malformed)?;
+            let bytes = failure(&request, ResponseCode::ServFail)?;
             return if self.current() {
                 Ok(bytes)
             } else {

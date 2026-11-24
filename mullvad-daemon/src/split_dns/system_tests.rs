@@ -104,7 +104,7 @@ pub(crate) fn fixture() -> (SystemIo, Arc<Platform>, RelayCaptureOwner, ReceiveS
 async fn split_dns_partial_ambiguous_udp_replies_servfail_without_network_and_rechecks_output() {
     use super::super::{transport::decode_message, udp::UdpQuery};
     use hickory_proto::{
-        op::{Message, Query, ResponseCode},
+        op::{Edns, Message, Query, ResponseCode},
         rr::{Name, RecordType},
     };
     for ipv6 in [false, true] {
@@ -131,6 +131,7 @@ async fn split_dns_partial_ambiguous_udp_replies_servfail_without_network_and_re
         let scope = ReceiveScope::new(flow.source.ip(), flow.destination.ip(), &buffers).unwrap();
         let mut request = Message::query();
         request.metadata.id = 778;
+        request.set_edns(Edns::new());
         request.add_query(Query::query(
             Name::from_ascii("ordinary.example.").unwrap(),
             RecordType::A,
@@ -158,6 +159,7 @@ async fn split_dns_partial_ambiguous_udp_replies_servfail_without_network_and_re
                 assert_eq!(response.metadata.id, request.metadata.id);
                 assert_eq!(response.queries, request.queries);
                 assert!(response.answers.is_empty());
+                assert_eq!(response.edns.unwrap().max_payload(), 1232);
             })
             .unwrap();
         platform.lockdown.store(true, Ordering::Release);

@@ -3,7 +3,10 @@ use crate::split_dns::transport::exchange;
 use hickory_net::runtime::TokioRuntimeProvider;
 use hickory_proto::{
     op::{Edns, OpCode, Query},
-    rr::{Name, RData, Record, RecordType, rdata::NULL},
+    rr::{
+        Name, RData, Record, RecordType,
+        rdata::{NULL, opt::EdnsOption},
+    },
 };
 use std::{
     io,
@@ -108,8 +111,23 @@ fn check_reply(reply: &UdpReply, original: &Message, ipv6: bool) -> Message {
     );
     let decoded = decode_message(&reply.bytes).unwrap();
     assert_eq!(decoded.metadata.id, original.metadata.id);
+    assert_eq!(decoded.metadata.message_type, MessageType::Response);
+    assert_eq!(decoded.metadata.op_code, original.metadata.op_code);
     assert_eq!(decoded.queries, original.queries);
     decoded
+}
+
+fn check_failure_opt(reply: &Message, request: &Message) {
+    if let Some(request) = &request.edns {
+        let edns = reply.edns.as_ref().expect("missing response OPT");
+        assert_eq!(edns.version(), 0);
+        assert_eq!(edns.max_payload(), 1232);
+        assert_eq!(edns.flags().dnssec_ok, request.flags().dnssec_ok);
+        assert_eq!(edns.flags().z, 0);
+        assert!(edns.options().options.is_empty());
+    } else {
+        assert!(reply.edns.is_none());
+    }
 }
 
 #[test]
@@ -187,7 +205,11 @@ async fn split_dns_udp_home_failure_or_ineligibility_is_servfail_not_passthrough
         io::ErrorKind::ConnectionRefused,
         io::ErrorKind::PermissionDenied,
     ] {
-        let original = request("nas.home.", RecordType::A, None);
+        let mut original = request("nas.home.", RecordType::A, Some(4096));
+        let edns = original.edns.as_mut().unwrap();
+        edns.flags_mut().z = 1;
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(65001, vec![1, 2, 3]));
         let calls = Arc::new(Mutex::new(Vec::new()));
         let observed = calls.clone();
         let reply = intercepted(&original, false)
@@ -209,6 +231,7 @@ async fn split_dns_udp_home_failure_or_ineligibility_is_servfail_not_passthrough
         assert!(decoded.metadata.recursion_desired);
         assert!(decoded.metadata.checking_disabled);
         assert!(decoded.answers.is_empty());
+        check_failure_opt(&decoded, &original);
         assert_eq!(*calls.lock().unwrap(), [Protocol::Udp]);
     }
 }
@@ -260,7 +283,7 @@ async fn split_dns_udp_ambiguous_and_unsupported_listed_messages_never_dispatch(
     let mut update = original.clone();
     update.metadata.op_code = OpCode::Update;
     let transfer = request("home.", RecordType::AXFR, None);
-    for (request, code) in [
+    for (mut request, code) in [
         (mixed, ResponseCode::FormErr),
         (same_lane, ResponseCode::FormErr),
         (update, ResponseCode::NotImp),
@@ -279,6 +302,10 @@ async fn split_dns_udp_ambiguous_and_unsupported_listed_messages_never_dispatch(
             .await
             .unwrap();
         assert_eq!(calls, 0);
+        if code == ResponseCode::FormErr {
+            request.queries.clear();
+            assert_eq!(&reply.bytes[4..6], &[0, 0]);
+        }
         assert_eq!(
             check_reply(&reply, &request, false).metadata.response_code,
             code
@@ -334,6 +361,7 @@ async fn split_dns_udp_edns_and_actual_emission_limit_require_tcp_before_tc() {
                 } else {
                     assert!(!decoded.metadata.truncation);
                     assert_eq!(decoded.metadata.response_code, ResponseCode::ServFail);
+                    check_failure_opt(&decoded, &original);
                 }
             }
         }

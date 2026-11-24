@@ -2,6 +2,7 @@
 //! is no listener, extra packet reader or independent route classifier.
 use super::{
     home_path::{HomeDnsPath, HomeDnsQuery},
+    response::failure,
     tcp_egress::{OwnedTcp, Registry, Upstream},
     tcp_io::CodecIo,
     transport::{ExchangeError, Protocol, decode_message},
@@ -9,7 +10,7 @@ use super::{
 use crate::local_delivery::{DeliveryAuthority, home_dns::DnsInput};
 use futures::StreamExt;
 use hickory_net::{tcp::TcpStream, xfer::DnsStreamHandle};
-use hickory_proto::op::{Message, MessageType, Metadata, ResponseCode, SerialMessage};
+use hickory_proto::op::{Message, MessageType, ResponseCode, SerialMessage};
 use mullvad_types::settings::local_network_access::split_dns::DnsLane;
 use std::{
     collections::{HashMap, LinkedList},
@@ -395,14 +396,6 @@ fn check(reply: &Message, request: &Message) -> Result<(), ExchangeError> {
     }
     Ok(())
 }
-fn failure(request: &Message, code: ResponseCode) -> Result<Vec<u8>, ExchangeError> {
-    let mut reply = Message::response(request.metadata.id, request.metadata.op_code);
-    reply.metadata = Metadata::response_from_request(&request.metadata);
-    reply.metadata.response_code = code;
-    reply.queries = request.queries.clone();
-    reply.to_vec().map_err(|_| ExchangeError::Malformed)
-}
-
 pub(super) struct TcpWork {
     forwarder: Forwarder<Owner>,
     owner: Arc<Owner>,

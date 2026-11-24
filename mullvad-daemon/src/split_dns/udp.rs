@@ -15,7 +15,7 @@ use std::{
 
 use crate::local_delivery::home_dns::DnsInput;
 use hickory_proto::{
-    op::{DnsResponse, Message, MessageType, Metadata, ResponseCode},
+    op::{DnsResponse, Message, MessageType, ResponseCode},
     serialize::binary::{BinEncodable, BinEncoder},
 };
 use mullvad_types::settings::local_network_access::split_dns::DnsLane;
@@ -28,6 +28,7 @@ use talpid_types::relay_flow::{
 
 use super::{
     home_path::{HomeDnsPath, HomeDnsQuery},
+    response::failure,
     transport::{ExchangeError, Protocol, decode_message},
 };
 
@@ -341,11 +342,11 @@ impl UdpQuery {
         Fut: Future<Output = Result<DnsResponse, ExchangeError>>,
     {
         let bytes = if let Some(error) = self.error {
-            self.failure(error)?
+            failure(&self.request, error)?
         } else {
             match self.home_answer(&mut home).await {
                 Ok(response) => self.fit(response, tcp_retry, injection_limit)?,
-                Err(_) => self.failure(ResponseCode::ServFail)?,
+                Err(_) => failure(&self.request, ResponseCode::ServFail)?,
             }
         };
         Ok(UdpReply {
@@ -383,15 +384,6 @@ impl UdpQuery {
         Ok(())
     }
 
-    fn failure(&self, code: ResponseCode) -> Result<Vec<u8>, ExchangeError> {
-        let mut response =
-            Message::response(self.request.metadata.id, self.request.metadata.op_code);
-        response.metadata = Metadata::response_from_request(&self.request.metadata);
-        response.metadata.response_code = code;
-        response.queries = self.request.queries.clone();
-        response.to_vec().map_err(|_| ExchangeError::Malformed)
-    }
-
     fn fit(
         &self,
         response: DnsResponse,
@@ -405,7 +397,7 @@ impl UdpQuery {
             return Ok(response.as_buffer().to_vec());
         }
         if !tcp_retry {
-            return self.failure(ResponseCode::ServFail);
+            return failure(&self.request, ResponseCode::ServFail);
         }
         // Hickory rolls back incomplete records and sets TC in the emitted
         // header. Never slice raw records or clear a received TC bit.

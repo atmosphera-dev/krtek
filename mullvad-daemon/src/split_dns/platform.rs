@@ -7,6 +7,8 @@ pub(crate) mod capture;
 pub(crate) mod home_path;
 #[path = "local_path.rs"]
 mod local_path;
+#[path = "response.rs"]
+mod response;
 #[path = "system.rs"]
 mod system;
 #[path = "tcp.rs"]
