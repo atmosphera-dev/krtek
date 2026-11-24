@@ -118,6 +118,26 @@ fn session(
     (capture, session)
 }
 
+#[test]
+fn split_dns_tcp_review_empty_writes_ignore_backpressure() {
+    use futures::io::AsyncWrite;
+
+    let buffers = BufferBudget::new(4096);
+    let (mut stream, _peer) = ServiceStream::pair(&buffers, 1).unwrap();
+    assert_eq!(stream.try_write(b"x").unwrap(), 1);
+    let mut io = CodecIo(stream);
+    let cx = &mut Context::from_waker(futures::task::noop_waker_ref());
+    assert!(Pin::new(&mut io).poll_write(cx, b"x").is_pending());
+    assert!(matches!(
+        Pin::new(&mut io).poll_write(cx, b""),
+        Poll::Ready(Ok(0))
+    ));
+    assert!(matches!(
+        Pin::new(&mut io).poll_write_vectored(cx, &[std::io::IoSlice::new(b"")]),
+        Poll::Ready(Ok(0))
+    ));
+}
+
 #[tokio::test]
 async fn split_dns_tcp_hickory_partial_frames_alternate_home_ordinary_home_both_families() {
     for ipv6 in [false, true] {
@@ -171,11 +191,12 @@ async fn split_dns_tcp_hickory_partial_frames_alternate_home_ordinary_home_both_
         ));
         let (mut reader, mut writer) = futures::io::AsyncReadExt::split(CodecIo(client));
         let mut coalesced = Vec::new();
-        for bytes in [
+        let requests = [
             query("first.home.", 777),
             expected.clone(),
             query("last.home.", 777),
-        ] {
+        ];
+        for bytes in &requests {
             coalesced.extend((bytes.len() as u16).to_be_bytes());
             coalesced.extend(bytes);
         }
@@ -209,8 +230,11 @@ async fn split_dns_tcp_hickory_partial_frames_alternate_home_ordinary_home_both_
         let replies = tokio::time::timeout(Duration::from_secs(3), client)
             .await
             .unwrap();
-        for (home_reply, reply) in [true, false, true].into_iter().zip(replies) {
+        for ((home_reply, reply), request) in
+            [true, false, true].into_iter().zip(replies).zip(requests)
+        {
             assert_eq!(reply.metadata.id, 777);
+            assert_eq!(reply.queries, decode_message(&request).unwrap().queries);
             assert_eq!(reply.answers.len(), usize::from(home_reply));
             if home_reply {
                 assert_eq!(reply.answers[0].ttl, 741);

@@ -37,6 +37,9 @@ impl<C: TcpChannel + Unpin> AsyncWrite for CodecIo<C> {
         cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if bytes.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
         loop {
             ready!(self.0.poll_write_ready(cx))?;
             match self.0.try_write(bytes) {
