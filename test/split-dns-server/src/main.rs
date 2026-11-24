@@ -142,24 +142,28 @@ fn tcp_vectors_for(nonce: &str, id: u16, system: bool) -> std::io::Result<serde_
 }
 
 async fn serve(args: ServerArguments) -> std::io::Result<()> {
-    if args.address.iter().any(|address| {
-        ![
-            "10.77.10.53".parse::<IpAddr>().unwrap(),
-            "10.77.10.54".parse().unwrap(),
-            "fd71:7274:656b:10::53".parse().unwrap(),
-            "fd71:7274:656b:10::54".parse().unwrap(),
-        ]
-        .contains(address)
-    }) {
-        return Err(std::io::Error::other(
-            "fixture requires the run-11 TAP address",
+    let (role, v4, v6) = match args.role {
+        Role::Home => (fixture::Role::Home, "10.77.10.53", "fd71:7274:656b:10::53"),
+        Role::Ordinary => (
+            fixture::Role::Ordinary,
+            "10.77.10.54",
+            "fd71:7274:656b:10::54",
+        ),
+    };
+    let (v4, v6) = (v4.parse::<IpAddr>().unwrap(), v6.parse::<IpAddr>().unwrap());
+    let matches_role = match args.address.as_slice() {
+        [address] => *address == v4 || *address == v6,
+        [first, second] => (*first, *second) == (v4, v6) || (*first, *second) == (v6, v4),
+        _ => false,
+    };
+    if !matches_role {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{role:?} fixture requires {v4}, {v6}, or both"),
         ));
     }
     let complete = server::run(server::ServerConfig {
-        role: match args.role {
-            Role::Home => fixture::Role::Home,
-            Role::Ordinary => fixture::Role::Ordinary,
-        },
+        role,
         addresses: args.address,
         port: args.port,
         output: args.output,
@@ -179,6 +183,59 @@ async fn serve(args: ServerArguments) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::{Role, ServerArguments, serve};
+    use std::io::ErrorKind;
+
+    #[tokio::test]
+    async fn serve_accepts_only_its_roles_tap_addresses() {
+        let home4 = "10.77.10.53";
+        let home6 = "fd71:7274:656b:10::53";
+        let ordinary4 = "10.77.10.54";
+        let ordinary6 = "fd71:7274:656b:10::54";
+        for (role, v4, v6, other4, other6) in [
+            (Role::Home, home4, home6, ordinary4, ordinary6),
+            (Role::Ordinary, ordinary4, ordinary6, home4, home6),
+        ] {
+            for (addresses, accepted) in [
+                (&[other4][..], false),
+                (&[other6][..], false),
+                (&[other4, other6][..], false),
+                (&[v4, other6][..], false),
+                (&[other4, v6][..], false),
+                (&[v4, v4][..], false),
+                (&[][..], false),
+                (&[v4][..], true),
+                (&[v6][..], true),
+                (&[v4, v6][..], true),
+                (&[v6, v4][..], true),
+            ] {
+                // `run` first creates its output directory. Give it an existing
+                // directory so acceptance is observable without binding guest TAP IPs.
+                let output = std::env::temp_dir();
+                let failure = serve(ServerArguments {
+                    role,
+                    address: addresses
+                        .iter()
+                        .map(|address| address.parse().unwrap())
+                        .collect(),
+                    port: 0,
+                    finish: output.join("unused-finish.json"),
+                    output,
+                    token: "tap-addresses".into(),
+                    drain_seconds: 0,
+                })
+                .await
+                .unwrap_err();
+                let expected = if accepted {
+                    ErrorKind::AlreadyExists
+                } else {
+                    ErrorKind::InvalidInput
+                };
+                assert_eq!(failure.kind(), expected, "{addresses:?}: {failure}");
+            }
+        }
+    }
+
     #[test]
     fn partial_tcp_vectors_keep_a_distinct_exact_ordinary_answer() {
         let vectors = super::tcp_vectors_for("systemControl", 65535, true).unwrap();
