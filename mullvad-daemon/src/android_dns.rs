@@ -11,19 +11,32 @@ use std::{
     os::fd::{AsRawFd, BorrowedFd},
 };
 use talpid_core::connectivity_listener::ConnectivityListener;
+use talpid_tunnel::packet_attachment::AttachmentBroker;
 use talpid_tunnel::tun_provider::local_network::LocalNetworkPlatform;
 
 pub(crate) use crate::android_dns_io::DnsTarget;
 use crate::android_dns_io::{DnsPlatform, DnsRuntime, PhysicalDns};
 
-impl DnsPlatform for LocalNetworkPlatform {
-    fn with_capture<T>(&self, action: impl FnOnce(i64) -> io::Result<T>) -> io::Result<T> {
-        self.with_dns_capture_epoch(action)
+#[derive(Clone)]
+struct AndroidDnsPlatform {
+    service: LocalNetworkPlatform,
+    broker: AttachmentBroker,
+}
+
+impl DnsPlatform for AndroidDnsPlatform {
+    fn capture_broker(&self) -> &AttachmentBroker {
+        &self.broker
+    }
+
+    fn with_service_capture<T>(&self, action: impl FnOnce(i64) -> io::Result<T>) -> io::Result<T> {
+        self.service
+            .with_dns_capture_epoch(action)
             .map_err(io::Error::other)?
     }
 
     fn physical_dns(&self) -> io::Result<Option<PhysicalDns>> {
         Ok(self
+            .service
             .own_dns_snapshot()
             .map_err(io::Error::other)?
             .map(|snapshot| PhysicalDns {
@@ -34,7 +47,8 @@ impl DnsPlatform for LocalNetworkPlatform {
     }
 
     fn own_socket(&self, epoch: i64, token: i64, fd: Option<BorrowedFd<'_>>) -> io::Result<bool> {
-        self.own_dns_socket(epoch, token, fd.map(|fd| fd.as_raw_fd()))
+        self.service
+            .own_dns_socket(epoch, token, fd.map(|fd| fd.as_raw_fd()))
             .map_err(io::Error::other)
     }
 }
@@ -45,19 +59,20 @@ impl DnsPlatform for LocalNetworkPlatform {
 #[derive(Clone)]
 pub struct AndroidDnsResolver {
     connectivity_listener: ConnectivityListener,
-    platform: LocalNetworkPlatform,
+    platform: AndroidDnsPlatform,
     target: DnsTarget,
 }
 
 impl AndroidDnsResolver {
     pub(crate) fn new(
         connectivity_listener: ConnectivityListener,
-        platform: LocalNetworkPlatform,
+        service: LocalNetworkPlatform,
+        broker: AttachmentBroker,
         target: DnsTarget,
     ) -> Self {
         Self {
             connectivity_listener,
-            platform,
+            platform: AndroidDnsPlatform { service, broker },
             target,
         }
     }

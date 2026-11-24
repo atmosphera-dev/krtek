@@ -380,13 +380,16 @@ upstreams are unchanged. The system authority uses the same joined-preparation
 mechanism and credited message/reply storage, and closes with the capture owner.
 
 The daemon's Android DNS adapter has a separate grant from app forwarding. With
-Mullvad off, the service's capture owner grants stock default-network I/O only
-for a confirmed idle epoch; otherwise the adapter uses the passive system DNS
-authority's exact physical-network token and protects and binds UDP/TCP before
-I/O. A prepared socket survives a capture handover only while that token is
-still current and the capture owner allows physical DNS. The capture monitor
-covers validation and each nonblocking poll; rejected I/O closes the prepared
-socket without fallback. A stock TCP operation already
+Mullvad off, stock default-network I/O requires both an idle service epoch and
+no native capture reservation. The service monitor and broker guard hold that
+decision through each stock poll. A reservation before service establishment
+fails closed until the service allows physical DNS. Native sink retirement does
+not grant stock I/O while the service still owns capture. For physical DNS the
+adapter uses the passive system DNS authority's exact physical-network token
+and protects and binds UDP/TCP before I/O. A prepared socket survives a capture
+handover only while that token is still current and the service allows physical
+DNS. The service monitor covers validation and each nonblocking poll; rejected
+I/O closes the prepared socket without fallback. A stock TCP operation already
 submitted to Android is not cancelled when capture appears; new I/O does not
 use the retired grant. Mullvad on uses the upstream default-network resolver
 and socket provider. A daemon target epoch fences results from older attempts.

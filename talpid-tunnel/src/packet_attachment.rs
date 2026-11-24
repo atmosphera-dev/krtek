@@ -514,6 +514,17 @@ impl AttachmentBroker {
             .expect("attachment state")
             .snapshot()
     }
+
+    /// Keep `open_capture` from reserving a generation during one idle operation.
+    /// The caller must also hold the VPN service monitor and confirm its idle
+    /// epoch: a retired native sink can still have Android cleanup pending.
+    /// Do not await or re-enter the broker from `action`.
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    pub fn with_capture_idle<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
+        let state = self.inner.state.lock().expect("attachment state");
+        (!state.closed && state.capture.is_none()).then(action)
+    }
+
     pub fn changes(&self) -> watch::Receiver<BrokerSnapshot> {
         self.inner.changes.subscribe()
     }

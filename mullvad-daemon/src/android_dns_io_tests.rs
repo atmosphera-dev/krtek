@@ -1,4 +1,5 @@
 use super::*;
+use crate::local_delivery::DeliveryBuffers;
 use futures::{
     FutureExt,
     io::{AsyncReadExt, AsyncWriteExt},
@@ -7,6 +8,7 @@ use std::sync::{
     Mutex,
     atomic::{AtomicUsize, Ordering},
 };
+use talpid_tunnel::packet_attachment::AttachmentBroker;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::TcpListener,
@@ -18,7 +20,12 @@ const PHYSICAL: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2));
 const MARKER: u32 = 0x68;
 
 #[derive(Clone)]
-struct Platform(Arc<Mutex<State>>, Option<i64>, Arc<Mutex<()>>);
+struct Platform(
+    Arc<Mutex<State>>,
+    Option<i64>,
+    Arc<Mutex<()>>,
+    AttachmentBroker,
+);
 
 struct State {
     epoch: i64,
@@ -29,6 +36,10 @@ struct State {
 
 impl Platform {
     fn new(epoch: i64, token: Option<i64>) -> Self {
+        let buffers = DeliveryBuffers::new();
+        let broker =
+            AttachmentBroker::new(buffers._application, buffers._capture, buffers._control)
+                .unwrap();
         Self(
             Arc::new(Mutex::new(State {
                 epoch,
@@ -38,12 +49,17 @@ impl Platform {
             })),
             token.map(|_| 11),
             Arc::new(Mutex::new(())),
+            broker,
         )
     }
 }
 
 impl DnsPlatform for Platform {
-    fn with_capture<T>(&self, action: impl FnOnce(i64) -> io::Result<T>) -> io::Result<T> {
+    fn capture_broker(&self) -> &AttachmentBroker {
+        &self.3
+    }
+
+    fn with_service_capture<T>(&self, action: impl FnOnce(i64) -> io::Result<T>) -> io::Result<T> {
         let _capture = self.2.lock().unwrap();
         let epoch = self.0.lock().unwrap().epoch;
         action(epoch)
@@ -149,6 +165,43 @@ async fn off_without_capture_uses_stock_sockets() {
     let adapter = select(&platform, &DnsTarget::new(TargetState::Unsecured), DEFAULT);
     round_trip(&adapter, 0).await;
     assert_eq!(platform.0.lock().unwrap().prepared, 0);
+}
+
+#[tokio::test]
+async fn native_reservation_fences_stock_dns_before_service_open() {
+    let platform = Platform::new(1, Some(11));
+    let target = DnsTarget::new(TargetState::Unsecured);
+    let idle = select(&platform, &target, DEFAULT);
+    let peer = UdpSocket::bind(LOCAL).await.unwrap();
+    let server = peer.local_addr().unwrap();
+    let socket = idle.bind_udp(LOCAL, server).await.unwrap();
+
+    let reservation = platform.3.open_capture(None).unwrap();
+    assert_eq!(
+        platform.3.snapshot().capture_generation,
+        Some(reservation.generation())
+    );
+    assert!(!platform.3.snapshot().capture_ready);
+    assert!(
+        matches!(DnsRuntime::select(platform.clone(), target.clone(), || panic!("stock DNS during reservation")),
+            Err(error) if error.kind() == io::ErrorKind::NotConnected)
+    );
+    assert_eq!(
+        poll_fn(|cx| socket.poll_send_to(cx, b"old", server))
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NotConnected
+    );
+    assert!(peer.recv_from(&mut [0; 3]).now_or_never().is_none());
+
+    platform.0.lock().unwrap().epoch = -2;
+    round_trip(&select(&platform, &target, PHYSICAL), MARKER).await;
+    drop(reservation);
+    // Native packet retirement is not Android's acknowledgement of fd closure.
+    round_trip(&select(&platform, &target, PHYSICAL), MARKER).await;
+    platform.0.lock().unwrap().epoch = 3;
+    round_trip(&select(&platform, &target, DEFAULT), 0).await;
 }
 
 #[tokio::test]

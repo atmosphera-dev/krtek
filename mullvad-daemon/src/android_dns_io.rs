@@ -15,6 +15,7 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
+use talpid_tunnel::packet_attachment::AttachmentBroker;
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 
 fn unavailable() -> io::Error {
@@ -56,9 +57,30 @@ pub(super) struct PhysicalDns {
 }
 
 pub(super) trait DnsPlatform: Clone + Send + Sync + Unpin + 'static {
-    fn with_capture<T>(&self, action: impl FnOnce(i64) -> io::Result<T>) -> io::Result<T>;
+    fn capture_broker(&self) -> &AttachmentBroker;
+    fn with_service_capture<T>(&self, action: impl FnOnce(i64) -> io::Result<T>) -> io::Result<T>;
     fn physical_dns(&self) -> io::Result<Option<PhysicalDns>>;
     fn own_socket(&self, epoch: i64, token: i64, fd: Option<BorrowedFd<'_>>) -> io::Result<bool>;
+}
+
+fn with_capture<P: DnsPlatform, T>(
+    platform: &P,
+    action: impl FnOnce(i64) -> io::Result<T>,
+) -> io::Result<T> {
+    platform.with_service_capture(|epoch| {
+        if epoch > 0 {
+            // Only the service can allow physical protection. A native
+            // reservation with an idle service epoch permits neither route.
+            // Take the broker lock inside the service monitor, as capture
+            // callbacks can enter the broker while holding that monitor.
+            platform
+                .capture_broker()
+                .with_capture_idle(|| action(epoch))
+                .unwrap_or_else(|| Err(unavailable()))
+        } else {
+            action(epoch)
+        }
+    })
 }
 
 #[derive(Clone)]
@@ -80,7 +102,7 @@ impl<P: DnsPlatform> DnsRuntime<P> {
         let (route, servers) = if state == TargetState::Secured {
             (Route::Upstream, default_servers()?)
         } else {
-            platform.with_capture(|epoch| match epoch {
+            with_capture(&platform, |epoch| match epoch {
                 1.. => Ok((Route::Idle(epoch), default_servers()?)),
                 ..0 => {
                     let physical = platform
@@ -118,14 +140,14 @@ impl<P: DnsPlatform> DnsRuntime<P> {
         }
         match self.route {
             Route::Upstream => action(),
-            Route::Idle(expected) => self.platform.with_capture(|epoch| {
+            Route::Idle(expected) => with_capture(&self.platform, |epoch| {
                 if epoch == expected {
                     action()
                 } else {
                     Err(unavailable())
                 }
             }),
-            Route::Physical { token, .. } => self.platform.with_capture(|current| {
+            Route::Physical { token, .. } => with_capture(&self.platform, |current| {
                 // A capture handover does not change the binding of a prepared socket.
                 // The current owner must still allow physical DNS, and the original
                 // network token must still be live. Check both before polling I/O.

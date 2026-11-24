@@ -1139,6 +1139,7 @@ impl Daemon {
                 talpid_tunnel::tun_provider::local_network::LocalNetworkPlatform::new(
                     config.android_context,
                 ),
+                local_network.broker(),
                 dns_target.clone(),
             ),
         );
