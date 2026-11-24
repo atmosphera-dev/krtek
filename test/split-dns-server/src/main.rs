@@ -122,8 +122,8 @@ fn tcp_vectors_for(nonce: &str, id: u16, system: bool) -> std::io::Result<serde_
             RecordType::A,
         ));
         let query = request.to_vec().map_err(std::io::Error::other)?;
-        let expected = (home || system).then(|| {
-            fixture::answer(
+        let expected = if home || system {
+            let answer = fixture::answer(
                 &request,
                 if home {
                     fixture::Role::Home
@@ -132,10 +132,16 @@ fn tcp_vectors_for(nonce: &str, id: u16, system: bool) -> std::io::Result<serde_
                 },
                 fixture::Protocol::Tcp,
             )
-            .unwrap()
-            .to_vec()
-            .unwrap()
-        });
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "nonce selects a silent fixture response",
+                )
+            })?;
+            Some(answer.to_vec().map_err(std::io::Error::other)?)
+        } else {
+            None
+        };
         vectors.push(serde_json::json!({"query_hex":hex(&query), "expected_hex":expected.map(|bytes| hex(&bytes)), "home":home}));
     }
     Ok(serde_json::json!({"messages":vectors}))
@@ -248,8 +254,29 @@ mod tests {
                 .all(|message| message["expected_hex"].as_str().is_some())
         );
         assert_ne!(messages[0]["expected_hex"], messages[1]["expected_hex"]);
+        assert_ordinary_answer(&messages[1]);
     }
-    use hickory_proto::op::{Message, MessageType};
+
+    #[test]
+    fn system_tcp_vectors_reject_reserved_silence_without_panicking() {
+        for nonce in ["silent", "SILENT"] {
+            let error = super::tcp_vectors_for(nonce, 1, true).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidInput);
+            assert!(super::tcp_vectors_for(nonce, 1, false).is_ok());
+        }
+    }
+
+    use hickory_proto::{
+        op::{Message, MessageType, ResponseCode},
+        rr::{RData, rdata::A},
+    };
+
+    fn assert_ordinary_answer(vector: &serde_json::Value) {
+        let reply = decode(vector["expected_hex"].as_str().unwrap());
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(reply.answers.len(), 1);
+        assert_eq!(reply.answers[0].data, RData::A(A::new(10, 77, 10, 54)));
+    }
 
     fn decode(hex: &str) -> Message {
         let bytes = (0..hex.len())
