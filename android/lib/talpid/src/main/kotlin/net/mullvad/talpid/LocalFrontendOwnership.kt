@@ -14,6 +14,11 @@ internal class LocalFrontendOwnership {
     private var revoked = false
     private val epochs = mutableSetOf<Long>()
     private var current: Long? = null
+    private var dnsEpoch = 1L
+
+    /** Positive proves absence; negative means an interface may exist. */
+    val ownDnsCaptureEpoch: Long
+        get() = if (owner == Owner.Idle || revoked) dnsEpoch else -dnsEpoch
 
     val frontendActive: Boolean
         get() = owner == Owner.Frontend
@@ -23,16 +28,22 @@ internal class LocalFrontendOwnership {
 
     fun tryUpstream(): Boolean {
         if (frontendActive) return false
+        dnsEpoch++
+        revoked = false
         owner = Owner.Upstream
         return true
     }
 
     fun upstreamClosed() {
-        if (owner == Owner.Upstream) owner = Owner.Idle
+        if (owner == Owner.Upstream) {
+            if (!revoked) dnsEpoch++
+            owner = Owner.Idle
+        }
     }
 
     fun tryFrontend(generation: Long): Boolean {
         if (generation <= 0 || owner != Owner.Idle) return false
+        dnsEpoch++
         owner = Owner.Frontend
         revoked = false
         epochs.add(generation)
@@ -44,6 +55,7 @@ internal class LocalFrontendOwnership {
         if (!canPrepare || current != predecessor || epochs.size != 1 || successor <= predecessor)
             return false
         epochs.add(successor)
+        dnsEpoch++
         return true
     }
 
@@ -65,11 +77,13 @@ internal class LocalFrontendOwnership {
 
     fun frontendFinished(generation: Long) {
         if (!epochs.remove(generation)) return
+        if (!revoked) dnsEpoch++
         if (current == generation) current = null
         if (epochs.isEmpty()) owner = Owner.Idle
     }
 
     fun revoke() {
+        if (!revoked && owner != Owner.Idle) dnsEpoch++
         revoked = true
     }
 }

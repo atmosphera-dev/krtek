@@ -114,24 +114,35 @@ impl LocalNetworkPlatform {
     pub fn system_dns_snapshot(
         &self,
     ) -> Result<Option<crate::android_frontend::SystemDnsSnapshot>, Error> {
+        self.read_dns_snapshot("systemDnsSnapshot")
+    }
+
+    pub fn own_dns_snapshot(
+        &self,
+    ) -> Result<Option<crate::android_frontend::SystemDnsSnapshot>, Error> {
+        self.read_dns_snapshot("ownSystemDnsSnapshot")
+    }
+
+    fn read_dns_snapshot(
+        &self,
+        name: &'static str,
+    ) -> Result<Option<crate::android_frontend::SystemDnsSnapshot>, Error> {
         let env = JnixEnv::from(
             self.context
                 .jvm
                 .attach_current_thread_as_daemon()
                 .map_err(Error::AttachJvmToThread)?,
         );
-        handled(&env, "systemDnsSnapshot", || {
+        handled(&env, name, || {
             let result = env
                 .call_method(
                     self.context.vpn_service.as_obj(),
-                    "systemDnsSnapshot",
+                    name,
                     "()Lnet/mullvad/talpid/model/SystemDnsSnapshot;",
                     &[],
                 )
-                .map_err(|e| Error::CallMethod("systemDnsSnapshot", e))?;
-            let object = result
-                .l()
-                .map_err(|e| Error::CallMethod("systemDnsSnapshot", e))?;
+                .map_err(|e| Error::CallMethod(name, e))?;
+            let object = result.l().map_err(|e| Error::CallMethod(name, e))?;
             let object = env.auto_local(object);
             system_dns::decode(&env, object.as_obj(), || {
                 crate::android_frontend::SystemDnsSnapshot::from_java(
@@ -140,6 +151,50 @@ impl LocalNetworkPlatform {
                 )
             })
             .map_err(|()| Error::TunnelDeviceError)
+        })
+    }
+
+    /// Serialize one synchronous DNS operation with VPN establishment and retirement.
+    /// No continuation may retain this monitor across an await.
+    pub fn with_dns_capture_epoch<T>(&self, f: impl FnOnce(i64) -> T) -> Result<T, Error> {
+        let env = self
+            .context
+            .jvm
+            .attach_current_thread_as_daemon()
+            .map_err(Error::AttachJvmToThread)?;
+        let service = self.context.vpn_service.as_obj();
+        let name = "ownDnsCaptureEpoch";
+        let _guard = env
+            .lock_obj(service)
+            .map_err(|e| Error::CallMethod(name, e))?;
+        let epoch = handled(&env, name, || {
+            env.call_method(service, name, "()J", &[])
+                .and_then(|value| value.j())
+                .map_err(|e| Error::CallMethod(name, e))
+        })?;
+        Ok(f(epoch))
+    }
+
+    pub fn own_dns_socket(&self, epoch: i64, token: i64, fd: Option<RawFd>) -> Result<bool, Error> {
+        let env = self
+            .context
+            .jvm
+            .attach_current_thread_as_daemon()
+            .map_err(Error::AttachJvmToThread)?;
+        let name = "ownSystemDnsSocket";
+        handled(&env, name, || {
+            env.call_method(
+                self.context.vpn_service.as_obj(),
+                name,
+                "(JJI)Z",
+                &[
+                    JValue::Long(epoch),
+                    JValue::Long(token),
+                    JValue::Int(fd.unwrap_or(-1)),
+                ],
+            )
+            .and_then(|value| value.z())
+            .map_err(|e| Error::CallMethod(name, e))
         })
     }
     pub fn system_dns_failure(&self) -> Result<i64, Error> {

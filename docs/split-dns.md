@@ -26,6 +26,13 @@ off, rather than choosing by callback order. With lockdown on they still drop.
 Missing or incomplete observation remains unavailable. Observation
 is passive: Krtek does not request a new connection or add a network permission.
 
+Krtek's own service lookups (such as GeoIP or API names) are not app split DNS.
+With Mullvad off and capture possible, they use only the observed non-VPN
+network's resolvers through protected sockets bound to that network. If that
+authority or socket preparation fails, there is no default-network fallback.
+With no Krtek VPN confirmed, or with Mullvad on, they use the upstream default
+resolver path. This does not let unlisted app queries bypass Android lockdown.
+
 ## Settings screen
 
 | # | Control | Behavior |

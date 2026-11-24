@@ -148,6 +148,73 @@ class SystemDnsAdapterTest {
     }
 
     @Test
+    fun `should use only the physical resolver and protect before binding under lockdown for own DNS`() {
+        ready(wifi, "10.77.10.54")
+        ready(cell, "10.77.10.55")
+        val vpn = capabilities()
+        every { vpn.hasTransport(NetworkCapabilities.TRANSPORT_VPN) } returns true
+        authority.onCapabilitiesChanged(cell, vpn)
+        lockdown = true
+
+        val snapshot = checkNotNull(authority.ownSnapshot())
+        assertEquals(listOf(InetAddress.getByName("10.77.10.54")), snapshot.dnsServers)
+        val descriptor = mockk<ParcelFileDescriptor>(relaxed = true)
+        val file = FileDescriptor()
+        mockkStatic(ParcelFileDescriptor::class)
+        every { ParcelFileDescriptor.fromFd(9) } returns descriptor
+        every { descriptor.fileDescriptor } returns file
+        every { protect(9) } returns true
+        every { wifi.bindSocket(file) } returns Unit
+        assertEquals(LocalSocketPreparation.STALE, authority.prepare(9, snapshot.token))
+        assertEquals(LocalSocketPreparation.READY, authority.prepareOwn(9, snapshot.token))
+        verifyOrder {
+            protect(9)
+            wifi.bindSocket(file)
+            descriptor.close()
+        }
+        verify(exactly = 0) { cell.bindSocket(any<FileDescriptor>()) }
+    }
+
+    @Test
+    fun `should refuse absent ambiguous and stale authority and protection denial for own DNS`() {
+        assertNull(authority.ownSnapshot())
+        ready(wifi, "10.77.10.54")
+        val first = checkNotNull(authority.ownSnapshot())
+        every { protect(9) } returns false
+        assertEquals(LocalSocketPreparation.PROTECT_FAILED, authority.prepareOwn(9, first.token))
+        ready(cell, "10.77.10.55")
+        assertNull(authority.ownSnapshot())
+        assertEquals(LocalSocketPreparation.STALE, authority.prepareOwn(9, first.token))
+        authority.onLost(cell)
+        assertNotEquals(first.token, checkNotNull(authority.ownSnapshot()).token)
+        assertEquals(LocalSocketPreparation.STALE, authority.prepareOwn(9, first.token))
+        authority.onLost(wifi)
+        assertNull(authority.ownSnapshot())
+        verify(exactly = 1) { protect(9) }
+        verify(exactly = 0) { wifi.bindSocket(any<FileDescriptor>()) }
+    }
+
+    @Test
+    fun `should not enable ordinary DNS from daemon observation on Android nine`() {
+        val legacy =
+            SystemDnsAuthority(
+                { error("no lockdown API") },
+                protect,
+                supported = false,
+                observeForDaemon = true,
+            )
+        legacy.onAvailable(wifi)
+        legacy.onCapabilitiesChanged(wifi, capabilities())
+        val links = mockk<LinkProperties>(relaxed = true)
+        every { links.dnsServers } returns listOf(InetAddress.getByName("10.77.10.54"))
+        legacy.onLinkPropertiesChanged(wifi, links)
+        val snapshot = checkNotNull(legacy.ownSnapshot())
+        assertNull(legacy.snapshot())
+        assertEquals(0L, legacy.failureToken())
+        assertEquals(LocalSocketPreparation.STALE, legacy.prepare(9, snapshot.token))
+    }
+
+    @Test
     fun `should not substitute a different networks resolvers when the selected list is empty`() {
         ready(wifi, "10.77.10.54")
         ready(cell, "10.77.10.55", local = false)

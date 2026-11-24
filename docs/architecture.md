@@ -377,6 +377,15 @@ not acquire Home authority. Connected UDP passthrough and unprotected TCP
 upstreams are unchanged. The system authority uses the same joined-preparation
 mechanism and credited message/reply storage, and closes with the capture owner.
 
+The daemon's Android DNS adapter has a separate grant from app forwarding. With
+Mullvad off, the service's capture owner grants stock default-network I/O only
+for a confirmed idle epoch; otherwise the adapter uses the passive system DNS
+authority's exact physical-network token and protects and binds UDP/TCP before
+I/O. Missing or changed authority fails closed. A stock TCP operation already
+submitted to Android is not cancelled when capture appears; new I/O does not
+use the retired grant. Mullvad on uses the upstream default-network resolver
+and socket provider. A daemon target epoch fences results from older attempts.
+
 Managed selection and current Local routes are initialized before tunnel startup.
 Normal Connect/Reconnect commands go directly to the upstream tunnel state machine;
 they neither pause target admission nor wait for a blocking capture. A pending

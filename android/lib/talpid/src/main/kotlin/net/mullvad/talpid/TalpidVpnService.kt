@@ -59,6 +59,7 @@ open class TalpidVpnService : LifecycleVpnService() {
     private val localPolicyRegistrationLock = Any()
     private var localPolicyDemandSequence = -1L
     private val localFrontendOwnership = LocalFrontendOwnership()
+    private var destroying = false
     private var captureRegistration = 0L
     private val captureObservers = mutableMapOf<Long, LocalCaptureNetworkObserver>()
     // Until native has decoded the complete result, this epoch still owns the
@@ -97,13 +98,17 @@ open class TalpidVpnService : LifecycleVpnService() {
                 { Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || isLockdownEnabled },
                 ::protect,
                 localNetwork = { localNetworkWatcher.physicalNetworkHandle },
+                observeForDaemon = true,
             )
         getSystemService<ConnectivityManager>()?.let(systemDnsAuthority::register)
     }
 
     @CallSuper
     override fun onDestroy() {
-        synchronized(this) { invalidateCaptureObservation() }
+        synchronized(this) {
+            destroying = true
+            invalidateCaptureObservation()
+        }
         localNetworkWatcher.stop()
         systemDnsAuthority.close()
         lockdownObserver?.close()
@@ -462,6 +467,26 @@ open class TalpidVpnService : LifecycleVpnService() {
         synchronized(this) {
             if (localFrontendOwnership.canPrepare) systemDnsAuthority.prepare(fd, token)
             else LocalSocketPreparation.INACTIVE
+        }
+
+    // Native holds this same monitor through each nonblocking OFF socket operation,
+    // so establishment cannot cross a stock DNS send or start an unbound connect.
+    @Suppress("Unused")
+    fun ownDnsCaptureEpoch(): Long =
+        synchronized(this) { if (destroying) 0L else localFrontendOwnership.ownDnsCaptureEpoch }
+
+    @Suppress("Unused")
+    fun ownSystemDnsSnapshot(): net.mullvad.talpid.model.SystemDnsSnapshot? =
+        synchronized(this) {
+            if (ownDnsCaptureEpoch() < 0) systemDnsAuthority.ownSnapshot() else null
+        }
+
+    @Suppress("Unused")
+    fun ownSystemDnsSocket(epoch: Long, token: Long, fd: Int): Boolean =
+        synchronized(this) {
+            if (epoch >= 0 || ownDnsCaptureEpoch() != epoch) return false
+            if (fd < 0) systemDnsAuthority.current(token, own = true)
+            else systemDnsAuthority.prepareOwn(fd, token) == LocalSocketPreparation.READY
         }
 
     protected fun hasOpenTun(): Boolean = synchronized(this) { activeTunStatus?.isOpen == true }

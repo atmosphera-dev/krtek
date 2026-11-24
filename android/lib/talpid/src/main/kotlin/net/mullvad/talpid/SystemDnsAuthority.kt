@@ -15,6 +15,7 @@ internal class SystemDnsAuthority(
     private val protect: (Int) -> Boolean,
     private val supported: Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q,
     private val localNetwork: () -> Long? = { null },
+    private val observeForDaemon: Boolean = false,
 ) : ConnectivityManager.NetworkCallback() {
     private var token = 1L
     private var connectivity: ConnectivityManager? = null
@@ -29,7 +30,7 @@ internal class SystemDnsAuthority(
     @Suppress("DEPRECATION") // Complete the passive callback's initial set on every supported API.
     fun register(manager: ConnectivityManager) {
         check(connectivity == null && !closed)
-        if (supported) {
+        if (supported || observeForDaemon) {
             connectivity = manager
             val passive =
                 NetworkRequest.Builder()
@@ -107,8 +108,10 @@ internal class SystemDnsAuthority(
         refresh()
     }
 
+    @Synchronized fun snapshot(): SystemDnsSnapshot? = if (supported) ownSnapshot() else null
+
     @Synchronized
-    fun snapshot(): SystemDnsSnapshot? {
+    fun ownSnapshot(): SystemDnsSnapshot? {
         refresh()
         return selected?.let {
             SystemDnsSnapshot(token, ArrayList(it.resolvers), it.interfaceIndex)
@@ -119,14 +122,21 @@ internal class SystemDnsAuthority(
     @Synchronized
     fun failureToken(): Long {
         refresh()
-        return if (ambiguous.isNotEmpty() && runCatching { !lockdown() }.getOrDefault(false)) token
+        return if (
+            supported && ambiguous.isNotEmpty() && runCatching { !lockdown() }.getOrDefault(false)
+        )
+            token
         else 0L
     }
 
     private fun refresh() {
         initial.removeAll { networks[it]?.complete == true }
         val candidates = networks.values.filter { it.eligible && it.complete }
-        val ready = supported && !closed && initial.isEmpty() && networks.values.all { it.complete }
+        val ready =
+            (supported || observeForDaemon) &&
+                !closed &&
+                initial.isEmpty() &&
+                networks.values.all { it.complete }
         val handle =
             if (ready)
                 selectSystemDnsNetwork(candidates.mapNotNull { it.candidate }, localNetwork())
@@ -149,13 +159,24 @@ internal class SystemDnsAuthority(
         else requestedLegacy(capabilities)
 
     @Synchronized
-    fun current(expected: Long): Boolean = snapshot()?.token == expected && !lockdown()
+    fun current(expected: Long, own: Boolean = false): Boolean {
+        refresh()
+        return selected != null && token == expected && (own || supported && !lockdown())
+    }
 
     @Synchronized
     fun prepare(fd: Int, expected: Long): Int =
-        if (current(expected))
-            LocalSocketPreparation.prepare(fd, checkNotNull(selected).network, protect).let {
+        if (current(expected)) {
+            prepareOwn(fd, expected).let {
                 if (current(expected)) it else LocalSocketPreparation.STALE
+            }
+        } else LocalSocketPreparation.STALE
+
+    @Synchronized
+    fun prepareOwn(fd: Int, expected: Long): Int =
+        if (current(expected, own = true))
+            LocalSocketPreparation.prepare(fd, checkNotNull(selected).network, protect).let {
+                if (current(expected, own = true)) it else LocalSocketPreparation.STALE
             }
         else LocalSocketPreparation.STALE
 
