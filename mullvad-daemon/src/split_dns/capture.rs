@@ -11,7 +11,9 @@ use talpid_lan_forwarder::{
     packet_receiver::{CompletedDatagram, PacketReceiver, dns_endpoints},
 };
 use talpid_tunnel::android_frontend::{DnsFuture, DnsReceiver};
-use talpid_types::relay_flow::{RelayBuffer, RelayBufferAllocator, RelayCapture, RelaySink};
+use talpid_types::relay_flow::{
+    RelayBufferAllocator, RelayCapture, RelayIngressOriginal, RelaySink,
+};
 
 pub(crate) struct CaptureDns {
     authority: Arc<DeliveryAuthority>,
@@ -195,7 +197,7 @@ impl DnsReceiver for CaptureDns {
         true
     }
 
-    fn original(&mut self) -> Option<RelayBuffer> {
+    fn original(&mut self) -> Option<RelayIngressOriginal> {
         let input = self.original.as_mut()?;
         match input.pop_original() {
             Ok(Some(bytes)) => Some(bytes),

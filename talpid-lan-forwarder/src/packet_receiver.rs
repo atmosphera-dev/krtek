@@ -25,6 +25,7 @@ use std::{
 };
 use talpid_types::relay_flow::{
     BUFFER_OVERHEAD, RelayBuffer, RelayBufferAllocator, RelayBufferReservation,
+    RelayIngressOriginal,
 };
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
@@ -94,9 +95,9 @@ impl CompletedDatagram {
             && self.pending.scope.current()
     }
 
-    /// Release each original only after the caller's current capture/target
-    /// check. Packet order is arrival order, including out-of-order fragments.
-    pub fn pop_original(&mut self) -> Result<Option<RelayBuffer>, IpError> {
+    /// Preserve the caller's admission scope, not the reassembly scope (which
+    /// ends at completion). Packet order is arrival order.
+    pub fn pop_original(&mut self) -> Result<Option<RelayIngressOriginal>, IpError> {
         if !self.current() {
             return Err(IpError::Stale);
         }
@@ -104,7 +105,7 @@ impl CompletedDatagram {
             .pending
             .originals
             .pop_first()
-            .map(|(_, original)| original.bytes))
+            .map(|(_, original)| self.pending.parent.original(original.bytes)))
     }
 }
 

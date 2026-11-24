@@ -181,7 +181,7 @@ async fn split_dns_udp_work_tcp_input_cannot_obtain_home_udp_authority() {
     let mut fixture = Fixture::new(true);
     let (query, scope, mut original) = fixture.input(49001);
     let flow = original.packet().unwrap().flow;
-    let mut wire = original.pop_original().unwrap().unwrap().to_vec();
+    let mut wire = original.pop_original().unwrap().unwrap().bytes().to_vec();
     // Independent test-only wire generator: retain the same DNS payload/tuple
     // but supply a complete, checksum-valid TCP segment rather than UDP.
     wire.splice(20..28, [0; 20]);

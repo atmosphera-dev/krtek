@@ -1,6 +1,7 @@
 //! Local receiver allocation is demand-bound, independent of capture storage.
 use super::*;
 use talpid_lan_forwarder::Refused;
+use talpid_types::relay_flow::RelayIngressOriginal;
 
 pub struct LocalReceiver<A: LocalAuthority> {
     receiver: Option<Forwarder<A>>,
@@ -63,7 +64,7 @@ pub(super) trait Receiver<A: LocalAuthority>: Send {
     ) -> bool {
         false
     }
-    fn original(&mut self) -> Option<talpid_types::relay_flow::RelayBuffer> {
+    fn original(&mut self) -> Option<RelayIngressOriginal> {
         None
     }
     fn has_original(&self) -> bool {
@@ -174,7 +175,7 @@ impl<A: LocalAuthority> Receiver<A> for LocalReceiver<A> {
             .expect("DNS candidate")
             .ingest(bytes, advertised, capture, replies, mtu)
     }
-    fn original(&mut self) -> Option<talpid_types::relay_flow::RelayBuffer> {
+    fn original(&mut self) -> Option<RelayIngressOriginal> {
         self.dns.as_mut().and_then(|dns| dns.original())
     }
     fn has_original(&self) -> bool {

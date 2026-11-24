@@ -31,7 +31,7 @@ use std::{
 };
 use talpid_lan_forwarder::{Forwarder, LocalAuthority};
 use talpid_types::capture_network::{CaptureExpectation, CaptureNetworkFeed};
-use talpid_types::relay_flow::{RelayCapture, RelaySink, RelayWriteOutcome};
+use talpid_types::relay_flow::{RelayCapture, RelayIngressOriginal, RelaySink, RelayWriteOutcome};
 use tokio::{
     io::{Interest, unix::AsyncFd},
     sync::{mpsc, oneshot, watch},
@@ -290,7 +290,7 @@ async fn drive_epoch<A: LocalAuthority>(
             _ = &mut *stop => return owner::Event::Terminal(FrontendState::Stopped),
             _ = async {}, if pending.is_none() && forwarder.has_original() => {
                 if let Some(original) = forwarder.original() {
-                    *pending = dispatch(forwarder, &original, session);
+                    *pending = dispatch(forwarder, Ingress::Original(original), session);
                 }
             },
             command = commands.recv() => match command {
@@ -402,14 +402,23 @@ fn ingest<A: LocalAuthority>(
             return None;
         }
     }
-    dispatch(forwarder, bytes, session)
+    dispatch(forwarder, Ingress::New(bytes), session)
+}
+
+enum Ingress<'a> {
+    New(&'a [u8]),
+    Original(RelayIngressOriginal),
 }
 
 fn dispatch<A: LocalAuthority>(
     forwarder: &mut impl Receiver<A>,
-    bytes: &[u8],
+    ingress: Ingress<'_>,
     session: Option<(&CaptureConfig, &Observation)>,
 ) -> Option<PendingIngress> {
+    let bytes = match &ingress {
+        Ingress::New(bytes) => bytes,
+        Ingress::Original(original) => original.bytes(),
+    };
     let Some((config, observation)) = session else {
         forwarder.ingest(bytes);
         return None;
@@ -480,7 +489,13 @@ fn dispatch<A: LocalAuthority>(
                             ip.destination()
                         ),
                     );
-                    if let Ok(mut packet) = observation.lease.ingress(target, bytes)
+                    let pending = match ingress {
+                        Ingress::New(bytes) => observation.lease.ingress(target, bytes),
+                        Ingress::Original(original) => {
+                            observation.lease.ingress_original(target, original)
+                        }
+                    };
+                    if let Ok(mut packet) = pending
                         && packet.try_send() == Err(AttachmentError::Full)
                     {
                         return Some(packet);

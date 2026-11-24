@@ -1,4 +1,5 @@
 //! Shared storage capabilities. A reservation is never packet or policy authority.
+use std::sync::RwLockReadGuard;
 use std::{
     fmt, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -789,9 +790,25 @@ impl RelayAttempt {
     }
 
     pub fn packet(&self, bytes: RelayBuffer) -> Result<RelayPacket, RelayFlowError> {
+        self.packet_with_admission(bytes, None)
+    }
+
+    pub fn original_packet(
+        &self,
+        original: RelayIngressOriginal,
+    ) -> Result<RelayPacket, RelayFlowError> {
+        self.packet_with_admission(original.bytes, Some(original.admission))
+    }
+
+    fn packet_with_admission(
+        &self,
+        bytes: RelayBuffer,
+        admission: Option<Arc<dyn RelayIngressAdmission>>,
+    ) -> Result<RelayPacket, RelayFlowError> {
         self.with_current(|| RelayPacket {
             storage: Arc::new(bytes),
             attempt: self.clone(),
+            admission,
             consumed: false,
         })
     }
@@ -829,11 +846,55 @@ impl RelaySocketContext {
     }
 }
 
+/// The admitting consumer owns this irreversible lifetime. The carrier may
+/// observe it but cannot revoke it or select a replacement.
+pub trait RelayIngressAdmission: Send + Sync {
+    fn live(&self) -> RwLockReadGuard<'_, bool>;
+}
+
+pub struct RelayIngressOriginal {
+    bytes: RelayBuffer,
+    admission: Arc<dyn RelayIngressAdmission>,
+}
+
+impl RelayIngressOriginal {
+    pub fn new(bytes: RelayBuffer, admission: Arc<dyn RelayIngressAdmission>) -> Self {
+        Self { bytes, admission }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn copy_to(&self, buffers: &dyn RelayBufferAllocator) -> Result<Self, RelayFlowError> {
+        Ok(Self::new(
+            RelayBuffer::copy_from(&self.bytes, buffers)?,
+            self.admission.clone(),
+        ))
+    }
+}
+
+/// Run under the admission read guard, after any broker/capture/attempt locks.
+/// The callback must not reenter lifecycle, broker or policy code.
+fn with_relay_ingress_admission<T>(
+    admission: Option<&dyn RelayIngressAdmission>,
+    operation: impl FnOnce() -> T,
+) -> Result<T, RelayFlowError> {
+    let live = admission.map(RelayIngressAdmission::live);
+    if live.as_deref() == Some(&false) {
+        return Err(RelayFlowError::Stale);
+    }
+    let result = operation();
+    drop(live);
+    Ok(result)
+}
+
 /// Fixed, immutable packet storage retained with exact lifetime authority.
 /// Moving through a queue does not strip either. Views share backing, not credit.
 pub struct RelayPacket {
     storage: Arc<RelayBuffer>,
     attempt: RelayAttempt,
+    admission: Option<Arc<dyn RelayIngressAdmission>>,
     consumed: bool,
 }
 
@@ -863,15 +924,17 @@ impl RelayPacket {
             return Err(RelayFlowError::Closed);
         }
         self.attempt.with_current(|| {
-            let buffer = match Arc::try_unwrap(self.storage) {
-                Ok(buffer) => buffer,
-                Err(shared) => RelayBuffer::copy_from(&shared, buffers)?,
-            };
-            let RelayBuffer { bytes, _charge } = buffer;
-            let result = operation(bytes);
-            drop(_charge);
-            Ok(result)
-        })?
+            with_relay_ingress_admission(self.admission.as_deref(), || {
+                let buffer = match Arc::try_unwrap(self.storage) {
+                    Ok(buffer) => buffer,
+                    Err(shared) => RelayBuffer::copy_from(&shared, buffers)?,
+                };
+                let RelayBuffer { bytes, _charge } = buffer;
+                let result = operation(bytes);
+                drop(_charge);
+                Ok(result)
+            })
+        })??
     }
     /// Mutate only through the packet's exact live authority. Unique backing
     /// stays in place; immutable views force a separately credited copy. No
@@ -943,7 +1006,13 @@ impl RelayPacket {
             // target. Its owner may retry against the actual current sink.
             return RelayWriteOutcome::Retry;
         }
-        match operation(&self.storage) {
+        let result =
+            with_relay_ingress_admission(self.admission.as_deref(), || operation(&self.storage));
+        let Ok(result) = result else {
+            self.consumed = true;
+            return RelayWriteOutcome::Stale;
+        };
+        match result {
             Ok(n) if n == self.storage.len() && n != 0 => {
                 self.consumed = true;
                 RelayWriteOutcome::Written
@@ -971,7 +1040,9 @@ impl RelayPacket {
         if self.consumed {
             return Err(RelayFlowError::Closed);
         }
-        self.attempt.with_current(|| operation(&self.storage))
+        self.attempt.with_current(|| {
+            with_relay_ingress_admission(self.admission.as_deref(), || operation(&self.storage))
+        })?
     }
 }
 

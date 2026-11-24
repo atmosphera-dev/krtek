@@ -32,7 +32,7 @@ fn packet_custody_tcp_completion_preserves_payload_and_original_packets_in_both_
             packet::parse(&normalized).unwrap().payload,
             b"complete TCP DNS frame"
         );
-        assert_eq!(&*input.pop_original().unwrap().unwrap(), bytes);
+        assert_eq!(input.pop_original().unwrap().unwrap().bytes(), bytes);
         assert!(input.pop_original().unwrap().is_none());
         scope.revoke();
         assert!(matches!(input.tcp_packet(&*buffers), Err(IpError::Stale)));
@@ -80,7 +80,7 @@ fn setup(ipv6: bool) -> (Arc<BufferBudget>, PacketReceiver, ReceiveScope) {
 fn originals(mut complete: CompletedDatagram) -> Vec<Vec<u8>> {
     let mut packets = vec![];
     while let Some(packet) = complete.pop_original().unwrap() {
-        packets.push(packet.to_vec());
+        packets.push(packet.bytes().to_vec());
     }
     packets
 }

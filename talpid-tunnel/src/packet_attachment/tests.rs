@@ -130,6 +130,77 @@ async fn owned_packets_wait_for_capacity_in_both_directions() {
 }
 
 #[tokio::test]
+async fn ordinary_ingress_retains_the_dns_admission_scope_through_handoff() {
+    use talpid_lan_forwarder::{
+        Flow, ReceiveScope, Transport, packet, packet_receiver::PacketReceiver,
+    };
+
+    let f = Fixture::new();
+    let (_request, lease, mut pair) = f.active().await;
+    let buffers = Arc::new(BufferBudget::new(32 * 1024 * 1024));
+    let mut receiver = PacketReceiver::new(buffers, 1420).unwrap();
+    let app: std::net::SocketAddr = "172.27.1.1:49152".parse().unwrap();
+    let resolver: std::net::SocketAddr = "192.0.2.53:53".parse().unwrap();
+    let wire = packet::udp_reply(
+        Flow {
+            source: resolver,
+            destination: app,
+            transport: Transport::Udp,
+        },
+        b"ordinary DNS passthrough",
+    )
+    .unwrap();
+    let mut original = || {
+        let scope = ReceiveScope::new(app.ip(), resolver.ip(), &f.capture).unwrap();
+        let mut completed = receiver.ingest(&scope, &wire).unwrap().unwrap();
+        assert_eq!(completed.packet().unwrap().flow.destination, resolver);
+        let original = completed.pop_original().unwrap().unwrap();
+        (scope, original)
+    };
+
+    let baseline = f.application.used();
+    let (_scope, dns) = original();
+    lease
+        .ingress_original(RelayTargetId::MULLVAD, dns)
+        .unwrap()
+        .try_send()
+        .unwrap();
+    pair.receive
+        .recv()
+        .await
+        .unwrap()
+        .handoff(|bytes| assert_eq!(bytes, wire))
+        .unwrap();
+    assert_eq!(f.application.used(), baseline);
+
+    for revoke_after_dequeue in [false, true] {
+        let (scope, dns) = original();
+        lease
+            .ingress_original(RelayTargetId::MULLVAD, dns)
+            .unwrap()
+            .try_send()
+            .unwrap();
+        assert!(f.application.used() > baseline);
+        if !revoke_after_dequeue {
+            scope.revoke();
+        }
+        let transport = pair.receive.recv().await.unwrap();
+        if revoke_after_dequeue {
+            scope.revoke();
+        }
+        let weak = scope.downgrade();
+        drop(scope);
+        assert!(weak.upgrade().is_some());
+        let outcome = talpid_netstack::raw_packet::handoff(transport, &f.application, |_| {
+            panic!("retired DNS original reached Ordinary handoff");
+        });
+        assert_eq!(outcome, Err(RelayFlowError::Stale));
+        assert_eq!(f.application.used(), baseline);
+        assert!(weak.upgrade().is_none());
+    }
+}
+
+#[tokio::test]
 async fn capacity_waits_cancel_without_crossing_attempt_or_sink() {
     use futures::FutureExt;
     for close in [false, true] {
