@@ -31,7 +31,7 @@ use std::{
 };
 use talpid_lan_forwarder::{Forwarder, LocalAuthority};
 use talpid_types::capture_network::{CaptureExpectation, CaptureNetworkFeed};
-use talpid_types::relay_flow::{RelayCapture, RelaySink, RelayWriteOutcome};
+use talpid_types::relay_flow::{RelayCapture, RelayIngressOriginal, RelaySink, RelayWriteOutcome};
 use tokio::{
     io::{Interest, unix::AsyncFd},
     sync::{mpsc, oneshot, watch},
@@ -39,6 +39,19 @@ use tokio::{
 };
 
 pub trait FrontendPlatform: Send + Sync + 'static {
+    fn system_dns(&self) -> Option<SystemDnsSnapshot> {
+        None
+    }
+    fn system_dns_current(&self, _token: i64) -> bool {
+        false
+    }
+    /// Reply-only ambiguity authority; never permission to prepare a socket.
+    fn system_dns_failure_token(&self) -> i64 {
+        0
+    }
+    fn prepare_system_dns(&self, _fd: i32, _token: i64) -> io::Result<()> {
+        Err(io::ErrorKind::PermissionDenied.into())
+    }
     fn open(
         &self,
         generation: i64,
@@ -71,6 +84,17 @@ pub trait FrontendPlatform: Send + Sync + 'static {
     /// Release platform ownership after descriptor closure. Must be idempotent:
     /// an error may mean the call never arrived, or that its acknowledgement failed.
     fn closed(&self, generation: i64) -> io::Result<()>;
+}
+
+/// Runtime-only non-VPN resolver snapshot. The token is retired before a
+/// changed/default-lost network can publish a successor with identical values.
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(target_os = "android", derive(jnix::FromJava))]
+#[cfg_attr(target_os = "android", jnix(package = "net.mullvad.talpid.model"))]
+pub struct SystemDnsSnapshot {
+    pub token: i64,
+    pub dns_servers: Vec<std::net::IpAddr>,
+    pub interface_index: i32,
 }
 
 pub struct CaptureHandover {
@@ -266,7 +290,7 @@ async fn drive_epoch<A: LocalAuthority>(
             _ = &mut *stop => return owner::Event::Terminal(FrontendState::Stopped),
             _ = async {}, if pending.is_none() && forwarder.has_original() => {
                 if let Some(original) = forwarder.original() {
-                    *pending = dispatch(forwarder, &original, session);
+                    *pending = dispatch(forwarder, Ingress::Original(original), session);
                 }
             },
             command = commands.recv() => match command {
@@ -378,14 +402,23 @@ fn ingest<A: LocalAuthority>(
             return None;
         }
     }
-    dispatch(forwarder, bytes, session)
+    dispatch(forwarder, Ingress::New(bytes), session)
+}
+
+enum Ingress<'a> {
+    New(&'a [u8]),
+    Original(RelayIngressOriginal),
 }
 
 fn dispatch<A: LocalAuthority>(
     forwarder: &mut impl Receiver<A>,
-    bytes: &[u8],
+    ingress: Ingress<'_>,
     session: Option<(&CaptureConfig, &Observation)>,
 ) -> Option<PendingIngress> {
+    let bytes = match &ingress {
+        Ingress::New(bytes) => bytes,
+        Ingress::Original(original) => original.bytes(),
+    };
     let Some((config, observation)) = session else {
         forwarder.ingest(bytes);
         return None;
@@ -456,7 +489,13 @@ fn dispatch<A: LocalAuthority>(
                             ip.destination()
                         ),
                     );
-                    if let Ok(mut packet) = observation.lease.ingress(target, bytes)
+                    let pending = match ingress {
+                        Ingress::New(bytes) => observation.lease.ingress(target, bytes),
+                        Ingress::Original(original) => {
+                            observation.lease.ingress_original(target, original)
+                        }
+                    };
+                    if let Ok(mut packet) = pending
                         && packet.try_send() == Err(AttachmentError::Full)
                     {
                         return Some(packet);

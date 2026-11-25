@@ -131,3 +131,20 @@ pub extern "system" fn Java_net_mullvad_talpid_LocalCaptureNetworkBridge_publish
         log::warn!("Capture network conversion unavailable");
     }
 }
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_net_mullvad_talpid_LocalCaptureNetworkBridge_lockdownChanged(
+    _: JNIEnv<'_>,
+    _: JClass<'_>,
+    registration: jlong,
+    enabled: jnix::jni::sys::jboolean,
+) {
+    if let Some(feed) = ACTIVE
+        .lock()
+        .expect("capture registration")
+        .as_ref()
+        .and_then(Weak::upgrade)
+    {
+        feed.publish_lockdown(registration, enabled != 0);
+    }
+}

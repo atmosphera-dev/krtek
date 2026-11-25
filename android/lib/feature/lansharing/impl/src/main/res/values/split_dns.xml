@@ -1,6 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="split_dns_title">Split DNS</string>
+    <string name="split_dns_enable">Use home DNS for listed domains</string>
+    <string name="split_dns_used_on">Used on %1$s</string>
+    <string name="split_dns_used_on_any_network">Used on any Wi-Fi or wired network</string>
+    <string name="split_dns_android_9_pause">On Android 9, split DNS pauses while Mullvad is
+    off.</string>
+    <string name="split_dns_domains">Domains</string>
+    <string name="split_dns_edit">Edit split DNS</string>
+    <string name="split_dns_save">Save</string>
     <string name="split_dns_domain">Domain</string>
     <string name="split_dns_add_domain">Add domain</string>
     <string name="split_dns_remove_domain">Remove domain</string>
@@ -10,6 +18,8 @@
     <string name="split_dns_home_ip_help">Your router\'s or home DNS server\'s own address, for
     example 192.168.1.1 (not 172.27.1.1).</string>
     <string name="split_dns_home_network">Home network</string>
+    <string name="split_dns_choose_home_network">Choose a home network</string>
+    <string name="split_dns_rule_network">%1$s - %2$s</string>
     <string name="split_dns_no_fallback">If your home DNS can\'t be reached, listed domains fail
     instead of asking another server. Other domains work as before.</string>
     <string name="split_dns_route_help">DNS answers do not add local network rules. Use full names,
@@ -17,4 +27,14 @@
     <string name="split_dns_private_dns">Android\'s Private DNS and apps with their own secure DNS
     (for example Chrome) skip split DNS. Turn them off to use it.</string>
     <string name="split_dns_open_private_dns">Open Private DNS settings</string>
+    <string name="split_dns_policy_invalid">The saved split DNS settings are invalid. Edit them to
+    fix this.</string>
+    <string name="split_dns_invalid">Check the domains, home DNS IP and home network.</string>
+    <string name="split_dns_invalid_domain">Fix or remove the domain that is not valid.</string>
+    <string name="split_dns_invalid_home_ip">Enter the home DNS server\'s IP address, for example
+    192.168.1.1.</string>
+    <string name="split_dns_missing_domain">Add at least one domain.</string>
+    <string name="split_dns_missing_home_network">Choose a home network.</string>
+    <string name="split_dns_home_ip_not_covered">The home network\'s rule doesn\'t include this
+    address. Add the address to that rule first.</string>
 </resources>

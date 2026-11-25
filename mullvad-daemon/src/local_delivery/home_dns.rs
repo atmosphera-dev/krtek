@@ -3,6 +3,31 @@
 
 use super::*;
 
+/// The classifier and its revocable capture registration are acquired together.
+#[derive(Clone)]
+pub(crate) struct DnsInput {
+    matcher: Arc<SuffixMatcher>,
+    scope: ReceiveScope,
+}
+
+impl DnsInput {
+    pub(crate) fn matcher(&self) -> &SuffixMatcher {
+        &self.matcher
+    }
+
+    pub(crate) fn scope(&self) -> &ReceiveScope {
+        &self.scope
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(matcher: SuffixMatcher, scope: ReceiveScope) -> Self {
+        Self {
+            matcher: Arc::new(matcher),
+            scope,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct HomeDnsGrant(Arc<HomeQuery>);
 
@@ -10,6 +35,7 @@ struct HomeQuery {
     flow: Flow,
     grant: DeliveryGrant,
     scope: ReceiveScope,
+    classification: ReceiveScope,
     live: watch::Sender<bool>,
     _storage: Arc<dyn RelayBufferReservation>,
 }
@@ -49,69 +75,106 @@ impl DeliveryAuthority {
         source: IpAddr,
         resolver: IpAddr,
         buffers: &dyn RelayBufferAllocator,
-    ) -> Result<(Arc<SuffixMatcher>, ReceiveScope), Refused> {
+    ) -> Result<DnsInput, Refused> {
         let mut inputs = self.inputs.write().unwrap();
-        inputs.revalidate_receive();
-        let dns = &inputs.policy.split_dns;
-        if !dns.enabled {
-            return Err(Refused::Denied);
-        }
-        let matcher = inputs.dns_matcher.clone().ok_or(Refused::Denied)?;
-        let capture = inputs.capture.as_ref().ok_or(Refused::Denied)?;
-        if !inputs.endpoint || !capture.sources.contains(&source) {
-            return Err(Refused::Denied);
-        }
-        let identity = capture.identity;
-        let generation = capture.generation()?;
+        inputs.reclaim_dns_inputs();
+        // The broker advances independently of the authority lock. Reuse and
+        // replacement must both use the same generation read for admission.
+        let identity = inputs.dns_capture().and_then(|(capture, identity)| {
+            capture
+                .sources
+                .contains(&source)
+                .then_some(identity)
+                .ok_or(Refused::Denied)
+        });
         let key = (source, resolver);
-        if let Some(scope) = inputs.dns_inputs.get(&key).and_then(|r| r.scope.upgrade()) {
-            return Ok((matcher, scope));
+        let current = inputs
+            .dns_inputs
+            .get(&key)
+            .and_then(|record| record.revalidate(identity.ok()));
+        if current.is_none() {
+            inputs.dns_inputs.remove(&key);
         }
-        let scope = ReceiveScope::new(source, resolver, buffers)?;
-        let revision = inputs.dns_revision;
+        let identity = identity?;
+        let matcher = inputs.dns_matcher.clone().ok_or(Refused::Denied)?;
+        if let Some(scope) = current {
+            return Ok(DnsInput { matcher, scope });
+        }
+
+        let retired = Arc::downgrade(&inputs.retired_dns_inputs);
+        let notify = Box::new(move |id, charge| {
+            if let Some(retired) = retired.upgrade() {
+                retired.lock().unwrap().push((key, id, charge));
+            }
+        });
+        let scope = ReceiveScope::new_notifying(source, resolver, buffers, Some(notify))?;
         inputs.dns_inputs.insert(
             key,
             DnsInputScope {
+                id: scope.id(),
                 scope: scope.downgrade(),
-                revision,
-                capture: identity,
-                generation,
+                identity,
                 _charge: scope.registration_credit(),
             },
         );
-        Ok((matcher, scope))
+        Ok(DnsInput { matcher, scope })
     }
 
     pub(crate) fn dns_enabled(&self) -> bool {
         self.inputs.read().unwrap().policy.split_dns.enabled
     }
 
-    /// Resolver selection belongs to the Local Home path, never to the DNS
-    /// message consumer. The normal authorization below rechecks the selected
-    /// address and policy, so a concurrent policy replacement cannot grant the
-    /// old address under the new policy.
+    /// Select and commit the grant under the same authority lock. Even an
+    /// unchanged Home address cannot authorize classification by a retired policy.
     pub(crate) fn home_dns_authorize_configured(
         &self,
+        input: &DnsInput,
         source: SocketAddr,
         transport: talpid_lan_forwarder::Transport,
         buffers: &dyn RelayBufferAllocator,
     ) -> Result<HomeDnsGrant, Refused> {
-        let destination = self
-            .inputs
-            .read()
-            .unwrap()
+        let mut inputs = self.inputs.write().unwrap();
+        let classification = input.scope();
+        if !classification.current() || classification.source() != source.ip() {
+            return Err(Refused::Stale);
+        }
+        let record = inputs
+            .dns_inputs
+            .get(&(classification.source(), classification.destination()))
+            .ok_or(Refused::Stale)?;
+        if record.identity.revision != inputs.dns_revision || record.id != classification.id() {
+            return Err(Refused::Stale);
+        }
+        let expected = record.identity;
+        let destination = inputs
             .policy
             .split_dns
             .home_resolver
             .ok_or(Refused::Denied)?;
-        self.home_dns_authorize(
-            Flow {
-                transport,
-                source,
-                destination: SocketAddr::new(destination, 53),
-            },
+        let flow = Flow {
+            transport,
+            source,
+            destination: SocketAddr::new(destination, 53),
+        };
+        let scope = self.receive_for(
+            &mut inputs,
+            source.ip(),
+            destination,
+            ReceivePurpose::HomeDns,
             buffers,
-        )
+        )?;
+        let grant = Self::authorize_received_for(&inputs, flow, &scope, ReceivePurpose::HomeDns)?;
+        if expected
+            != (DnsInputIdentity {
+                capture: grant.capture,
+                generation: grant.generation,
+                revision: grant.dns_revision,
+            })
+            || !classification.current()
+        {
+            return Err(Refused::Stale);
+        }
+        Self::home_dns_query(flow, grant, scope, classification.clone(), buffers)
     }
 
     /// Observe authority changes as well as explicit per-query retirement. A
@@ -129,6 +192,7 @@ impl DeliveryAuthority {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn home_dns_authorize(
         &self,
         flow: Flow,
@@ -137,29 +201,45 @@ impl DeliveryAuthority {
         if flow.destination.port() != 53 {
             return Err(Refused::Denied);
         }
-        // Same fixed grant/task metadata allowance as Local; cloned providers
-        // share this backing rather than cloning per-query grant allocations.
-        let storage = buffers
-            .try_reserve(size_of::<HomeQuery>() + 4096)
-            .map_err(|_| Refused::Full)?;
+        let mut inputs = self.inputs.write().unwrap();
         let scope = self.receive_for(
+            &mut inputs,
             flow.source.ip(),
             flow.destination.ip(),
             ReceivePurpose::HomeDns,
             buffers,
         )?;
-        let grant = self.authorize_received_for(flow, &scope, ReceivePurpose::HomeDns)?;
+        let grant = Self::authorize_received_for(&inputs, flow, &scope, ReceivePurpose::HomeDns)?;
+        Self::home_dns_query(flow, grant, scope.clone(), scope, buffers)
+    }
+
+    fn home_dns_query(
+        flow: Flow,
+        grant: DeliveryGrant,
+        scope: ReceiveScope,
+        classification: ReceiveScope,
+        buffers: &dyn RelayBufferAllocator,
+    ) -> Result<HomeDnsGrant, Refused> {
+        // Same fixed grant/task metadata allowance as Local; cloned providers
+        // share this backing rather than cloning per-query grant allocations.
+        let storage = buffers
+            .try_reserve(size_of::<HomeQuery>() + 4096)
+            .map_err(|_| Refused::Full)?;
         Ok(HomeDnsGrant(Arc::new(HomeQuery {
             flow,
             grant,
             scope,
+            classification,
             live: watch::channel(true).0,
             _storage: storage,
         })))
     }
 
     pub(crate) fn home_dns_current(&self, query: &HomeDnsGrant) -> bool {
-        *query.0.live.borrow() && query.0.scope.current() && self.current(&query.0.grant)
+        *query.0.live.borrow()
+            && query.0.classification.current()
+            && query.0.scope.current()
+            && self.current(&query.0.grant)
     }
 
     pub(crate) fn home_dns_prepare(

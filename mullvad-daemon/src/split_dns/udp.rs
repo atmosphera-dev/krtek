@@ -13,11 +13,12 @@ use std::{
     time::Duration,
 };
 
+use crate::local_delivery::home_dns::DnsInput;
 use hickory_proto::{
-    op::{DnsResponse, Message, MessageType, Metadata, ResponseCode},
+    op::{DnsResponse, Message, MessageType, ResponseCode},
     serialize::binary::{BinEncodable, BinEncoder},
 };
-use mullvad_types::settings::local_network_access::split_dns::{DnsLane, SuffixMatcher};
+use mullvad_types::settings::local_network_access::split_dns::DnsLane;
 use talpid_lan_forwarder::packet_receiver::{
     CompletedDatagram, DatagramReply, IpError, PacketReceiver,
 };
@@ -27,6 +28,7 @@ use talpid_types::relay_flow::{
 
 use super::{
     home_path::{HomeDnsPath, HomeDnsQuery},
+    response::failure,
     transport::{ExchangeError, Protocol, decode_message},
 };
 
@@ -37,6 +39,7 @@ pub(super) enum UdpDecision<'a> {
 }
 
 pub(super) struct UdpQuery {
+    context: DnsInput,
     client: SocketAddr,
     resolver: SocketAddr,
     request: Message,
@@ -47,15 +50,16 @@ pub(super) struct UdpQuery {
 /// list belonging to the same capture generation. No Home eligibility decision
 /// occurs here: a listed name stays intercepted even when Home is ineligible.
 pub(super) fn inspect<'a>(
-    matcher: Option<&SuffixMatcher>,
+    context: Option<&DnsInput>,
     advertised: &[IpAddr],
     client: SocketAddr,
     resolver: SocketAddr,
     bytes: &'a [u8],
 ) -> UdpDecision<'a> {
-    let Some(matcher) = matcher else {
+    let Some(context) = context else {
         return UdpDecision::PassThrough(bytes);
     };
+    let matcher = context.matcher();
     if resolver.port() != 53 || !advertised.contains(&resolver.ip()) {
         return UdpDecision::PassThrough(bytes);
     }
@@ -81,6 +85,7 @@ pub(super) fn inspect<'a>(
         None
     };
     UdpDecision::Intercept(Box::new(UdpQuery {
+        context: context.clone(),
         client,
         resolver,
         request,
@@ -104,6 +109,7 @@ pub(super) struct HomeUdpReply {
     reply: UdpReply,
     request: Message,
     leases: [Option<Arc<dyn HomeDnsQuery>>; 2],
+    system: Option<Arc<super::system::SystemQuery>>,
     _storage: Arc<dyn RelayBufferReservation>,
 }
 
@@ -140,7 +146,9 @@ impl HomeUdpReply {
         &self,
         emit: impl FnOnce(SocketAddr, SocketAddr, &[u8]) -> T,
     ) -> Result<T, ExchangeError> {
-        if !self.leases.iter().flatten().all(|lease| lease.current()) {
+        if !self.leases.iter().flatten().all(|lease| lease.current())
+            || self.system.as_ref().is_some_and(|query| !query.current())
+        {
             return Err(ExchangeError::Closed);
         }
         Ok(emit(
@@ -210,9 +218,36 @@ impl HomeUdpOutput {
 }
 
 impl UdpQuery {
+    pub(super) async fn system_answer(
+        flow: talpid_lan_forwarder::Flow,
+        bytes: Vec<u8>,
+        scope: talpid_lan_forwarder::ReceiveScope,
+        system: &super::system::SystemIo,
+        capture: RelayCapture,
+        storage: Arc<dyn RelayBufferReservation>,
+    ) -> Result<HomeUdpReply, ExchangeError> {
+        let request = decode_message(&bytes)?;
+        let query = system.authorize(flow.destination, false, scope, capture)?;
+        let bytes = query.exchange(&system.io, bytes).await?;
+        Ok(HomeUdpReply {
+            reply: UdpReply {
+                source: flow.destination,
+                destination: flow.source,
+                bytes,
+            },
+            request,
+            leases: [None, None],
+            system: Some(query),
+            _storage: storage,
+        })
+    }
     pub(super) fn check_input(&self, input: &CompletedDatagram) -> Result<(), IpError> {
+        if input.parent_scope_id() != self.context.scope().id() {
+            return Err(IpError::Stale);
+        }
         let packet = input.packet()?;
-        if packet.flow.source != self.client
+        if packet.flow.transport != talpid_lan_forwarder::Transport::Udp
+            || packet.flow.source != self.client
             || packet.flow.destination != self.resolver
             || decode_message(packet.payload).map_err(|_| IpError::Malformed)? != self.request
         {
@@ -246,7 +281,7 @@ impl UdpQuery {
                     let previous = leases[0].clone();
                     let query = if leases.iter().flatten().all(|lease| lease.current()) {
                         path.ok_or(ExchangeError::Closed)
-                            .and_then(|path| path.authorize(client, protocol))
+                            .and_then(|path| path.authorize(&self.context, client, protocol))
                             .map(Arc::<dyn HomeDnsQuery>::from)
                     } else {
                         Err(ExchangeError::Closed)
@@ -281,6 +316,7 @@ impl UdpQuery {
             reply,
             request: self.request,
             leases,
+            system: None,
             _storage: storage,
         };
         reply.with_current(|_, _, _| ())?;
@@ -306,11 +342,11 @@ impl UdpQuery {
         Fut: Future<Output = Result<DnsResponse, ExchangeError>>,
     {
         let bytes = if let Some(error) = self.error {
-            self.failure(error)?
+            failure(&self.request, error)?
         } else {
             match self.home_answer(&mut home).await {
                 Ok(response) => self.fit(response, tcp_retry, injection_limit)?,
-                Err(_) => self.failure(ResponseCode::ServFail)?,
+                Err(_) => failure(&self.request, ResponseCode::ServFail)?,
             }
         };
         Ok(UdpReply {
@@ -348,15 +384,6 @@ impl UdpQuery {
         Ok(())
     }
 
-    fn failure(&self, code: ResponseCode) -> Result<Vec<u8>, ExchangeError> {
-        let mut response =
-            Message::response(self.request.metadata.id, self.request.metadata.op_code);
-        response.metadata = Metadata::response_from_request(&self.request.metadata);
-        response.metadata.response_code = code;
-        response.queries = self.request.queries.clone();
-        response.to_vec().map_err(|_| ExchangeError::Malformed)
-    }
-
     fn fit(
         &self,
         response: DnsResponse,
@@ -370,7 +397,7 @@ impl UdpQuery {
             return Ok(response.as_buffer().to_vec());
         }
         if !tcp_retry {
-            return self.failure(ResponseCode::ServFail);
+            return failure(&self.request, ResponseCode::ServFail);
         }
         // Hickory rolls back incomplete records and sets TC in the emitted
         // header. Never slice raw records or clear a received TC bit.

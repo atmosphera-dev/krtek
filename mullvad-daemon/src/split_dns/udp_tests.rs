@@ -3,7 +3,10 @@ use crate::split_dns::transport::exchange;
 use hickory_net::runtime::TokioRuntimeProvider;
 use hickory_proto::{
     op::{Edns, OpCode, Query},
-    rr::{Name, RData, Record, RecordType, rdata::NULL},
+    rr::{
+        Name, RData, Record, RecordType,
+        rdata::{NULL, opt::EdnsOption},
+    },
 };
 use std::{
     io,
@@ -57,9 +60,9 @@ fn intercepted(request: &Message, ipv6: bool) -> UdpQuery {
     }
     .parse()
     .unwrap();
-    let matcher = SuffixMatcher::compile(["home", "my-matrix-server.com"]).unwrap();
+    let input = test_input(client, resolver, ["home", "my-matrix-server.com"]);
     match inspect(
-        Some(&matcher),
+        Some(&input),
         &[resolver.ip()],
         client,
         resolver,
@@ -68,6 +71,21 @@ fn intercepted(request: &Message, ipv6: bool) -> UdpQuery {
         UdpDecision::Intercept(query) => *query,
         _ => panic!("listed question was not intercepted"),
     }
+}
+
+fn test_input<const N: usize>(
+    client: SocketAddr,
+    resolver: SocketAddr,
+    suffixes: [&str; N],
+) -> DnsInput {
+    use mullvad_types::settings::local_network_access::split_dns::SuffixMatcher;
+    use talpid_lan_forwarder::ReceiveScope;
+    use talpid_netstack::buffer_budget::BufferBudget;
+
+    DnsInput::for_test(
+        SuffixMatcher::compile(suffixes).unwrap(),
+        ReceiveScope::new(client.ip(), resolver.ip(), &BufferBudget::new(1024)).unwrap(),
+    )
 }
 
 fn check_reply(reply: &UdpReply, original: &Message, ipv6: bool) -> Message {
@@ -93,15 +111,30 @@ fn check_reply(reply: &UdpReply, original: &Message, ipv6: bool) -> Message {
     );
     let decoded = decode_message(&reply.bytes).unwrap();
     assert_eq!(decoded.metadata.id, original.metadata.id);
+    assert_eq!(decoded.metadata.message_type, MessageType::Response);
+    assert_eq!(decoded.metadata.op_code, original.metadata.op_code);
     assert_eq!(decoded.queries, original.queries);
     decoded
 }
 
+fn check_failure_opt(reply: &Message, request: &Message) {
+    if let Some(request) = &request.edns {
+        let edns = reply.edns.as_ref().expect("missing response OPT");
+        assert_eq!(edns.version(), 0);
+        assert_eq!(edns.max_payload(), 1232);
+        assert_eq!(edns.flags().dnssec_ok, request.flags().dnssec_ok);
+        assert_eq!(edns.flags().z, 0);
+        assert!(edns.options().options.is_empty());
+    } else {
+        assert!(reply.edns.is_none());
+    }
+}
+
 #[test]
 fn split_dns_udp_unlisted_and_out_of_scope_keep_original_bytes() {
-    let matcher = SuffixMatcher::compile(["home"]).unwrap();
     let client = "172.27.1.1:49152".parse().unwrap();
     let resolver: SocketAddr = "100.64.0.3:53".parse().unwrap();
+    let input = test_input(client, resolver, ["home"]);
     for (name, enabled, destination, advertised) in [
         ("outside.example.", true, resolver, true),
         ("myhome.", true, resolver, true),
@@ -117,7 +150,7 @@ fn split_dns_udp_unlisted_and_out_of_scope_keep_original_bytes() {
             vec![]
         };
         let UdpDecision::PassThrough(original) = inspect(
-            enabled.then_some(&matcher),
+            enabled.then_some(&input),
             &servers,
             client,
             destination,
@@ -172,7 +205,11 @@ async fn split_dns_udp_home_failure_or_ineligibility_is_servfail_not_passthrough
         io::ErrorKind::ConnectionRefused,
         io::ErrorKind::PermissionDenied,
     ] {
-        let original = request("nas.home.", RecordType::A, None);
+        let mut original = request("nas.home.", RecordType::A, Some(4096));
+        let edns = original.edns.as_mut().unwrap();
+        edns.flags_mut().z = 1;
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(65001, vec![1, 2, 3]));
         let calls = Arc::new(Mutex::new(Vec::new()));
         let observed = calls.clone();
         let reply = intercepted(&original, false)
@@ -194,6 +231,7 @@ async fn split_dns_udp_home_failure_or_ineligibility_is_servfail_not_passthrough
         assert!(decoded.metadata.recursion_desired);
         assert!(decoded.metadata.checking_disabled);
         assert!(decoded.answers.is_empty());
+        check_failure_opt(&decoded, &original);
         assert_eq!(*calls.lock().unwrap(), [Protocol::Udp]);
     }
 }
@@ -245,7 +283,7 @@ async fn split_dns_udp_ambiguous_and_unsupported_listed_messages_never_dispatch(
     let mut update = original.clone();
     update.metadata.op_code = OpCode::Update;
     let transfer = request("home.", RecordType::AXFR, None);
-    for (request, code) in [
+    for (mut request, code) in [
         (mixed, ResponseCode::FormErr),
         (same_lane, ResponseCode::FormErr),
         (update, ResponseCode::NotImp),
@@ -264,6 +302,10 @@ async fn split_dns_udp_ambiguous_and_unsupported_listed_messages_never_dispatch(
             .await
             .unwrap();
         assert_eq!(calls, 0);
+        if code == ResponseCode::FormErr {
+            request.queries.clear();
+            assert_eq!(&reply.bytes[4..6], &[0, 0]);
+        }
         assert_eq!(
             check_reply(&reply, &request, false).metadata.response_code,
             code
@@ -273,9 +315,9 @@ async fn split_dns_udp_ambiguous_and_unsupported_listed_messages_never_dispatch(
 
 #[test]
 fn split_dns_udp_malformed_or_response_payload_cannot_authorize_forwarding() {
-    let matcher = SuffixMatcher::compile(["home"]).unwrap();
     let source = "172.27.1.1:49152".parse().unwrap();
     let resolver: SocketAddr = "100.64.0.3:53".parse().unwrap();
+    let input = test_input(source, resolver, ["home"]);
     let good = request("nas.home.", RecordType::A, None).to_vec().unwrap();
     let mut trailing = good.clone();
     trailing.push(42);
@@ -291,7 +333,7 @@ fn split_dns_udp_malformed_or_response_payload_cannot_authorize_forwarding() {
         response,
     ] {
         assert!(matches!(
-            inspect(Some(&matcher), &[resolver.ip()], source, resolver, &bytes),
+            inspect(Some(&input), &[resolver.ip()], source, resolver, &bytes),
             UdpDecision::Drop
         ));
     }
@@ -319,6 +361,7 @@ async fn split_dns_udp_edns_and_actual_emission_limit_require_tcp_before_tc() {
                 } else {
                     assert!(!decoded.metadata.truncation);
                     assert_eq!(decoded.metadata.response_code, ResponseCode::ServFail);
+                    check_failure_opt(&decoded, &original);
                 }
             }
         }

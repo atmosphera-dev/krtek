@@ -2,19 +2,20 @@
 use super::{Error, VpnServiceConfig};
 use crate::tun_provider::AppliedTun;
 use jnix::{
-    IntoJava, JnixEnv,
+    FromJava, IntoJava, JnixEnv,
     jni::objects::{AutoLocal, JObject, JValue},
 };
 use std::os::fd::RawFd;
 use talpid_types::android::AndroidContext;
 mod descriptor;
 mod jni_call;
+mod system_dns;
 use jni_call::handled;
 
 pub const METHODS: [(&str, &str); 9] = [
     (
         "openLocalFrontend",
-        "(J[Ljava/lang/String;[Ljava/lang/String;)Lnet/mullvad/talpid/model/CreateTunResult;",
+        "(J[Ljava/lang/String;[Ljava/lang/String;Ljava/util/ArrayList;)Lnet/mullvad/talpid/model/CreateTunResult;",
     ),
     ("finishLocalFrontend", "(J)V"),
     ("isLocalFrontendActive", "()Z"),
@@ -26,7 +27,7 @@ pub const METHODS: [(&str, &str); 9] = [
     ("bindLocalFrontend", "(JLjava/lang/String;)Z"),
     (
         "handoverLocalFrontend",
-        "(JJ[Ljava/lang/String;[Ljava/lang/String;)Lnet/mullvad/talpid/model/CaptureHandoverResult;",
+        "(JJ[Ljava/lang/String;[Ljava/lang/String;Ljava/util/ArrayList;)Lnet/mullvad/talpid/model/CaptureHandoverResult;",
     ),
     (
         "handoverSecuredFrontend",
@@ -110,6 +111,133 @@ pub struct LocalNetworkPlatform {
 }
 
 impl LocalNetworkPlatform {
+    pub fn system_dns_snapshot(
+        &self,
+    ) -> Result<Option<crate::android_frontend::SystemDnsSnapshot>, Error> {
+        self.read_dns_snapshot("systemDnsSnapshot")
+    }
+
+    pub fn own_dns_snapshot(
+        &self,
+    ) -> Result<Option<crate::android_frontend::SystemDnsSnapshot>, Error> {
+        self.read_dns_snapshot("ownSystemDnsSnapshot")
+    }
+
+    fn read_dns_snapshot(
+        &self,
+        name: &'static str,
+    ) -> Result<Option<crate::android_frontend::SystemDnsSnapshot>, Error> {
+        let env = JnixEnv::from(
+            self.context
+                .jvm
+                .attach_current_thread_as_daemon()
+                .map_err(Error::AttachJvmToThread)?,
+        );
+        handled(&env, name, || {
+            let result = env
+                .call_method(
+                    self.context.vpn_service.as_obj(),
+                    name,
+                    "()Lnet/mullvad/talpid/model/SystemDnsSnapshot;",
+                    &[],
+                )
+                .map_err(|e| Error::CallMethod(name, e))?;
+            let object = result.l().map_err(|e| Error::CallMethod(name, e))?;
+            let object = env.auto_local(object);
+            system_dns::decode(&env, object.as_obj(), || {
+                crate::android_frontend::SystemDnsSnapshot::from_java(
+                    &env,
+                    JValue::Object(object.as_obj()),
+                )
+            })
+            .map_err(|()| Error::TunnelDeviceError)
+        })
+    }
+
+    /// Serialize one synchronous DNS operation with VPN establishment and retirement.
+    /// No continuation may retain this monitor across an await.
+    pub fn with_dns_capture_epoch<T>(&self, f: impl FnOnce(i64) -> T) -> Result<T, Error> {
+        let env = self
+            .context
+            .jvm
+            .attach_current_thread_as_daemon()
+            .map_err(Error::AttachJvmToThread)?;
+        let service = self.context.vpn_service.as_obj();
+        let name = "ownDnsCaptureEpoch";
+        let _guard = env
+            .lock_obj(service)
+            .map_err(|e| Error::CallMethod(name, e))?;
+        let epoch = handled(&env, name, || {
+            env.call_method(service, name, "()J", &[])
+                .and_then(|value| value.j())
+                .map_err(|e| Error::CallMethod(name, e))
+        })?;
+        Ok(f(epoch))
+    }
+
+    pub fn own_dns_socket(&self, epoch: i64, token: i64, fd: Option<RawFd>) -> Result<bool, Error> {
+        let env = self
+            .context
+            .jvm
+            .attach_current_thread_as_daemon()
+            .map_err(Error::AttachJvmToThread)?;
+        let name = "ownSystemDnsSocket";
+        handled(&env, name, || {
+            env.call_method(
+                self.context.vpn_service.as_obj(),
+                name,
+                "(JJI)Z",
+                &[
+                    JValue::Long(epoch),
+                    JValue::Long(token),
+                    JValue::Int(fd.unwrap_or(-1)),
+                ],
+            )
+            .and_then(|value| value.z())
+            .map_err(|e| Error::CallMethod(name, e))
+        })
+    }
+    pub fn system_dns_failure(&self) -> Result<i64, Error> {
+        let env = self
+            .context
+            .jvm
+            .attach_current_thread_as_daemon()
+            .map_err(Error::AttachJvmToThread)?;
+        let name = "systemDnsFailureToken";
+        handled(&env, name, || {
+            env.call_method(self.context.vpn_service.as_obj(), name, "()J", &[])
+                .and_then(|value| value.j())
+                .map_err(|error| Error::CallMethod(name, error))
+        })
+    }
+
+    pub fn system_dns_call(&self, token: i64, fd: Option<i32>) -> Result<bool, Error> {
+        let env = self
+            .context
+            .jvm
+            .attach_current_thread_as_daemon()
+            .map_err(Error::AttachJvmToThread)?;
+        let (name, sig, args) = match fd {
+            None => ("systemDnsCurrent", "(J)Z", vec![JValue::Long(token)]),
+            Some(fd) => (
+                "prepareSystemDns",
+                "(IJ)I",
+                vec![JValue::Int(fd), JValue::Long(token)],
+            ),
+        };
+        handled(&env, name, || {
+            let result = env
+                .call_method(self.context.vpn_service.as_obj(), name, sig, &args)
+                .map_err(|e| Error::CallMethod(name, e))?;
+            match fd {
+                None => result.z().map_err(|e| Error::CallMethod(name, e)),
+                Some(_) => result
+                    .i()
+                    .map(|code| code == 0)
+                    .map_err(|e| Error::CallMethod(name, e)),
+            }
+        })
+    }
     pub fn new(context: AndroidContext) -> Self {
         Self { context }
     }
@@ -148,6 +276,7 @@ impl LocalNetworkPlatform {
         handled(&env, name, || {
             let routes = string_array(&env, name, &config.routes)?;
             let excluded = string_array(&env, name, &config.excluded_packages)?;
+            let dns = config.dns_servers.clone().into_java(&env);
             let result = env
                 .call_method(
                     self.context.vpn_service.as_obj(),
@@ -157,6 +286,7 @@ impl LocalNetworkPlatform {
                         JValue::Long(generation),
                         JValue::Object(routes.as_obj()),
                         JValue::Object(excluded.as_obj()),
+                        JValue::Object(dns.as_obj()),
                     ],
                 )
                 .and_then(|value| value.l())
@@ -259,13 +389,14 @@ impl LocalNetworkPlatform {
                 FrontendHandoverConfig::Secured(_) => 7,
             }];
             handled(&env, name, || {
-                let (argument, excluded) = match config {
+                let (argument, excluded, dns) = match config {
                     FrontendHandoverConfig::Partial(config) => (
                         string_array(&env, name, &config.routes)?,
                         Some(string_array(&env, name, &config.excluded_packages)?),
+                        Some(config.dns_servers.clone().into_java(&env)),
                     ),
                     FrontendHandoverConfig::Secured(config) => {
-                        (VpnServiceConfig::new(config).into_java(&env), None)
+                        (VpnServiceConfig::new(config).into_java(&env), None, None)
                     }
                 };
                 let mut arguments = vec![
@@ -275,6 +406,9 @@ impl LocalNetworkPlatform {
                 ];
                 if let Some(excluded) = &excluded {
                     arguments.push(JValue::Object(excluded.as_obj()));
+                }
+                if let Some(dns) = &dns {
+                    arguments.push(JValue::Object(dns.as_obj()));
                 }
                 let result = env
                     .call_method(

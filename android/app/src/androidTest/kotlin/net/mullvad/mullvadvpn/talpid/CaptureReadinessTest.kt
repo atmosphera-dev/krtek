@@ -149,6 +149,22 @@ class CaptureReadinessTest {
     }
 
     @Test
+    fun partialSampleMustStayInTheSameCaptureAndSession() {
+        val before = CaptureReadiness.partialReceipt(partial(), "11")
+        assertEquals(before, CaptureReadiness.matchingPartialReceipt(before, partial(), "11"))
+        assertNull(CaptureReadiness.matchingPartialReceipt(before, partial("13"), "11"))
+        assertNull(
+            CaptureReadiness.matchingPartialReceipt(
+                before,
+                partial().replace("session_generation: Some(1)", "session_generation: Some(2)"),
+                "11",
+            )
+        )
+        assertNull(CaptureReadiness.matchingPartialReceipt(null, partial(), "11"))
+        assertNull(CaptureReadiness.matchingPartialReceipt(before, "", "11"))
+    }
+
+    @Test
     fun malformedPartialFormatStillFailsStrictly() {
         assertFails { CaptureReadiness.partialReceipt(partial("0"), null) }
         assertFails {

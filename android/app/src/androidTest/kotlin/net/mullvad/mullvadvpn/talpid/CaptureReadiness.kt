@@ -123,6 +123,12 @@ internal object CaptureReadiness {
         return PartialReceipt(generation, session, format)
     }
 
+    fun matchingPartialReceipt(
+        before: PartialReceipt?,
+        afterTail: String,
+        previousGeneration: String?,
+    ): PartialReceipt? = before?.takeIf { it == partialReceipt(afterTail, previousGeneration) }
+
     fun receipt(
         tail: String,
         iface: String,

@@ -72,7 +72,10 @@ impl Observation {
             updates,
             lease,
             sources: config.sources(),
-            dns_servers: Vec::new(),
+            dns_servers: match config {
+                CaptureConfig::Partial(config) => config.dns_servers.clone(),
+                _ => Vec::new(),
+            },
             mtu: config.mtu(),
             requested_routes: Vec::new(),
             lifecycle: Mutex::new(None),

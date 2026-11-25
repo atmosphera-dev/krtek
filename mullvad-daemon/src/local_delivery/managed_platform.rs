@@ -1,5 +1,6 @@
 //! Production managed entry, also compiled against the platform boundary in Linux tests.
 use super::*;
+use crate::split_dns::platform::{capture::CaptureDns, home_path::HomeDnsPath, local_home_path};
 use talpid_lan_forwarder::Forwarder;
 use talpid_tunnel::android_frontend::{
     FrontendOwner, FrontendPlatform, FrontendState, LocalReceiver,
@@ -11,12 +12,23 @@ pub struct PlatformOwner {
     authority: Arc<DeliveryAuthority>,
     receiver: watch::Receiver<FrontendState>,
     open: bool,
-    home: Arc<dyn crate::split_dns::home_path::HomeDnsPath>,
+    home: Arc<dyn HomeDnsPath>,
 }
 impl FrontendFactory for PlatformFactory {
     type Owner = PlatformOwner;
     fn supported(&self) -> bool {
         true
+    }
+    fn partial_dns(&self) -> Vec<IpAddr> {
+        self.0
+            .system_dns()
+            .map_or_else(Vec::new, |snapshot| snapshot.dns_servers)
+    }
+    fn partial_lockdown(&self) -> bool {
+        self.0.capture_feed().lockdown()
+    }
+    fn platform_changes(&self) -> Option<watch::Receiver<bool>> {
+        Some(self.0.capture_feed().lockdown_changes())
     }
     fn start(
         &self,
@@ -28,12 +40,9 @@ impl FrontendFactory for PlatformFactory {
         let updates = authority.subscribe();
         let classifier = authority.clone();
         let receiver_authority = authority.clone();
-        let home = crate::split_dns::local_home_path(authority.clone(), buffers.clone());
-        let dns = crate::split_dns::capture::CaptureDns::new(
-            authority.clone(),
-            buffers.clone(),
-            home.clone(),
-        );
+        let home = local_home_path(authority.clone(), buffers.clone());
+        let dns = CaptureDns::new(authority.clone(), buffers.clone(), home.clone())
+            .with_system(self.0.clone());
         let forwarder = LocalReceiver::new(move |mtu| {
             log::debug!("local-receiver-start capture_mtu={mtu}");
             Forwarder::with_mtu(receiver_authority.clone(), buffers.clone(), mtu)

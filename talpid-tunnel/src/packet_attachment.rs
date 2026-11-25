@@ -13,7 +13,8 @@ use std::{
 use talpid_types::relay_flow::{
     MAX_TARGETS, RelayAttempt, RelayAttemptOwner, RelayBuffer, RelayBufferAllocator,
     RelayBufferReservation, RelayCapture, RelayCaptureGeneration, RelayCaptureOwner,
-    RelayFlowError, RelayPacket, RelaySink, RelaySources, RelayTargetId, RelayWriteOutcome,
+    RelayFlowError, RelayIngressOriginal, RelayPacket, RelaySink, RelaySources, RelayTargetId,
+    RelayWriteOutcome,
 };
 use tokio::sync::{Notify, watch};
 
@@ -153,8 +154,13 @@ struct Capture {
     owner: Option<RelayCaptureOwner>,
 }
 
+enum OutboundPacket {
+    Ordinary(RelayBuffer),
+    Original(RelayIngressOriginal),
+}
+
 struct Queues {
-    outbound: VecDeque<RelayBuffer>,
+    outbound: VecDeque<OutboundPacket>,
     inbound: VecDeque<RelayPacket>,
     generation: u64,
     retired: bool,
@@ -458,7 +464,7 @@ pub struct PendingIngress {
     bridge: Arc<Bridge>,
     generation: u64,
     sink: RelaySink,
-    packet: Option<RelayBuffer>,
+    packet: Option<OutboundPacket>,
 }
 
 impl AttachmentBroker {
@@ -508,6 +514,17 @@ impl AttachmentBroker {
             .expect("attachment state")
             .snapshot()
     }
+
+    /// Keep `open_capture` from reserving a generation during one idle operation.
+    /// The caller must also hold the VPN service monitor and confirm its idle
+    /// epoch: a retired native sink can still have Android cleanup pending.
+    /// Do not await or re-enter the broker from `action`.
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    pub fn with_capture_idle<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
+        let state = self.inner.state.lock().expect("attachment state");
+        (!state.closed && state.capture.is_none()).then(action)
+    }
+
     pub fn changes(&self) -> watch::Receiver<BrokerSnapshot> {
         self.inner.changes.subscribe()
     }
@@ -1505,6 +1522,26 @@ impl CaptureLease {
         target: RelayTargetId,
         bytes: &[u8],
     ) -> Result<PendingIngress, AttachmentError> {
+        self.pending_ingress(target, |buffers| {
+            RelayBuffer::copy_from(bytes, buffers).map(OutboundPacket::Ordinary)
+        })
+    }
+
+    pub(crate) fn ingress_original(
+        &self,
+        target: RelayTargetId,
+        original: RelayIngressOriginal,
+    ) -> Result<PendingIngress, AttachmentError> {
+        self.pending_ingress(target, |buffers| {
+            original.copy_to(buffers).map(OutboundPacket::Original)
+        })
+    }
+
+    fn pending_ingress(
+        &self,
+        target: RelayTargetId,
+        copy: impl FnOnce(&dyn RelayBufferAllocator) -> Result<OutboundPacket, RelayFlowError>,
+    ) -> Result<PendingIngress, AttachmentError> {
         let state = self.inner.state.lock().expect("attachment state");
         if !state
             .capture
@@ -1540,15 +1577,14 @@ impl CaptureLease {
         if queues.retired {
             return Err(AttachmentError::Stale);
         }
-        let packet =
-            RelayBuffer::copy_from(bytes, self.inner.application.as_ref()).map_err(|error| {
-                if error == RelayFlowError::Full {
-                    self.inner
-                        .admission_refusals
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                AttachmentError::from(error)
-            })?;
+        let packet = copy(self.inner.application.as_ref()).map_err(|error| {
+            if error == RelayFlowError::Full {
+                self.inner
+                    .admission_refusals
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            AttachmentError::from(error)
+        })?;
         Ok(PendingIngress {
             inner: Arc::downgrade(&self.inner),
             request: request.clone(),
@@ -1868,7 +1904,7 @@ fn enqueue(
     }
     let bytes = RelayBuffer::copy_from(bytes, inner.application.as_ref())?;
     if outbound {
-        queues.outbound.push_back(bytes);
+        queues.outbound.push_back(OutboundPacket::Ordinary(bytes));
         attempt.bridge.outbound.notify_one();
     } else {
         let packet = attempt.owner.capability().packet(bytes)?;
@@ -1997,7 +2033,12 @@ impl TransportReceive {
                         .pop_front()
                     {
                         self.control.attempt.bridge.wake();
-                        return self.control.capability().packet(packet).map_err(Into::into);
+                        let attempt = self.control.capability();
+                        return match packet {
+                            OutboundPacket::Ordinary(bytes) => attempt.packet(bytes),
+                            OutboundPacket::Original(original) => attempt.original_packet(original),
+                        }
+                        .map_err(Into::into);
                     }
                 }
             }

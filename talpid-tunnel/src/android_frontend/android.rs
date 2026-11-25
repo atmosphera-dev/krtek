@@ -8,6 +8,27 @@ use std::{io, sync::Arc};
 use talpid_types::capture_network::{CaptureExpectation, CaptureNetworkFeed, CapturePrefix};
 
 impl FrontendPlatform for LocalNetworkPlatform {
+    fn system_dns(&self) -> Option<super::SystemDnsSnapshot> {
+        match self.system_dns_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                log::warn!("System DNS snapshot JNI failure: {error:?}");
+                None
+            }
+        }
+    }
+    fn system_dns_current(&self, token: i64) -> bool {
+        self.system_dns_call(token, None).unwrap_or(false)
+    }
+    fn system_dns_failure_token(&self) -> i64 {
+        self.system_dns_failure().unwrap_or(0)
+    }
+    fn prepare_system_dns(&self, fd: i32, token: i64) -> io::Result<()> {
+        match self.system_dns_call(token, Some(fd)) {
+            Ok(true) => Ok(()),
+            _ => Err(io::ErrorKind::PermissionDenied.into()),
+        }
+    }
     fn open(&self, generation: i64, config: &CaptureConfig) -> io::Result<AppliedTun> {
         match config {
             CaptureConfig::Partial(config) => self.open_frontend(generation, config),

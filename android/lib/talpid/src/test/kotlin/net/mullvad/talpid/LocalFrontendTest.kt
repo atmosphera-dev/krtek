@@ -10,6 +10,7 @@ import net.mullvad.talpid.model.CaptureHandoverResult
 import net.mullvad.talpid.model.CaptureNetworkObservation
 import net.mullvad.talpid.model.CaptureRoute
 import net.mullvad.talpid.model.CreateTunResult
+import net.mullvad.talpid.model.SystemDnsSnapshot
 import net.mullvad.talpid.model.TunConfig
 import org.junit.jupiter.api.Test
 
@@ -46,13 +47,25 @@ class LocalFrontendTest {
                 listOf("169.254.0.0/16", "fe80::/10"),
             )) {
             val addresses = mutableListOf<Pair<String, Int>>()
-            val announced = mutableListOf<String>()
+            val announced = mutableListOf<net.mullvad.talpid.model.InetNetwork>()
             val config = assertNotNull(LocalFrontendConfig.parse(routes.toTypedArray()))
             config.configure(
                 { address, bits -> addresses += address to bits },
-                { announced += it.toString() },
+                { announced += it },
             )
-            assertEquals(routes, announced)
+            assertEquals(
+                routes.map { text ->
+                    val cidr =
+                        checkNotNull(
+                            net.mullvad.mullvadvpn.lib.model.LocalCidr.parse(text).getOrNull()
+                        )
+                    net.mullvad.talpid.model.InetNetwork(
+                        InetAddress.getByAddress(cidr.networkBytes()),
+                        cidr.prefix.toShort(),
+                    )
+                },
+                announced,
+            )
             assertEquals(
                 listOf(
                     InetAddress.getByName("172.27.1.1") to 32,
@@ -150,6 +163,32 @@ class LocalFrontendTest {
         )
         val type = TalpidVpnService::class.java
         assertEquals(
+            Long::class.javaPrimitiveType,
+            type.getDeclaredMethod("systemDnsFailureToken").returnType,
+        )
+        assertEquals(
+            SystemDnsSnapshot::class.java,
+            type.getDeclaredMethod("systemDnsSnapshot").returnType,
+        )
+        assertEquals(
+            Boolean::class.javaPrimitiveType,
+            type.getDeclaredMethod("systemDnsCurrent", Long::class.javaPrimitiveType).returnType,
+        )
+        assertEquals(
+            Int::class.javaPrimitiveType,
+            type
+                .getDeclaredMethod(
+                    "prepareSystemDns",
+                    Int::class.javaPrimitiveType,
+                    Long::class.javaPrimitiveType,
+                )
+                .returnType,
+        )
+        assertEquals(
+            ArrayList::class.java,
+            SystemDnsSnapshot::class.java.getDeclaredMethod("getDnsServers").returnType,
+        )
+        assertEquals(
             Int::class.javaPrimitiveType,
             type
                 .getDeclaredMethod("takeLocalFrontendDescriptor", Long::class.javaPrimitiveType)
@@ -163,6 +202,7 @@ class LocalFrontendTest {
                     Long::class.javaPrimitiveType,
                     Array<String>::class.java,
                     Array<String>::class.java,
+                    ArrayList::class.java,
                 )
                 .returnType,
         )
@@ -183,7 +223,8 @@ class LocalFrontendTest {
                         Long::class.javaPrimitiveType,
                         Long::class.javaPrimitiveType,
                         configType,
-                        *if (name == "handoverLocalFrontend") arrayOf(Array<String>::class.java)
+                        *if (name == "handoverLocalFrontend")
+                            arrayOf(Array<String>::class.java, ArrayList::class.java)
                         else emptyArray(),
                     )
                     .returnType,

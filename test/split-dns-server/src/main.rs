@@ -31,6 +31,16 @@ enum Command {
         #[arg(long)]
         token: String,
     },
+    /// Independent complete query/Home-response goldens for the ordinary-UID
+    /// connected TCP consumer. Run in the device guest, never on the host.
+    TcpVectors {
+        #[arg(long)]
+        nonce: String,
+        #[arg(long)]
+        id: u16,
+        #[arg(long)]
+        system: bool,
+    },
 }
 
 #[derive(clap::Args)]
@@ -56,28 +66,110 @@ async fn main() -> std::io::Result<()> {
     match Arguments::parse().command {
         Command::Serve(args) => serve(args).await,
         Command::Finish { path, token } => server::publish_finish(&path, &token),
+        Command::TcpVectors { nonce, id, system } => {
+            println!("{}", tcp_vectors_for(&nonce, id, system)?);
+            Ok(())
+        }
     }
 }
 
-async fn serve(args: ServerArguments) -> std::io::Result<()> {
-    if args.address.iter().any(|address| {
-        ![
-            "10.77.10.53".parse::<IpAddr>().unwrap(),
-            "10.77.10.54".parse().unwrap(),
-            "fd71:7274:656b:10::53".parse().unwrap(),
-            "fd71:7274:656b:10::54".parse().unwrap(),
-        ]
-        .contains(address)
-    }) {
+/// Stub-resolver queries, as an app's resolver sends them: recursion desired. A real
+/// ordinary resolver refuses non-recursive questions, and Home goldens echo the flag.
+#[cfg(test)]
+fn tcp_vectors(nonce: &str, id: u16) -> std::io::Result<serde_json::Value> {
+    tcp_vectors_for(nonce, id, false)
+}
+fn tcp_vectors_for(nonce: &str, id: u16, system: bool) -> std::io::Result<serde_json::Value> {
+    use hickory_proto::{
+        op::{Message, Query},
+        rr::{Name, RecordType},
+    };
+    if nonce.is_empty()
+        || nonce.len() > 40
+        || !nonce.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
         return Err(std::io::Error::other(
-            "fixture requires the run-11 TAP address",
+            "an alphanumeric DNS-label nonce is required",
+        ));
+    }
+    let hex = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let mut vectors = Vec::new();
+    for (offset, (name, home)) in [
+        (format!("{nonce}-first.home."), true),
+        (
+            if system {
+                format!("{nonce}.ordinary.test.")
+            } else {
+                "example.com.".into()
+            },
+            false,
+        ),
+        (format!("{nonce}-last.home."), true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut request = Message::query();
+        request.metadata.id = id.wrapping_add(offset as u16);
+        request.metadata.recursion_desired = true;
+        request.add_query(Query::query(
+            Name::from_ascii(name).map_err(std::io::Error::other)?,
+            RecordType::A,
+        ));
+        let query = request.to_vec().map_err(std::io::Error::other)?;
+        let expected = if home || system {
+            let answer = fixture::answer(
+                &request,
+                if home {
+                    fixture::Role::Home
+                } else {
+                    fixture::Role::Ordinary
+                },
+                fixture::Protocol::Tcp,
+            )
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "nonce selects a silent fixture response",
+                )
+            })?;
+            Some(answer.to_vec().map_err(std::io::Error::other)?)
+        } else {
+            None
+        };
+        vectors.push(serde_json::json!({"query_hex":hex(&query), "expected_hex":expected.map(|bytes| hex(&bytes)), "home":home}));
+    }
+    Ok(serde_json::json!({"messages":vectors}))
+}
+
+async fn serve(args: ServerArguments) -> std::io::Result<()> {
+    let (role, v4, v6) = match args.role {
+        Role::Home => (fixture::Role::Home, "10.77.10.53", "fd71:7274:656b:10::53"),
+        Role::Ordinary => (
+            fixture::Role::Ordinary,
+            "10.77.10.54",
+            "fd71:7274:656b:10::54",
+        ),
+    };
+    let (v4, v6) = (v4.parse::<IpAddr>().unwrap(), v6.parse::<IpAddr>().unwrap());
+    let matches_role = match args.address.as_slice() {
+        [address] => *address == v4 || *address == v6,
+        [first, second] => (*first, *second) == (v4, v6) || (*first, *second) == (v6, v4),
+        _ => false,
+    };
+    if !matches_role {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{role:?} fixture requires {v4}, {v6}, or both"),
         ));
     }
     let complete = server::run(server::ServerConfig {
-        role: match args.role {
-            Role::Home => fixture::Role::Home,
-            Role::Ordinary => fixture::Role::Ordinary,
-        },
+        role,
         addresses: args.address,
         port: args.port,
         output: args.output,
@@ -92,5 +184,127 @@ async fn serve(args: ServerArguments) -> std::io::Result<()> {
         Err(std::io::Error::other(
             "fixture observation window is incomplete",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Role, ServerArguments, serve};
+    use std::io::ErrorKind;
+
+    #[tokio::test]
+    async fn serve_accepts_only_its_roles_tap_addresses() {
+        let home4 = "10.77.10.53";
+        let home6 = "fd71:7274:656b:10::53";
+        let ordinary4 = "10.77.10.54";
+        let ordinary6 = "fd71:7274:656b:10::54";
+        for (role, v4, v6, other4, other6) in [
+            (Role::Home, home4, home6, ordinary4, ordinary6),
+            (Role::Ordinary, ordinary4, ordinary6, home4, home6),
+        ] {
+            for (addresses, accepted) in [
+                (&[other4][..], false),
+                (&[other6][..], false),
+                (&[other4, other6][..], false),
+                (&[v4, other6][..], false),
+                (&[other4, v6][..], false),
+                (&[v4, v4][..], false),
+                (&[][..], false),
+                (&[v4][..], true),
+                (&[v6][..], true),
+                (&[v4, v6][..], true),
+                (&[v6, v4][..], true),
+            ] {
+                // `run` first creates its output directory. Give it an existing
+                // directory so acceptance is observable without binding guest TAP IPs.
+                let output = std::env::temp_dir();
+                let failure = serve(ServerArguments {
+                    role,
+                    address: addresses
+                        .iter()
+                        .map(|address| address.parse().unwrap())
+                        .collect(),
+                    port: 0,
+                    finish: output.join("unused-finish.json"),
+                    output,
+                    token: "tap-addresses".into(),
+                    drain_seconds: 0,
+                })
+                .await
+                .unwrap_err();
+                let expected = if accepted {
+                    ErrorKind::AlreadyExists
+                } else {
+                    ErrorKind::InvalidInput
+                };
+                assert_eq!(failure.kind(), expected, "{addresses:?}: {failure}");
+            }
+        }
+    }
+
+    #[test]
+    fn partial_tcp_vectors_keep_a_distinct_exact_ordinary_answer() {
+        let vectors = super::tcp_vectors_for("systemControl", 65535, true).unwrap();
+        let messages = vectors["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert!(!messages[1]["home"].as_bool().unwrap());
+        assert!(
+            messages
+                .iter()
+                .all(|message| message["expected_hex"].as_str().is_some())
+        );
+        assert_ne!(messages[0]["expected_hex"], messages[1]["expected_hex"]);
+        assert_ordinary_answer(&messages[1]);
+    }
+
+    #[test]
+    fn system_tcp_vectors_reject_reserved_silence_without_panicking() {
+        for nonce in ["silent", "SILENT"] {
+            let error = super::tcp_vectors_for(nonce, 1, true).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidInput);
+            assert!(super::tcp_vectors_for(nonce, 1, false).is_ok());
+        }
+    }
+
+    use hickory_proto::{
+        op::{Message, MessageType, ResponseCode},
+        rr::{RData, rdata::A},
+    };
+
+    fn assert_ordinary_answer(vector: &serde_json::Value) {
+        let reply = decode(vector["expected_hex"].as_str().unwrap());
+        assert_eq!(reply.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(reply.answers.len(), 1);
+        assert_eq!(reply.answers[0].data, RData::A(A::new(10, 77, 10, 54)));
+    }
+
+    fn decode(hex: &str) -> Message {
+        let bytes = (0..hex.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
+            .collect::<Vec<_>>();
+        Message::from_vec(&bytes).unwrap()
+    }
+
+    #[test]
+    fn tcp_vectors_ask_for_recursion_and_home_goldens_echo_it() {
+        let vectors = super::tcp_vectors("rdControl", 65535).unwrap();
+        let messages = vectors["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        for (index, vector) in messages.iter().enumerate() {
+            let query = decode(vector["query_hex"].as_str().unwrap());
+            assert_eq!(query.metadata.message_type, MessageType::Query);
+            assert!(query.metadata.recursion_desired, "query {index}");
+            assert_eq!(query.metadata.id, 65535u16.wrapping_add(index as u16));
+            match vector["expected_hex"].as_str() {
+                Some(expected) => {
+                    let reply = decode(expected);
+                    assert!(vector["home"].as_bool().unwrap());
+                    assert!(reply.metadata.recursion_desired, "golden {index}");
+                    assert_eq!(reply.metadata.id, query.metadata.id);
+                }
+                None => assert!(!vector["home"].as_bool().unwrap()),
+            }
+        }
     }
 }

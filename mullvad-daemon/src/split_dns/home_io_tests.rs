@@ -178,40 +178,62 @@ async fn split_dns_home_io_udp_tcp_both_families_reach_exact_prepared_peer() {
 
 #[tokio::test]
 async fn split_dns_home_io_wrong_peer_source_bind_and_unfunded_work_never_prepare() {
-    let budget = Arc::new(BufferBudget::new(CAPABILITY_BYTES));
+    let budget = Arc::new(BufferBudget::new(CAPABILITY_BYTES + PREPARATION_BYTES));
     let owner = HomeIoOwner::new(budget.clone());
     let target = "127.0.0.1:53".parse().unwrap();
     let capability = Arc::new(FixtureCapability::new(target));
     let runtime = owner.with_capability(capability.clone()).unwrap();
-    assert!(
+    assert_eq!(
         runtime
             .bind_udp(
                 "0.0.0.0:0".parse().unwrap(),
                 "127.0.0.2:53".parse().unwrap()
             )
             .await
-            .is_err()
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::PermissionDenied,
     );
-    assert!(
+    assert_eq!(
         runtime
             .bind_udp("127.0.0.1:0".parse().unwrap(), target)
             .await
-            .is_err()
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::InvalidInput,
     );
-    assert!(
+    assert_eq!(
         runtime
             .connect_tcp(target, Some("0.0.0.0:0".parse().unwrap()), None)
             .await
-            .is_err()
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::InvalidInput,
     );
-    assert!(
+    let held = budget.try_reserve(PREPARATION_BYTES).unwrap();
+    assert_eq!(
         runtime
             .bind_udp("0.0.0.0:0".parse().unwrap(), target)
             .await
-            .is_err()
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::OutOfMemory,
     );
-    assert!(runtime.connect_tcp(target, None, None).await.is_err());
+    assert_eq!(
+        runtime
+            .connect_tcp(target, None, None)
+            .await
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::OutOfMemory,
+    );
     assert_eq!(capability.prepared.load(SeqCst), 0);
+    drop(held);
     drop(runtime);
     owner.close().await.unwrap();
     assert_eq!(budget.used(), 0);
@@ -229,6 +251,8 @@ async fn split_dns_home_io_revoked_udp_and_tcp_cannot_send_or_return_bytes() {
         .bind_udp("0.0.0.0:0".parse().unwrap(), target)
         .await
         .unwrap();
+    let client = (target.ip(), socket.socket.local_addr().unwrap().port());
+    udp.send_to(b"queued", client).await.unwrap();
     capability.live.store(false, SeqCst);
     assert_eq!(
         socket.send_to(b"denied", target).await.unwrap_err().kind(),
@@ -236,7 +260,11 @@ async fn split_dns_home_io_revoked_udp_and_tcp_cannot_send_or_return_bytes() {
     );
     let mut bytes = [0; 16];
     assert_eq!(
-        socket.recv_from(&mut bytes).await.unwrap_err().kind(),
+        tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap_err()
+            .kind(),
         io::ErrorKind::PermissionDenied
     );
     assert!(udp.try_recv_from(&mut bytes).is_err());
@@ -251,17 +279,24 @@ async fn split_dns_home_io_revoked_udp_and_tcp_cannot_send_or_return_bytes() {
         .connect_tcp(target, None, Some(Duration::from_secs(2)))
         .await
         .unwrap();
-    let (_peer, _) = listener.accept().await.unwrap();
+    let (mut peer, _) = listener.accept().await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut peer, b"queued")
+        .await
+        .unwrap();
     capability.live.store(false, SeqCst);
     assert_eq!(
         socket.write_all(b"denied").await.unwrap_err().kind(),
         io::ErrorKind::PermissionDenied
     );
     assert_eq!(
-        futures::io::AsyncReadExt::read(&mut socket, &mut bytes)
-            .await
-            .unwrap_err()
-            .kind(),
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            futures::io::AsyncReadExt::read(&mut socket, &mut bytes)
+        )
+        .await
+        .unwrap()
+        .unwrap_err()
+        .kind(),
         io::ErrorKind::PermissionDenied
     );
     drop(socket);
@@ -282,9 +317,9 @@ async fn split_dns_home_io_cancelled_waiter_still_joins_preparation_and_refunds_
         ..FixtureCapability::new(target)
     });
     let runtime = owner.with_capability(capability.clone()).unwrap();
-    let waiter =
+    let mut waiter =
         tokio::spawn(async move { runtime.bind_udp("0.0.0.0:0".parse().unwrap(), target).await });
-    capability.started.notified().await;
+    preparation_started(&capability, &mut waiter).await;
     waiter.abort();
     assert!(matches!(waiter.await, Err(error) if error.is_cancelled()));
     assert!(budget.used() >= PREPARATION_BYTES + CAPABILITY_BYTES);
@@ -316,7 +351,7 @@ async fn split_dns_home_io_slow_preparation_does_not_serialize_an_independent_ex
         ..FixtureCapability::new("127.0.0.1:53".parse().unwrap())
     });
     let runtime = owner.with_capability(slow.clone()).unwrap();
-    let waiter = tokio::spawn(async move {
+    let mut waiter = tokio::spawn(async move {
         runtime
             .bind_udp(
                 "0.0.0.0:0".parse().unwrap(),
@@ -324,7 +359,7 @@ async fn split_dns_home_io_slow_preparation_does_not_serialize_an_independent_ex
             )
             .await
     });
-    slow.started.notified().await;
+    preparation_started(&slow, &mut waiter).await;
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let target = socket.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -364,8 +399,20 @@ async fn split_dns_home_io_slow_preparation_does_not_serialize_an_independent_ex
     assert_eq!(budget.used(), 0);
 }
 
+async fn preparation_started(
+    capability: &FixtureCapability,
+    waiter: &mut tokio::task::JoinHandle<io::Result<HomeUdp>>,
+) {
+    tokio::select! {
+        _ = waiter => panic!("waiter completed before blocking preparation started"),
+        started = tokio::time::timeout(Duration::from_secs(2), capability.started.notified()) => {
+            started.expect("blocking preparation did not start");
+        }
+    }
+}
+
 #[tokio::test]
-async fn split_dns_home_io_panicked_preparation_remains_failed_after_join_and_refunds_credit() {
+async fn split_dns_home_io_close_reports_joined_panic_once_and_stays_closed() {
     let budget = Arc::new(BufferBudget::new(65536));
     let owner = HomeIoOwner::new(budget.clone());
     let target = "127.0.0.1:53".parse().unwrap();
@@ -382,11 +429,12 @@ async fn split_dns_home_io_panicked_preparation_remains_failed_after_join_and_re
     );
     drop(runtime);
     assert!(owner.close().await.is_err());
-    assert!(owner.close().await.is_err(), "joined panic was forgotten");
     assert!(
-        owner
-            .with_capability(Arc::new(FixtureCapability::new(target)))
-            .is_err()
+        owner.close().await.is_ok(),
+        "joined panic was reported twice"
     );
+    let successor = Arc::new(FixtureCapability::new(target));
+    assert!(owner.with_capability(successor.clone()).is_err());
+    assert_eq!(successor.prepared.load(SeqCst), 0);
     assert_eq!(budget.used(), 0);
 }

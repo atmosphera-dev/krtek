@@ -91,6 +91,7 @@ pub struct LocalNetworkRuntime<F: FrontendFactory = PlatformFactory> {
     broker: AttachmentBroker,
     broker_updates: watch::Receiver<BrokerSnapshot>,
     release_updates: watch::Receiver<u64>,
+    platform_updates: Option<watch::Receiver<bool>>,
     suspended: bool,
     phase: Option<TunnelPhase>,
     target_config: Option<talpid_tunnel::packet_attachment::PendingCaptureRequest>,
@@ -172,6 +173,7 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
         }
         let broker_updates = broker.changes();
         let release_updates = broker.capture_release_changes();
+        let platform_updates = factory.platform_changes();
         let mut runtime = Self {
             feed: feed.filter(|_| receiver.is_some()),
             receiver,
@@ -188,6 +190,7 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
             broker,
             broker_updates,
             release_updates,
+            platform_updates,
             suspended: false,
             phase: None,
             target_config: None,
@@ -202,7 +205,9 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
                     authority.observe(event);
                 }
             }));
-            feed.set_policy_demand(!policy.announced_routes().is_empty());
+            feed.set_policy_demand(
+                policy.split_dns.enabled || !policy.announced_routes().is_empty(),
+            );
         }
         // Startup reconciles before exposing real delivery availability. Do not
         // project a failed/not-yet-started owner from the constructor.
@@ -226,6 +231,7 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
                 tokio::select! {
                     _ = self.broker_updates.changed() => {},
                     _ = self.release_updates.changed() => {},
+                    _ = feed_changed(&mut self.platform_updates) => {},
                 }
             },
         )
@@ -301,7 +307,10 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
         }
         self.delivery.authority.update_policy(policy);
         if let Some(feed) = &self.feed {
-            feed.set_policy_demand(!self.shutting_down && !policy.announced_routes().is_empty());
+            feed.set_policy_demand(
+                !self.shutting_down
+                    && (policy.split_dns.enabled || !policy.announced_routes().is_empty()),
+            );
         }
         // The platform may synchronously withdraw its observation on the last
         // demand. Do not publish an old physical identity after that withdrawal.
@@ -321,14 +330,30 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
             self.blocking_config = None;
         }
         let partial = || {
-            let routes = policy
+            let mut routes = policy
                 .announced_routes()
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>();
+            let dns_servers = if policy.split_dns.enabled {
+                self.delivery.partial_dns()
+            } else {
+                vec![]
+            };
+            routes.extend(
+                dns_servers
+                    .iter()
+                    .map(|ip| ipnetwork::IpNetwork::from(*ip).to_string()),
+            );
+            // Partial already exposes both fixed interface families. Route coverage
+            // for Android's platform lookup is separate from Local permission.
+            if !dns_servers.is_empty() && self.delivery.partial_lockdown() {
+                routes = vec!["0.0.0.0/0".into(), "::/0".into()];
+            }
             (!routes.is_empty()).then_some(DeliveryConfig::Partial(
                 talpid_tunnel::tun_provider::PartialConfig {
                     routes,
+                    dns_servers,
                     excluded_packages: if policy.skip_local_rules_for_excluded_apps {
                         self.excluded_packages.clone().unwrap_or_default()
                     } else {
@@ -632,7 +657,7 @@ impl<F: FrontendFactory> LocalNetworkRuntime<F> {
     }
 }
 
-async fn feed_changed(receiver: &mut Option<watch::Receiver<LocalNetworkFeedState>>) {
+async fn feed_changed<T: Send + Sync>(receiver: &mut Option<watch::Receiver<T>>) {
     match receiver {
         Some(active) => {
             if active.changed().await.is_err() {

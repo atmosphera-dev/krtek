@@ -5,9 +5,11 @@ use hickory_proto::{
     rr::{Name, RecordType},
 };
 use mullvad_types::settings::local_network_access::{
-    LocalNetworkAccess, split_dns::SplitDnsPolicy,
+    LocalNetworkAccess,
+    split_dns::{SplitDnsPolicy, SuffixMatcher},
 };
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use talpid_lan_forwarder::{ReceiveScope, Refused};
 use talpid_netstack::buffer_budget::BufferBudget;
 
 fn configured() -> LocalNetworkAccess {
@@ -23,6 +25,23 @@ fn configured() -> LocalNetworkAccess {
 
 fn client() -> SocketAddr {
     "172.27.1.1:49152".parse().unwrap()
+}
+
+fn resolver() -> SocketAddr {
+    "10.64.0.1:53".parse().unwrap()
+}
+
+fn input(authority: &DeliveryAuthority) -> DnsInput {
+    authority
+        .dns_input(client().ip(), resolver().ip(), &BufferBudget::new(1024))
+        .unwrap()
+}
+
+fn fixture_input() -> DnsInput {
+    DnsInput::for_test(
+        SuffixMatcher::compile(["home"]).unwrap(),
+        ReceiveScope::new(client().ip(), resolver().ip(), &BufferBudget::new(1024)).unwrap(),
+    )
 }
 
 fn message() -> Message {
@@ -47,8 +66,9 @@ async fn split_dns_home_path_local_leases_hide_resolver_and_keep_transport_indep
     let budget = Arc::new(BufferBudget::new(256 * 1024));
     let path: Box<dyn HomeDnsPath> =
         Box::new(LocalHomeDnsPath::new(authority.clone(), budget.clone()));
-    let udp = path.authorize(client(), Protocol::Udp).unwrap();
-    let tcp = path.authorize(client(), Protocol::Tcp).unwrap();
+    let input = input(&authority);
+    let udp = path.authorize(&input, client(), Protocol::Udp).unwrap();
+    let tcp = path.authorize(&input, client(), Protocol::Tcp).unwrap();
     let used = budget.used();
     assert!(
         used > 8192,
@@ -73,7 +93,9 @@ async fn split_dns_home_path_local_policy_and_network_revocation_never_revive_a_
     let authority = authority(&on);
     let path = LocalHomeDnsPath::new(authority.clone(), Arc::new(BufferBudget::new(256 * 1024)));
     for network_loss in [false, true] {
-        let query = path.authorize(client(), Protocol::Udp).unwrap();
+        let query = path
+            .authorize(&input(&authority), client(), Protocol::Udp)
+            .unwrap();
         let waiting = query.retired();
         tokio::pin!(waiting);
         assert!(futures::poll!(waiting.as_mut()).is_pending());
@@ -96,7 +118,11 @@ async fn split_dns_home_path_local_policy_and_network_revocation_never_revive_a_
                 .await
                 .is_err()
         );
-        assert!(path.authorize(client(), Protocol::Tcp).unwrap().current());
+        assert!(
+            path.authorize(&input(&authority), client(), Protocol::Tcp)
+                .unwrap()
+                .current()
+        );
     }
     path.close().await.unwrap();
 }
@@ -105,8 +131,9 @@ async fn split_dns_home_path_local_policy_and_network_revocation_never_revive_a_
 async fn split_dns_home_path_local_close_retires_existing_leases_and_refuses_new_work() {
     let on = configured();
     let authority = authority(&on);
+    let input = input(&authority);
     let path = LocalHomeDnsPath::new(authority, Arc::new(BufferBudget::new(256 * 1024)));
-    let query = path.authorize(client(), Protocol::Udp).unwrap();
+    let query = path.authorize(&input, client(), Protocol::Udp).unwrap();
     let waiting = query.retired();
     tokio::pin!(waiting);
     assert!(futures::poll!(waiting.as_mut()).is_pending());
@@ -115,8 +142,8 @@ async fn split_dns_home_path_local_close_retires_existing_leases_and_refuses_new
         .await
         .unwrap();
     assert!(!query.current());
-    assert!(path.authorize(client(), Protocol::Udp).is_err());
-    assert!(path.authorize(client(), Protocol::Tcp).is_err());
+    assert!(path.authorize(&input, client(), Protocol::Udp).is_err());
+    assert!(path.authorize(&input, client(), Protocol::Tcp).is_err());
     assert!(
         query
             .exchange(Duration::from_secs(1), message())
@@ -124,6 +151,56 @@ async fn split_dns_home_path_local_close_retires_existing_leases_and_refuses_new
             .is_err()
     );
     path.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn split_dns_home_path_local_exchange_reuses_admitted_runtime_credit() {
+    for protocol in [Protocol::Udp, Protocol::Tcp] {
+        assert_exchange_reuses_admitted_runtime_credit(protocol).await;
+    }
+}
+
+async fn assert_exchange_reuses_admitted_runtime_credit(protocol: Protocol) {
+    let on = configured();
+    let budget = Arc::new(BufferBudget::new(256 * 1024));
+    let preparation_headroom = Arc::new(AtomicUsize::new(usize::MAX));
+    let authority = Arc::new(DeliveryAuthority::new(
+        &on,
+        Arc::new({
+            let budget = budget.clone();
+            let preparation_headroom = preparation_headroom.clone();
+            move |_, _| {
+                preparation_headroom.store(budget.limit() - budget.used(), SeqCst);
+                // Observe socket preparation without allowing physical I/O.
+                Err(Refused::Denied)
+            }
+        }),
+    ));
+    authority.update(&on, Some(observation()));
+    let path = LocalHomeDnsPath::new(authority.clone(), budget.clone());
+    let input = input(&authority);
+
+    let query = path.authorize(&input, client(), protocol).unwrap();
+    // Enough for the 16 KiB preparation, but not a second 4 KiB runtime.
+    let filler = budget
+        .reserve(budget.limit() - budget.used() - 18 * 1024)
+        .unwrap();
+    assert!(
+        query
+            .exchange(Duration::from_secs(1), message())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        preparation_headroom.load(SeqCst),
+        2 * 1024,
+        "{protocol:?}: admitted query must reach separately charged preparation"
+    );
+    drop(filler);
+    drop(query);
+    path.close().await.unwrap();
+    authority.update(&on, Some(observation()));
+    assert_eq!(budget.used(), 0);
 }
 
 #[tokio::test]
@@ -139,21 +216,27 @@ async fn split_dns_home_path_local_denial_or_resource_failure_never_prepares_a_s
         }),
     ));
     authority.update(&on, Some(observation()));
+    let original = input(&authority);
     let empty = LocalHomeDnsPath::new(authority.clone(), Arc::new(BufferBudget::new(0)));
-    assert!(empty.authorize(client(), Protocol::Udp).is_err());
+    assert!(empty.authorize(&original, client(), Protocol::Udp).is_err());
     empty.close().await.unwrap();
     let path = LocalHomeDnsPath::new(authority.clone(), Arc::new(BufferBudget::new(256 * 1024)));
     assert!(
-        path.authorize("172.27.1.2:49152".parse().unwrap(), Protocol::Udp)
-            .is_err()
+        path.authorize(
+            &original,
+            "172.27.1.2:49152".parse().unwrap(),
+            Protocol::Udp
+        )
+        .is_err()
     );
     let mut off = on.clone();
     off.split_dns.enabled = false;
     authority.update_policy(&off);
-    assert!(path.authorize(client(), Protocol::Udp).is_err());
+    assert!(path.authorize(&original, client(), Protocol::Udp).is_err());
     authority.update_policy(&on);
+    let successor = input(&authority);
     authority.revoke();
-    assert!(path.authorize(client(), Protocol::Tcp).is_err());
+    assert!(path.authorize(&successor, client(), Protocol::Tcp).is_err());
     assert_eq!(prepared.load(SeqCst), 0);
     path.close().await.unwrap();
 }
@@ -167,6 +250,7 @@ struct MemoryQuery;
 impl HomeDnsPath for MemoryPath {
     fn authorize(
         &self,
+        _: &DnsInput,
         _: SocketAddr,
         _: Protocol,
     ) -> Result<Box<dyn HomeDnsQuery>, ExchangeError> {
@@ -202,14 +286,13 @@ impl HomeDnsQuery for MemoryQuery {
 #[tokio::test]
 async fn split_dns_home_path_udp_message_consumer_accepts_a_nonlocal_injected_path() {
     use super::super::udp::{UdpDecision, inspect};
-    use mullvad_types::settings::local_network_access::split_dns::SuffixMatcher;
     let path: Box<dyn HomeDnsPath> = Box::new(MemoryPath);
-    let matcher = SuffixMatcher::compile(["home"]).unwrap();
+    let input = fixture_input();
     let request = message();
     let original = request.to_vec().unwrap();
-    let resolver = "10.64.0.1:53".parse::<SocketAddr>().unwrap();
+    let resolver = resolver();
     let UdpDecision::Intercept(query) = inspect(
-        Some(&matcher),
+        Some(&input),
         &[resolver.ip()],
         client(),
         resolver,
@@ -243,6 +326,7 @@ struct UnavailablePath;
 impl HomeDnsPath for UnavailablePath {
     fn authorize(
         &self,
+        _: &DnsInput,
         _: SocketAddr,
         _: Protocol,
     ) -> Result<Box<dyn HomeDnsQuery>, ExchangeError> {
@@ -256,14 +340,13 @@ impl HomeDnsPath for UnavailablePath {
 #[tokio::test]
 async fn split_dns_home_path_unavailable_path_is_servfail_without_an_ordinary_capability() {
     use super::super::udp::{UdpDecision, inspect};
-    use mullvad_types::settings::local_network_access::split_dns::SuffixMatcher;
     let path: Box<dyn HomeDnsPath> = Box::new(UnavailablePath);
-    let matcher = SuffixMatcher::compile(["home"]).unwrap();
+    let input = fixture_input();
     let request = message();
     let original = request.to_vec().unwrap();
-    let resolver = "10.64.0.1:53".parse::<SocketAddr>().unwrap();
+    let resolver = resolver();
     let UdpDecision::Intercept(query) = inspect(
-        Some(&matcher),
+        Some(&input),
         &[resolver.ip()],
         client(),
         resolver,

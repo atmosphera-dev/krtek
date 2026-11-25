@@ -211,9 +211,18 @@ class SplitDnsDraftTest {
     }
 
     @Test
-    fun `should not print the network label in editor UI diagnostics`() {
-        val state = SplitDnsEditorUiState(SplitDnsDraft.from(policy), "Used on Wi-Fi: My home")
-        assertEquals("SplitDnsEditorUiState(saving=false)", state.toString())
+    fun `should not print domains address or network in screen state diagnostics`() {
+        val draft = SplitDnsDraft.from(policy)
+        val text =
+            LocalNetworkSharingUiState(
+                    lanSharingEnabled = true,
+                    policy = LocalNetworkAccess(rules = listOf(rule), splitDns = policy),
+                    splitDnsEditor = SplitDnsEditorState(draft, draft),
+                )
+                .toString()
+        for (secret in listOf("home", "192.168", "My home", "My Wi-Fi", rule.id.toString())) {
+            assertFalse(secret in text, "Screen state diagnostics must stay redacted")
+        }
     }
 
     private fun rows(vararg text: String): List<SplitDnsDomainDraft> = text.map {

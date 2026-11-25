@@ -111,7 +111,8 @@ struct Inputs {
     receive: BTreeMap<ReceiveKey, ReceiveRecord>,
     dns_revision: u64,
     dns_matcher: Option<Arc<SuffixMatcher>>,
-    dns_inputs: BTreeMap<(IpAddr, IpAddr), DnsInputScope>,
+    dns_inputs: BTreeMap<DnsInputKey, DnsInputScope>,
+    retired_dns_inputs: Arc<Mutex<Vec<RetiredDnsInput>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -133,12 +134,31 @@ type ReceiveKey = (IpAddr, IpAddr, ReceivePurpose);
 #[cfg(any(target_os = "android", test))]
 pub(crate) mod home_dns;
 
-struct DnsInputScope {
-    scope: WeakReceiveScope,
+type DnsInputKey = (IpAddr, IpAddr);
+type RetiredDnsInput = (DnsInputKey, u64, Arc<dyn RelayBufferReservation>);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DnsInputIdentity {
     revision: u64,
     capture: u64,
     generation: Option<u64>,
+}
+
+struct DnsInputScope {
+    id: u64,
+    scope: WeakReceiveScope,
+    identity: DnsInputIdentity,
     _charge: Arc<dyn RelayBufferReservation>,
+}
+
+impl DnsInputScope {
+    fn revalidate(&self, identity: Option<DnsInputIdentity>) -> Option<ReceiveScope> {
+        let scope = self.scope.upgrade()?;
+        if identity != Some(self.identity) {
+            scope.revoke();
+        }
+        scope.current().then_some(scope)
+    }
 }
 
 /// Fixed non-transport facts, deliberately without NetworkLease's rule-ID Vec.
@@ -188,6 +208,7 @@ struct ReceiveRecord {
     id: u64,
     scope: WeakReceiveScope,
     identity: ReceiveIdentity,
+    transport_incarnation: u64,
     _charge: Arc<dyn RelayBufferReservation>,
 }
 
@@ -203,8 +224,32 @@ impl Inputs {
             .map(Arc::new)
     }
 
-    fn grant(&self, source: IpAddr, destination: IpAddr) -> Result<DeliveryGrant, Refused> {
-        self.grant_for(source, destination, ReceivePurpose::Local)
+    fn dns_capture(&self) -> Result<(&CaptureAuthority, DnsInputIdentity), Refused> {
+        if !self.endpoint || self.dns_matcher.is_none() {
+            return Err(Refused::Denied);
+        }
+        let capture = self.capture.as_ref().ok_or(Refused::Denied)?;
+        let identity = DnsInputIdentity {
+            revision: self.dns_revision,
+            capture: capture.identity,
+            generation: capture.generation()?,
+        };
+        Ok((capture, identity))
+    }
+
+    fn reclaim_dns_inputs(&mut self) {
+        // Drop notifications can run under the authority lock. Drain only
+        // reported retirements and never remove a replacement for the same key.
+        let retired = std::mem::take(&mut *self.retired_dns_inputs.lock().unwrap());
+        for (key, id, _charge) in retired {
+            if self
+                .dns_inputs
+                .get(&key)
+                .is_some_and(|record| record.id == id)
+            {
+                self.dns_inputs.remove(&key);
+            }
+        }
     }
 
     fn grant_for(
@@ -258,33 +303,56 @@ impl Inputs {
         })
     }
 
-    fn revalidate_receive(&mut self) {
-        self.dns_inputs.retain(|(source, _), record| {
-            let Some(scope) = record.scope.upgrade() else {
-                return false;
-            };
-            let current = self.endpoint
-                && self.dns_revision == record.revision
-                && self.capture.as_ref().is_some_and(|capture| {
-                    capture.identity == record.capture
-                        && capture.sources.contains(source)
-                        && capture.generation().is_ok_and(|g| g == record.generation)
-                });
-            if !current {
-                scope.revoke();
-            }
-            scope.current()
-        });
+    /// Revalidate against every producer event, not just the snapshot a woken
+    /// owner eventually sees. For changes to physical eligibility, compare
+    /// with the immediately preceding inputs without retaining a rule list per
+    /// receive record. Capture/endpoint changes already retire the scope itself.
+    fn revalidate_receive(
+        &mut self,
+        previous_policy: Option<&LocalNetworkAccess>,
+        previous_observation: Option<&NetworkObservation>,
+    ) {
+        let mut dns_inputs = std::mem::take(&mut self.dns_inputs);
+        if !dns_inputs.is_empty() {
+            let capture = self.dns_capture().ok();
+            dns_inputs.retain(|(source, _), record| {
+                let identity = capture
+                    .filter(|(capture, _)| capture.sources.contains(source))
+                    .map(|(_, identity)| identity);
+                record.revalidate(identity).is_some()
+            });
+        }
+        self.dns_inputs = dns_inputs;
+        self.reclaim_dns_inputs();
         let mut records = std::mem::take(&mut self.receive);
         records.retain(|_, record| {
             let Some(scope) = record.scope.upgrade() else {
                 return false;
             };
-            if !self
-                .grant_for(scope.source(), scope.destination(), record.identity.purpose)
-                .is_ok_and(|grant| record.identity.matches(&grant))
+            let grant = match self.grant_for(
+                scope.source(),
+                scope.destination(),
+                record.identity.purpose,
+            ) {
+                Ok(grant) if record.identity.matches(&grant) => grant,
+                _ => {
+                    scope.revoke();
+                    return false;
+                }
+            };
+            if !record.identity.purpose.is_home()
+                && (previous_policy.is_some() || previous_observation.is_some())
+                && !grant.physical.is_current(
+                    previous_policy.unwrap_or(&self.policy),
+                    previous_observation
+                        .or(self.observation.as_ref())
+                        .expect("live observation"),
+                )
             {
-                scope.revoke();
+                record.transport_incarnation = record
+                    .transport_incarnation
+                    .checked_add(1)
+                    .expect("transport incarnation exhausted");
             }
             scope.current()
         });
@@ -350,7 +418,10 @@ pub struct DeliveryGrant {
 /// Every issued transport grant retains its original irreversible scope. This
 /// reaches per-I/O current checks even before the async flow owner revalidates.
 #[derive(Clone)]
-struct GrantScope(ReceiveScope);
+struct GrantScope {
+    receive: ReceiveScope,
+    transport_incarnation: u64,
+}
 impl std::fmt::Debug for GrantScope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("GrantScope(redacted)")
@@ -358,7 +429,8 @@ impl std::fmt::Debug for GrantScope {
 }
 impl PartialEq for GrantScope {
     fn eq(&self, other: &Self) -> bool {
-        self.0.id() == other.0.id()
+        self.receive.id() == other.receive.id()
+            && self.transport_incarnation == other.transport_incarnation
     }
 }
 impl Eq for GrantScope {}
@@ -383,6 +455,7 @@ impl DeliveryAuthority {
                 dns_revision: 1,
                 dns_matcher: Inputs::compile_dns(policy),
                 dns_inputs: BTreeMap::new(),
+                retired_dns_inputs: Arc::default(),
             }),
             preparer,
             revalidate: watch::channel(0).0,
@@ -402,10 +475,10 @@ impl DeliveryAuthority {
                 .checked_add(1)
                 .expect("DNS policy revision exhausted");
         }
-        inputs.policy = policy.clone();
-        inputs.observation = observation;
+        let previous_policy = std::mem::replace(&mut inputs.policy, policy.clone());
+        let previous_observation = std::mem::replace(&mut inputs.observation, observation);
         inputs.observation_confirmed = true;
-        inputs.revalidate_receive();
+        inputs.revalidate_receive(Some(&previous_policy), previous_observation.as_ref());
         self.reclaim_receive(&mut inputs);
         drop(inputs);
         self.wake();
@@ -421,8 +494,8 @@ impl DeliveryAuthority {
                 .dns_revision
                 .checked_add(1)
                 .expect("DNS policy revision exhausted");
-            inputs.policy = policy.clone();
-            inputs.revalidate_receive();
+            let previous = std::mem::replace(&mut inputs.policy, policy.clone());
+            inputs.revalidate_receive(Some(&previous), None);
             self.reclaim_receive(&mut inputs);
             drop(inputs);
             self.wake();
@@ -442,9 +515,9 @@ impl DeliveryAuthority {
             .filter(|s| s.observer_running)
             .map(NetworkObservation::from);
         let mut inputs = self.inputs.write().unwrap();
-        inputs.observation = observation;
+        let previous = std::mem::replace(&mut inputs.observation, observation);
         inputs.observation_confirmed = confirmed;
-        inputs.revalidate_receive();
+        inputs.revalidate_receive(None, previous.as_ref());
         self.reclaim_receive(&mut inputs);
         drop(inputs);
         self.wake();
@@ -476,7 +549,7 @@ impl DeliveryAuthority {
     fn install(&self, capture: CaptureAuthority) {
         let mut inputs = self.inputs.write().unwrap();
         inputs.capture = Some(capture);
-        inputs.revalidate_receive();
+        inputs.revalidate_receive(None, None);
         self.reclaim_receive(&mut inputs);
         drop(inputs);
         self.wake();
@@ -505,7 +578,7 @@ impl DeliveryAuthority {
                 current.reserved = capture.reserved;
             }
         }
-        inputs.revalidate_receive();
+        inputs.revalidate_receive(None, None);
         self.reclaim_receive(&mut inputs);
         drop(inputs);
         self.wake();
@@ -514,7 +587,7 @@ impl DeliveryAuthority {
     pub fn revoke(&self) {
         let mut inputs = self.inputs.write().unwrap();
         inputs.capture = None;
-        inputs.revalidate_receive();
+        inputs.revalidate_receive(None, None);
         self.reclaim_receive(&mut inputs);
         drop(inputs);
         self.wake();
@@ -524,7 +597,7 @@ impl DeliveryAuthority {
         let mut inputs = self.inputs.write().unwrap();
         if inputs.endpoint != ready {
             inputs.endpoint = ready;
-            inputs.revalidate_receive();
+            inputs.revalidate_receive(None, None);
             self.reclaim_receive(&mut inputs);
             drop(inputs);
             self.wake();
@@ -536,15 +609,30 @@ impl DeliveryAuthority {
         self.revalidate.subscribe()
     }
 
+    // Pure policy probe for fixtures; shipping transport issuance always
+    // requires a receive capability and a transport incarnation.
+    #[cfg(test)]
+    fn authorize(&self, flow: Flow) -> Result<DeliveryGrant, Refused> {
+        let inputs = self.inputs.read().unwrap();
+        if !inputs.observation_confirmed {
+            return Err(Refused::Denied);
+        }
+        inputs.grant_for(
+            flow.source.ip(),
+            flow.destination.ip(),
+            ReceivePurpose::Local,
+        )
+    }
+
     fn receive_for(
         &self,
+        inputs: &mut Inputs,
         source: IpAddr,
         destination: IpAddr,
         purpose: ReceivePurpose,
         buffers: &dyn RelayBufferAllocator,
     ) -> Result<ReceiveScope, Refused> {
-        let mut inputs = self.inputs.write().unwrap();
-        self.reclaim_receive(&mut inputs);
+        self.reclaim_receive(inputs);
         let key = (source, destination, purpose);
         let grant = match inputs.grant_for(source, destination, purpose) {
             Ok(grant) => grant,
@@ -615,6 +703,7 @@ impl DeliveryAuthority {
                 id: scope.id(),
                 scope: scope.downgrade(),
                 identity: ReceiveIdentity::from_grant(&grant),
+                transport_incarnation: 0,
                 _charge: scope.registration_credit(),
             },
         );
@@ -633,15 +722,11 @@ impl DeliveryAuthority {
     }
 
     fn authorize_received_for(
-        &self,
+        inputs: &Inputs,
         flow: Flow,
         scope: &ReceiveScope,
         purpose: ReceivePurpose,
     ) -> Result<DeliveryGrant, Refused> {
-        let inputs = self.inputs.read().unwrap();
-        if !inputs.observation_confirmed {
-            return Err(Refused::Stale);
-        }
         if !scope.current()
             || scope.source() != flow.source.ip()
             || scope.destination() != flow.destination.ip()
@@ -664,7 +749,17 @@ impl DeliveryAuthority {
             scope.revoke();
             return Err(Refused::Stale);
         }
-        grant.scope = Some(GrantScope(scope.clone()));
+        if !inputs.observation_confirmed {
+            return Err(if purpose.is_home() {
+                Refused::Stale
+            } else {
+                Refused::AwaitingConfirmation
+            });
+        }
+        grant.scope = Some(GrantScope {
+            receive: scope.clone(),
+            transport_incarnation: record.transport_incarnation,
+        });
         #[cfg(feature = "r06-diagnostics")]
         talpid_lan_forwarder::diagnostics::observe(
             "complete-flow-authorized",
@@ -705,21 +800,19 @@ impl LocalAuthority for DeliveryAuthority {
         }
     }
 
-    fn authorize(&self, flow: Flow) -> Result<DeliveryGrant, Refused> {
-        let inputs = self.inputs.read().unwrap();
-        if !inputs.observation_confirmed {
-            return Err(Refused::Denied);
-        }
-        inputs.grant(flow.source.ip(), flow.destination.ip())
-    }
-
     fn receive(
         &self,
         source: IpAddr,
         destination: IpAddr,
         buffers: &dyn RelayBufferAllocator,
     ) -> Result<ReceiveScope, Refused> {
-        self.receive_for(source, destination, ReceivePurpose::Local, buffers)
+        self.receive_for(
+            &mut self.inputs.write().unwrap(),
+            source,
+            destination,
+            ReceivePurpose::Local,
+            buffers,
+        )
     }
 
     fn authorize_received(
@@ -727,7 +820,12 @@ impl LocalAuthority for DeliveryAuthority {
         flow: Flow,
         scope: &ReceiveScope,
     ) -> Result<DeliveryGrant, Refused> {
-        self.authorize_received_for(flow, scope, ReceivePurpose::Local)
+        Self::authorize_received_for(
+            &self.inputs.read().unwrap(),
+            flow,
+            scope,
+            ReceivePurpose::Local,
+        )
     }
 
     fn prepare(&self, socket: &socket2::Socket, grant: &DeliveryGrant) -> Result<(), Refused> {
@@ -754,7 +852,16 @@ impl LocalAuthority for DeliveryAuthority {
     fn current(&self, grant: &DeliveryGrant) -> bool {
         let inputs = self.inputs.read().unwrap();
         inputs.endpoint
-            && grant.scope.as_ref().is_none_or(|scope| scope.0.current())
+            && grant.scope.as_ref().is_none_or(|scope| {
+                scope.receive.current()
+                    && inputs
+                        .receive
+                        .get(&(grant.source, grant.physical.destination, grant.purpose))
+                        .is_some_and(|record| {
+                            record.id == scope.receive.id()
+                                && record.transport_incarnation == scope.transport_incarnation
+                        })
+            })
             && inputs.capture.as_ref().is_some_and(|capture| {
                 capture.identity == grant.capture
                     && capture.sources.contains(&grant.source)
@@ -805,6 +912,15 @@ pub trait DeliveryOwner {
 pub trait FrontendFactory: Send + Sync {
     type Owner: DeliveryOwner + Send;
     fn supported(&self) -> bool;
+    fn partial_dns(&self) -> Vec<IpAddr> {
+        vec![]
+    }
+    fn partial_lockdown(&self) -> bool {
+        true
+    }
+    fn platform_changes(&self) -> Option<watch::Receiver<bool>> {
+        None
+    }
     fn start(
         &self,
         config: DeliveryConfig,
@@ -953,6 +1069,12 @@ enum Readiness {
 }
 
 impl<F: FrontendFactory> Delivery<F> {
+    pub fn partial_dns(&self) -> Vec<IpAddr> {
+        self.factory.partial_dns()
+    }
+    pub fn partial_lockdown(&self) -> bool {
+        self.factory.partial_lockdown()
+    }
     pub fn supported(&self) -> bool {
         self.factory.supported()
     }

@@ -4,6 +4,8 @@
 mod access_method;
 pub mod account_history;
 mod android_dns;
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+mod android_dns_io;
 mod api;
 mod api_address_updater;
 #[cfg(not(target_os = "android"))]
@@ -734,6 +736,8 @@ pub struct Daemon {
     local_connect: local_network::ConnectContinuation,
     tunnel_state: TunnelState,
     target_state: PersistentTargetState,
+    #[cfg(target_os = "android")]
+    dns_target: android_dns::DnsTarget,
     #[cfg(target_os = "linux")]
     exclude_pids: split_tunnel::PidManager,
     rx: mpsc::UnboundedReceiver<InternalDaemonEvent>,
@@ -1041,7 +1045,7 @@ impl Daemon {
             #[cfg(target_os = "windows")]
             volume_update_rx,
             #[cfg(target_os = "android")]
-            config.android_context,
+            config.android_context.clone(),
             #[cfg(target_os = "android")]
             Some(local_network.broker()),
             #[cfg(target_os = "android")]
@@ -1122,13 +1126,22 @@ impl Daemon {
         // Attempt to download a fresh relay list
         relay_list_updater.update().await;
 
+        #[cfg(target_os = "android")]
+        let dns_target = android_dns::DnsTarget::new(*target_state);
         let location_handler = GeoIpHandler::new(
             internal_event_tx.clone().to_specialized_sender(),
             api_handle.availability.clone(),
             #[cfg(not(target_os = "android"))]
             mullvad_api::DefaultDnsResolver,
             #[cfg(target_os = "android")]
-            android_dns::AndroidDnsResolver::new(connectivity_listener),
+            android_dns::AndroidDnsResolver::new(
+                connectivity_listener,
+                talpid_tunnel::tun_provider::local_network::LocalNetworkPlatform::new(
+                    config.android_context,
+                ),
+                local_network.broker(),
+                dns_target.clone(),
+            ),
         );
 
         let leak_checker = {
@@ -1151,6 +1164,8 @@ impl Daemon {
                 locked_down: settings.lockdown_mode,
             },
             target_state,
+            #[cfg(target_os = "android")]
+            dns_target,
             #[cfg(target_os = "linux")]
             exclude_pids: split_tunneling_pid_manager,
             rx: internal_event_rx,
@@ -3779,6 +3794,8 @@ impl Daemon {
         if new_state != *self.target_state || self.tunnel_state.is_in_error_state() {
             log::debug!("Target state {:?} => {:?}", *self.target_state, new_state);
 
+            #[cfg(target_os = "android")]
+            self.dns_target.publish(new_state);
             self.target_state.set(new_state).await;
 
             match *self.target_state {

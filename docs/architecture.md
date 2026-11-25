@@ -311,7 +311,19 @@ route/family union added afterward. A missing target family is not advertised
 unless Local needs it; that extra family captures and drops non-Local traffic,
 never enabling a physical internet fallback. For an IPv4-only target below 1280,
 Local IPv6 requires a capture-only MTU floor of 1280; the target/carrier MTU is
-unchanged. Local-only capture uses MTU 1280, enabled CIDRs only and no DNS. The
+unchanged. Partial capture uses MTU 1280 and enabled CIDRs. With split DNS enabled,
+Android 10+ adds the non-VPN default resolver list and its exact host routes.
+With DNS enabled and Android lockdown on, Partial instead captures both default
+routes so Android's normal lookup can see both exposed interface families.
+Capture-owned OS observation reconciles lockdown changes through normal profile
+handover. The caller-scoped OS getter is resampled after every successful Builder
+establishment: its pre-establish false is not a lasting lockdown observation.
+If either settings observer registration fails, capture observation keeps
+blocking DNS coverage through callbacks and establishment until both register.
+This does not grant physical or Ordinary authority. Non-Local/non-DNS
+traffic is dropped, and each Ordinary DNS I/O retains its live OS gate.
+Without DNS demand or lockdown, Partial retains host routes only.
+Android 9 retains the DNS-free Partial profile. The
 upstream safe blocking MTU is separately 1380. These app-facing address values
 are independent of Mullvad login, key rotation and tunnel assignment.
 Tunnel targets translate to their own assigned addresses; Local uses protected,
@@ -347,6 +359,40 @@ readiness, but does not invalidate an exactly observed Local capture epoch.
 DNS and LAN subtraction use the upstream projection once; DNS resolvers are not
 globally recaptured or reserved from an explicit Local rule. Mullvad's real gateway
 and SOCKS exceptions remain reserved.
+
+Partial unlisted DNS uses its own runtime-only system authority, never a Home
+grant or a saved Mullvad target. A passive NOT_VPN + INTERNET observation supplies
+the resolver list independently of the app default, which can be Krtek's VPN.
+Prefer the Local observer's unambiguous physical network; otherwise prefer
+validated networks, then Wi-Fi/Ethernet, refusing tied candidates. Incomplete
+observations do not select a network, and an empty selected resolver list never
+falls back to another network. Every query and I/O checks Android's live lockdown
+gate; only an allowed query can protect and bind to that network. Revoked
+incarnations, changed capture sinks and Partial/full transitions retire old work.
+Complete ambiguous selection has separate reply-only authority when live
+lockdown is off: UDP and each Ordinary TCP message receive immediate SERVFAIL,
+without network I/O. This authority cannot prepare sockets and retains its exact
+ambiguity incarnation, OS gate and output guards; lockdown still drops. Missing
+or incomplete observation does not grant ambiguity reply authority.
+TCP classifies each framed message separately, so blocked Ordinary messages do
+not acquire Home authority. Connected UDP passthrough and unprotected TCP
+upstreams are unchanged. The system authority uses the same joined-preparation
+mechanism and credited message/reply storage, and closes with the capture owner.
+
+The daemon's Android DNS adapter has a separate grant from app forwarding. With
+Mullvad off, stock default-network I/O requires both an idle service epoch and
+no native capture reservation. The service monitor and broker guard hold that
+decision through each stock poll. A reservation before service establishment
+fails closed until the service allows physical DNS. Native sink retirement does
+not grant stock I/O while the service still owns capture. For physical DNS the
+adapter uses the passive system DNS authority's exact physical-network token
+and protects and binds UDP/TCP before I/O. A prepared socket survives a capture
+handover only while that token is still current and the service allows physical
+DNS. The service monitor covers validation and each nonblocking poll; rejected
+I/O closes the prepared socket without fallback. A stock TCP operation already
+submitted to Android is not cancelled when capture appears; new I/O does not
+use the retired grant. Mullvad on uses the upstream default-network resolver
+and socket provider. A daemon target epoch fences results from older attempts.
 
 Managed selection and current Local routes are initialized before tunnel startup.
 Normal Connect/Reconnect commands go directly to the upstream tunnel state machine;
@@ -413,9 +459,12 @@ Physical observation has two publication responsibilities. Under its event lock,
 the watcher hands a monotone, revocation-only witness to the same Rust authority
 before coalescing callbacks into a complete status sample. The shared eligibility
 evaluator retires affected receive scopes immediately; harmless refreshes retain
-eligible scopes. A witness cannot admit new work, replace status, prepare a socket
-or call the platform. Its revision fences late complete samples and stale
-callbacks. New work waits for a complete sample at the current fence. JNI witness
+eligible scopes. A change in the matching transport lease retires its incarnation
+even if the receive scope stays eligible. A witness cannot admit new work, replace
+status, prepare a socket or call the platform. Its revision fences late complete samples and stale
+callbacks. New work waits for a complete sample at the current fence. UDP already
+held for a stale preparation can wait for confirmation without resetting its scope,
+single retry or deadline. JNI witness
 conversion failure closes authority immediately; platform demand cleanup is
 deferred to the async owner outside the event lock. Committed settings publish
 their exact Local policy to that same authority before asynchronous listeners or

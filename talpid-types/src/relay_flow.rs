@@ -1,4 +1,5 @@
 //! Shared storage capabilities. A reservation is never packet or policy authority.
+use std::sync::RwLockReadGuard;
 use std::{
     fmt, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -204,6 +205,7 @@ struct CaptureState {
     live: bool,
     sink: Option<RelaySink>,
     last_sink: u64,
+    socket_revision: u64,
     attempts: [Weak<Attempt>; MAX_TARGETS],
 }
 
@@ -236,6 +238,27 @@ impl RelayTargetId {
 pub struct RelayCapture(Arc<Capture>);
 
 impl RelayCapture {
+    /// Capture/target context for an unprotected process socket. Suspension
+    /// revokes it even when the same sink later resumes; Local is unchanged.
+    pub fn socket_context(&self, target: RelayTargetId) -> Option<RelaySocketContext> {
+        let state = self.0.state.lock().expect("capture state");
+        if !state.live || state.sink.is_none() {
+            return None;
+        }
+        state
+            .attempts
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find_map(|attempt| {
+                let active = attempt.target == target
+                    && *attempt.phase.lock().expect("attempt state") == AttemptPhase::Active;
+                active.then(|| RelaySocketContext {
+                    attempt: RelayAttempt(attempt),
+                    sink: state.sink.clone().expect("checked sink"),
+                    revision: state.socket_revision,
+                })
+            })
+    }
     pub fn with_current<T>(&self, operation: impl FnOnce() -> T) -> Result<T, RelayFlowError> {
         let state = self.0.state.lock().expect("capture state");
         if !state.live {
@@ -371,6 +394,7 @@ impl RelayCaptureOwner {
                 live: true,
                 sink: None,
                 last_sink: 0,
+                socket_revision: 0,
                 attempts: std::array::from_fn(|_| Weak::new()),
             }),
             _charge: charge,
@@ -464,6 +488,10 @@ impl RelayCaptureOwner {
             return Err(RelayFlowError::Stale);
         }
         state.sink = None;
+        state.socket_revision = state
+            .socket_revision
+            .checked_add(1)
+            .expect("capture socket revision exhausted");
         let records = sink_records(&state, false, "sink-suspended");
         drop(state);
         emit_records(records);
@@ -762,12 +790,103 @@ impl RelayAttempt {
     }
 
     pub fn packet(&self, bytes: RelayBuffer) -> Result<RelayPacket, RelayFlowError> {
+        self.packet_with_admission(bytes, None)
+    }
+
+    pub fn original_packet(
+        &self,
+        original: RelayIngressOriginal,
+    ) -> Result<RelayPacket, RelayFlowError> {
+        self.packet_with_admission(original.bytes, Some(original.admission))
+    }
+
+    fn packet_with_admission(
+        &self,
+        bytes: RelayBuffer,
+        admission: Option<Arc<dyn RelayIngressAdmission>>,
+    ) -> Result<RelayPacket, RelayFlowError> {
         self.with_current(|| RelayPacket {
             storage: Arc::new(bytes),
             attempt: self.clone(),
+            admission,
             consumed: false,
         })
     }
+}
+
+/// An existing admitted attempt plus an irreversible capture-suspension witness.
+/// This is not ownership of a TUN, a socket, or permission to protect/bind one.
+#[derive(Clone)]
+pub struct RelaySocketContext {
+    attempt: RelayAttempt,
+    sink: RelaySink,
+    revision: u64,
+}
+impl RelaySocketContext {
+    pub fn current(&self) -> bool {
+        self.with_current(|| ()).is_ok()
+    }
+
+    /// Same capture -> attempt lock order as packet admission. No await,
+    /// platform/authority/broker reentry or retained borrowed data in operation.
+    pub fn with_current<T>(&self, operation: impl FnOnce() -> T) -> Result<T, RelayFlowError> {
+        let capture = self.attempt.0.capture.state.lock().expect("capture state");
+        let phase = self.attempt.0.phase.lock().expect("attempt state");
+        if !capture.live
+            || capture.socket_revision != self.revision
+            || !capture
+                .sink
+                .as_ref()
+                .is_some_and(|current| current.same_sink(&self.sink))
+            || *phase != AttemptPhase::Active
+        {
+            return Err(RelayFlowError::Stale);
+        }
+        Ok(operation())
+    }
+}
+
+/// The admitting consumer owns this irreversible lifetime. The carrier may
+/// observe it but cannot revoke it or select a replacement.
+pub trait RelayIngressAdmission: Send + Sync {
+    fn live(&self) -> RwLockReadGuard<'_, bool>;
+}
+
+pub struct RelayIngressOriginal {
+    bytes: RelayBuffer,
+    admission: Arc<dyn RelayIngressAdmission>,
+}
+
+impl RelayIngressOriginal {
+    pub fn new(bytes: RelayBuffer, admission: Arc<dyn RelayIngressAdmission>) -> Self {
+        Self { bytes, admission }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn copy_to(&self, buffers: &dyn RelayBufferAllocator) -> Result<Self, RelayFlowError> {
+        Ok(Self::new(
+            RelayBuffer::copy_from(&self.bytes, buffers)?,
+            self.admission.clone(),
+        ))
+    }
+}
+
+/// Run under the admission read guard, after any broker/capture/attempt locks.
+/// The callback must not reenter lifecycle, broker or policy code.
+fn with_relay_ingress_admission<T>(
+    admission: Option<&dyn RelayIngressAdmission>,
+    operation: impl FnOnce() -> T,
+) -> Result<T, RelayFlowError> {
+    let live = admission.map(RelayIngressAdmission::live);
+    if live.as_deref() == Some(&false) {
+        return Err(RelayFlowError::Stale);
+    }
+    let result = operation();
+    drop(live);
+    Ok(result)
 }
 
 /// Fixed, immutable packet storage retained with exact lifetime authority.
@@ -775,6 +894,7 @@ impl RelayAttempt {
 pub struct RelayPacket {
     storage: Arc<RelayBuffer>,
     attempt: RelayAttempt,
+    admission: Option<Arc<dyn RelayIngressAdmission>>,
     consumed: bool,
 }
 
@@ -804,15 +924,17 @@ impl RelayPacket {
             return Err(RelayFlowError::Closed);
         }
         self.attempt.with_current(|| {
-            let buffer = match Arc::try_unwrap(self.storage) {
-                Ok(buffer) => buffer,
-                Err(shared) => RelayBuffer::copy_from(&shared, buffers)?,
-            };
-            let RelayBuffer { bytes, _charge } = buffer;
-            let result = operation(bytes);
-            drop(_charge);
-            Ok(result)
-        })?
+            with_relay_ingress_admission(self.admission.as_deref(), || {
+                let buffer = match Arc::try_unwrap(self.storage) {
+                    Ok(buffer) => buffer,
+                    Err(shared) => RelayBuffer::copy_from(&shared, buffers)?,
+                };
+                let RelayBuffer { bytes, _charge } = buffer;
+                let result = operation(bytes);
+                drop(_charge);
+                Ok(result)
+            })
+        })??
     }
     /// Mutate only through the packet's exact live authority. Unique backing
     /// stays in place; immutable views force a separately credited copy. No
@@ -884,7 +1006,13 @@ impl RelayPacket {
             // target. Its owner may retry against the actual current sink.
             return RelayWriteOutcome::Retry;
         }
-        match operation(&self.storage) {
+        let result =
+            with_relay_ingress_admission(self.admission.as_deref(), || operation(&self.storage));
+        let Ok(result) = result else {
+            self.consumed = true;
+            return RelayWriteOutcome::Stale;
+        };
+        match result {
             Ok(n) if n == self.storage.len() && n != 0 => {
                 self.consumed = true;
                 RelayWriteOutcome::Written
@@ -912,7 +1040,9 @@ impl RelayPacket {
         if self.consumed {
             return Err(RelayFlowError::Closed);
         }
-        self.attempt.with_current(|| operation(&self.storage))
+        self.attempt.with_current(|| {
+            with_relay_ingress_admission(self.admission.as_deref(), || operation(&self.storage))
+        })?
     }
 }
 

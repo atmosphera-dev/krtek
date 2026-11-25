@@ -3,10 +3,13 @@
 use crate::Flow;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{
-    Arc, Weak,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, RwLock, RwLockReadGuard, Weak,
+    atomic::{AtomicU64, Ordering},
 };
-use talpid_types::relay_flow::{RelayBufferAllocator, RelayBufferReservation};
+use talpid_types::relay_flow::{
+    RelayBuffer, RelayBufferAllocator, RelayBufferReservation, RelayIngressAdmission,
+    RelayIngressOriginal,
+};
 
 /// At most one context per retained native input node. This is a storage bound,
 /// not a packet-rate quota or a second fragment-assembly table.
@@ -18,9 +21,15 @@ struct ReceiveState {
     id: u64,
     source: IpAddr,
     destination: IpAddr,
-    live: AtomicBool,
+    live: RwLock<bool>,
     _charge: Arc<dyn RelayBufferReservation>,
     retired: Option<ReceiveRetirement>,
+}
+
+impl RelayIngressAdmission for ReceiveState {
+    fn live(&self) -> RwLockReadGuard<'_, bool> {
+        self.live.read().expect("receive scope")
+    }
 }
 
 impl Drop for ReceiveState {
@@ -84,7 +93,7 @@ impl ReceiveScope {
             id,
             source,
             destination,
-            live: AtomicBool::new(true),
+            live: RwLock::new(true),
             _charge: charge,
             retired,
         })))
@@ -103,11 +112,15 @@ impl ReceiveScope {
     }
 
     pub fn current(&self) -> bool {
-        self.0.live.load(Ordering::Acquire)
+        *self.0.live()
     }
 
     pub fn revoke(&self) {
-        self.0.live.store(false, Ordering::Release);
+        *self.0.live.write().expect("receive scope") = false;
+    }
+
+    pub(crate) fn original(&self, bytes: RelayBuffer) -> RelayIngressOriginal {
+        RelayIngressOriginal::new(bytes, self.0.clone())
     }
 
     pub fn downgrade(&self) -> WeakReceiveScope {
@@ -138,6 +151,9 @@ pub enum Refused {
     UnsupportedMtu,
     Denied,
     Stale,
+    /// The original receive scope is still valid; a complete observation must
+    /// confirm it before a fresh transport can be issued.
+    AwaitingConfirmation,
     Full,
     PreparationFailed,
 }
@@ -166,8 +182,6 @@ pub trait LocalAuthority: Send + Sync + 'static {
     ) -> Result<Self::Grant, Refused> {
         Err(Refused::Denied)
     }
-    /// Decide without creating, preparing or connecting a socket.
-    fn authorize(&self, flow: Flow) -> Result<Self::Grant, Refused>;
     /// Protect and bind under the platform's admission check. Runs off the owner task.
     fn prepare(&self, socket: &socket2::Socket, grant: &Self::Grant) -> Result<(), Refused>;
     /// Re-evaluate the grant against the latest inputs.

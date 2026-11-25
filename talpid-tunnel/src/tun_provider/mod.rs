@@ -54,13 +54,14 @@ cfg_if! {
     }
 }
 
-/// Partial capture announces only enabled local routes, without DNS or managed
-/// observation. The Local policy projects effective exclusions independently of
+/// Partial capture announces enabled Local routes and optional exact system-DNS
+/// routes, without managed observation. The policy projects exclusions independently of
 /// secured capture; it may include apps that Mullvad excludes from full capture.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PartialConfig {
     pub routes: Vec<String>,
     pub excluded_packages: Vec<String>,
+    pub dns_servers: Vec<IpAddr>,
 }
 
 impl From<Vec<String>> for PartialConfig {
@@ -68,6 +69,7 @@ impl From<Vec<String>> for PartialConfig {
         Self {
             routes,
             excluded_packages: vec![],
+            dns_servers: vec![],
         }
     }
 }
@@ -78,7 +80,7 @@ impl PartialConfig {
             Some(
                 AndroidTunConfig {
                     addresses: vec![transport::ROUTER_IPV4.into(), transport::ROUTER_IPV6.into()],
-                    dns_servers: vec![],
+                    dns_servers: config.dns_servers.clone(),
                     routes: config
                         .routes
                         .iter()

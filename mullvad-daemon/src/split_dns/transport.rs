@@ -18,7 +18,7 @@ use hickory_net::{
     xfer::DnsStreamHandle,
 };
 use hickory_proto::{
-    op::{DnsResponse, Message, MessageType, OpCode, SerialMessage},
+    op::{DnsResponse, Header, HeaderCounts, Message, MessageType, OpCode, SerialMessage},
     rr::RecordType,
     serialize::binary::{BinDecodable, BinDecoder, BinEncoder},
 };
@@ -84,7 +84,22 @@ pub(super) async fn exchange<P: RuntimeProvider>(
         return Err(ExchangeError::Malformed);
     }
 
-    let reply = P::Timer::timeout(timeout, async move {
+    let reply = exchange_bytes(provider, resolver, protocol, timeout, bytes).await?;
+
+    restore_client_id(reply, client_id)
+}
+
+/// Ordinary forwarding preserves the complete original wire message, including
+/// its ID and compression. No retry, alternate upstream or TC fallback.
+pub(super) async fn exchange_bytes<P: RuntimeProvider>(
+    provider: P,
+    resolver: SocketAddr,
+    protocol: Protocol,
+    timeout: Duration,
+    bytes: Vec<u8>,
+) -> Result<DnsResponse, ExchangeError> {
+    let request = decode_message(&bytes)?;
+    P::Timer::timeout(timeout, async move {
         match protocol {
             Protocol::Udp => {
                 let ip = if resolver.is_ipv4() {
@@ -121,9 +136,7 @@ pub(super) async fn exchange<P: RuntimeProvider>(
             }
         }
     })
-    .await??;
-
-    restore_client_id(reply, client_id)
+    .await?
 }
 
 /// Decode exactly one complete library message; Hickory's convenience
@@ -132,12 +145,31 @@ pub(crate) fn decode_message(bytes: &[u8]) -> Result<Message, ExchangeError> {
     if bytes.len() > MAX_MESSAGE_BYTES {
         return Err(ExchangeError::Malformed);
     }
+    let mut header_decoder = BinDecoder::new(bytes);
+    let header = Header::read(&mut header_decoder).map_err(|_| ExchangeError::Malformed)?;
+    if minimum_section_bytes(header.counts) > header_decoder.len() {
+        return Err(ExchangeError::Malformed);
+    }
+
     let mut decoder = BinDecoder::new(bytes);
     let message = Message::read(&mut decoder).map_err(|_| ExchangeError::Malformed)?;
     if !decoder.is_empty() {
         return Err(ExchangeError::Malformed);
     }
     Ok(message)
+}
+
+/// Bound Hickory's count-based reservations by the actual bytes on the wire.
+fn minimum_section_bytes(counts: HeaderCounts) -> usize {
+    // A root name is one byte (a compression pointer is two). Each question
+    // then needs QTYPE and QCLASS; each RR also needs TTL and RDLENGTH, even
+    // for an empty RDATA or OPT record. Widen before summing the u16 counts.
+    const MIN_QUESTION_BYTES: usize = 5;
+    const MIN_RECORD_BYTES: usize = 11;
+    let records = usize::from(counts.answers)
+        + usize::from(counts.authorities)
+        + usize::from(counts.additionals);
+    usize::from(counts.queries) * MIN_QUESTION_BYTES + records * MIN_RECORD_BYTES
 }
 
 fn validate_reply(bytes: Vec<u8>, request: &Message) -> Result<DnsResponse, ExchangeError> {
@@ -149,6 +181,7 @@ fn validate_reply(bytes: Vec<u8>, request: &Message) -> Result<DnsResponse, Exch
     {
         return Err(ExchangeError::Identity);
     }
+    // Hickory reparses here, but decode_message already bounded these counts.
     DnsResponse::from_buffer(bytes).map_err(|_| ExchangeError::Malformed)
 }
 

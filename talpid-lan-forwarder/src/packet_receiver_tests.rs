@@ -1,6 +1,43 @@
 use super::*;
-use crate::{Flow, forwarder::tests::stock_udp_wire, packet::tests::flow};
+use crate::{Flow, Transport, forwarder::tests::stock_udp_wire, packet::tests::flow};
 use talpid_netstack::buffer_budget::BufferBudget;
+
+#[test]
+fn packet_custody_tcp_completion_preserves_payload_and_original_packets_in_both_families() {
+    use crate::packet::{TcpFlags, tests::tcp_packet};
+    for ipv6 in [false, true] {
+        let buffers = Arc::new(BufferBudget::new(32 * 1024 * 1024));
+        let flow = flow(ipv6, Transport::Tcp);
+        let scope = ReceiveScope::new(flow.source.ip(), flow.destination.ip(), &*buffers).unwrap();
+        let mut receiver = PacketReceiver::new(buffers.clone(), 1280).unwrap();
+        let bytes = tcp_packet(
+            flow,
+            TcpFlags {
+                syn: false,
+                ack: true,
+                fin: false,
+                rst: false,
+            },
+            b"complete TCP DNS frame",
+        );
+        assert_eq!(udp_endpoints(&bytes).unwrap(), None);
+        assert_eq!(
+            dns_endpoints(&bytes).unwrap(),
+            Some((flow.source.ip(), flow.destination.ip()))
+        );
+        let mut input = receiver.ingest(&scope, &bytes).unwrap().unwrap();
+        assert_eq!(input.packet().unwrap().flow, flow);
+        let normalized = input.tcp_packet(&*buffers).unwrap();
+        assert_eq!(
+            packet::parse(&normalized).unwrap().payload,
+            b"complete TCP DNS frame"
+        );
+        assert_eq!(input.pop_original().unwrap().unwrap().bytes(), bytes);
+        assert!(input.pop_original().unwrap().is_none());
+        scope.revoke();
+        assert!(matches!(input.tcp_packet(&*buffers), Err(IpError::Stale)));
+    }
+}
 
 fn isolated(name: &str) -> bool {
     let name = format!("packet_receiver::tests::{name}");
@@ -43,7 +80,7 @@ fn setup(ipv6: bool) -> (Arc<BufferBudget>, PacketReceiver, ReceiveScope) {
 fn originals(mut complete: CompletedDatagram) -> Vec<Vec<u8>> {
     let mut packets = vec![];
     while let Some(packet) = complete.pop_original().unwrap() {
-        packets.push(packet.to_vec());
+        packets.push(packet.bytes().to_vec());
     }
     packets
 }

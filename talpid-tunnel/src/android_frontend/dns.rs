@@ -1,11 +1,14 @@
 //! Injected selective consumer, owned and polled by the sole capture reactor.
 use std::{future::Future, io, net::IpAddr, pin::Pin, sync::Arc};
-use talpid_types::relay_flow::{RelayBuffer, RelayBufferAllocator, RelayCapture, RelaySink};
+use talpid_types::relay_flow::{
+    RelayBufferAllocator, RelayCapture, RelayIngressOriginal, RelaySink,
+};
 
 pub type DnsFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// No descriptor access, second reader, route classifier or physical authority.
 pub trait DnsReceiver: Send {
+    fn set_partial(&mut self, _partial: bool) {}
     /// A cheap candidate test, before allocating the demand-bound Local arena.
     fn candidate(&self, bytes: &[u8], advertised: &[IpAddr]) -> bool;
     /// true consumes this packet; false retains its original normal IP path.
@@ -17,7 +20,7 @@ pub trait DnsReceiver: Send {
         replies: Arc<dyn RelayBufferAllocator>,
         mtu: u16,
     ) -> bool;
-    fn original(&mut self) -> Option<RelayBuffer>;
+    fn original(&mut self) -> Option<RelayIngressOriginal>;
     fn has_original(&self) -> bool;
     fn has_output(&self) -> bool;
     fn set_mtu(&mut self, mtu: u16) -> Result<(), talpid_lan_forwarder::Refused>;

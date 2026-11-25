@@ -40,7 +40,6 @@ import androidx.compose.ui.test.v2.AndroidComposeUiTestEnvironment
 import androidx.compose.ui.test.v2.runEmptyComposeUiTest
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.test.platform.app.InstrumentationRegistry
-import androidx.test.runner.lifecycle.ActivityLifecycleCallback
 import androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry
 import androidx.test.runner.lifecycle.Stage
 import java.security.MessageDigest
@@ -48,7 +47,6 @@ import java.util.ArrayDeque
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -84,38 +82,14 @@ class LocalNetworkEditorInstrumentedTest {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
     private val target = instrumentation.targetContext
 
-    private fun withLiveActivity(block: (MainActivity) -> Unit) {
-        val lifecycle = ActivityLifecycleMonitorRegistry.getInstance()
-        val created = AtomicReference<MainActivity?>()
-        val resumed = CountDownLatch(1)
-        instrumentation.runOnMainSync {
-            check(
-                Stage.values().all { stage ->
-                    lifecycle.getActivitiesInStage(stage).none { it is MainActivity }
-                }
-            ) {
-                "Preserve an existing activity instead of reusing or clearing it"
-            }
-        }
-        val callback = ActivityLifecycleCallback { activity, stage ->
-            if (activity is MainActivity && stage == Stage.PRE_ON_CREATE)
-                created.compareAndSet(null, activity)
-            if (stage == Stage.RESUMED && activity === created.get()) resumed.countDown()
-        }
-        lifecycle.addLifecycleCallback(callback)
-        try {
-            target.startActivity(
-                Intent(target, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            )
-            check(resumed.await(10, TimeUnit.SECONDS)) {
-                "Owned real activity did not reach resumed state"
-            }
-            compose.waitForIdle()
-            block(checkNotNull(created.get()))
-        } finally {
-            lifecycle.removeLifecycleCallback(callback)
-            created.get()?.let { activity -> instrumentation.runOnMainSync { activity.finish() } }
-        }
+    private fun withLiveActivity(block: () -> Unit) = withResumedMainActivity {
+        compose.waitForIdle()
+        block()
+    }
+
+    internal fun withForegroundActivity(block: () -> Unit) = runEmptyComposeUiTest {
+        compose = this
+        withLiveActivity { block() }
     }
 
     private fun nodes(): List<AccessibilityNodeInfo> {
@@ -275,7 +249,20 @@ class LocalNetworkEditorInstrumentedTest {
         assertEquals(value, rendered.text?.toString())
     }
 
-    internal fun back() = EditorBackNavigationTest.toDiscardDialog(instrumentation, compose)
+    internal fun back(editorField: String = "local_access_name") =
+        EditorBackNavigationTest.toDiscardDialog(instrumentation, compose, editorField)
+
+    /** Full display capture for the final screenshot set; the IME is hidden first. */
+    internal fun screenshot(): android.graphics.Bitmap {
+        if (EditorBackNavigationTest.imeVisible(instrumentation)) {
+            EditorBackNavigationTest.hideIme(instrumentation)
+            compose.waitUntil(timeoutMillis = 15_000) {
+                !EditorBackNavigationTest.imeVisible(instrumentation)
+            }
+        }
+        ExternalUiActionCompletion.settle(instrumentation::waitForIdleSync, compose::waitForIdle)
+        return checkNotNull(instrumentation.uiAutomation.takeScreenshot())
+    }
 
     private fun mainActivityResumed(): Boolean {
         var resumed = false
@@ -289,9 +276,10 @@ class LocalNetworkEditorInstrumentedTest {
     }
 
     /** One Back per acknowledged system window; resumption forbids further navigation. */
-    internal fun returnFromSystemSettings(step: String) {
+    internal fun returnFromSystemSettings(step: String, requireSettingsVisit: Boolean = false) {
         val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15)
         var departingWindow: Int? = null
+        var observedSettings = false
         fun record(action: String, window: Int) {
             instrumentation.sendStatus(
                 0,
@@ -302,7 +290,11 @@ class LocalNetworkEditorInstrumentedTest {
             val root = instrumentation.uiAutomation.rootInActiveWindow
             val owner = root?.packageName?.toString()
             val resumed = mainActivityResumed()
-            if (resumed && owner == target.packageName) {
+            if (
+                resumed &&
+                    owner == target.packageName &&
+                    (!requireSettingsVisit || observedSettings)
+            ) {
                 compose.waitForIdle()
                 assertTrue(
                     compose
@@ -329,11 +321,15 @@ class LocalNetworkEditorInstrumentedTest {
                 if (root.windowId != departingWindow && root.refresh() && !mainActivityResumed()) {
                     departingWindow?.let { record("ack", it) }
                     departingWindow = root.windowId
+                    if (owner == "com.android.settings") observedSettings = true
                     record("back", root.windowId)
                     EditorBackNavigationTest.systemBack(instrumentation)
                 }
             }
             Thread.sleep(25)
+        }
+        check(!requireSettingsVisit || observedSettings) {
+            "Android Settings window was not observed"
         }
         error("System return transition was not acknowledged on the original route")
     }

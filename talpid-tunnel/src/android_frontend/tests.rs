@@ -284,20 +284,17 @@ impl LocalAuthority for Authority {
         {
             return Err(Refused::Stale);
         }
-        self.authorize(flow)
+        if self.available.load(SeqCst) {
+            Ok(self.revision.load(SeqCst))
+        } else {
+            Err(Refused::Denied)
+        }
     }
     fn disposition(&self, _: IpAddr) -> Disposition {
         if self.drop.load(SeqCst) {
             Disposition::Drop
         } else {
             Disposition::Local
-        }
-    }
-    fn authorize(&self, _: Flow) -> Result<u64, Refused> {
-        if self.available.load(SeqCst) {
-            Ok(self.revision.load(SeqCst))
-        } else {
-            Err(Refused::Denied)
         }
     }
     fn prepare(&self, _: &socket2::Socket, _: &u64) -> Result<(), Refused> {

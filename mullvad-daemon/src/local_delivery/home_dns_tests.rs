@@ -26,6 +26,158 @@ fn query_flow(transport: Transport) -> Flow {
     flow
 }
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
+#[test]
+fn split_dns_admission_revalidates_only_its_key_against_the_current_capture() {
+    use crate::local_delivery::tests::broker;
+    use talpid_tunnel::tun_provider::transport::ROUTER_SOURCES;
+
+    let on = configured();
+    let authority = DeliveryAuthority::new(&on, Arc::new(|_, _| Ok(())));
+    authority.update(&on, Some(observation()));
+    let broker = broker();
+    let open = || {
+        let lease = broker.open_capture(None).unwrap();
+        lease
+            .bind_observed_identity("tun-owned", 101_u64 << 32, ROUTER_SOURCES, 1280)
+            .unwrap();
+        lease
+    };
+    let first = open();
+    let local = flow(Transport::Udp, 49152);
+    let source = local.source.ip();
+    let resolver = "192.0.2.53".parse().unwrap();
+    let other = "192.0.2.54".parse().unwrap();
+    authority.install(CaptureAuthority::new(
+        vec![source],
+        Some(broker.clone()),
+        vec![],
+    ));
+    let budget = BufferBudget::new(65536);
+    let old = authority.dns_input(source, resolver, &budget).unwrap();
+    let local_scope = authority
+        .receive_for(
+            &mut authority.inputs.write().unwrap(),
+            source,
+            local.destination.ip(),
+            ReceivePurpose::Local,
+            &budget,
+        )
+        .unwrap();
+
+    first.retire();
+    let successor = open();
+    assert_ne!(first.generation(), successor.generation());
+    let unrelated = authority.dns_input(source, other, &budget).unwrap();
+    assert!(
+        local_scope.current(),
+        "DNS admission swept Local registrations"
+    );
+    assert!(
+        old.scope().current(),
+        "DNS admission swept unrelated live DNS registrations"
+    );
+
+    let current = authority.dns_input(source, resolver, &budget).unwrap();
+    assert_ne!(old.scope().id(), current.scope().id());
+    assert!(
+        !old.scope().current(),
+        "the old registration must be revoked before replacement"
+    );
+    // A late last-guard drop must not evict the new registration for this key.
+    drop(old);
+    let same = authority.dns_input(source, resolver, &budget).unwrap();
+    assert_eq!(current.scope().id(), same.scope().id());
+
+    authority.endpoint(false);
+    assert!(!local_scope.current());
+    assert!(!current.scope().current());
+    assert!(!unrelated.scope().current());
+}
+
+#[test]
+fn split_dns_admission_reclaims_dropped_registrations_across_keys() {
+    let authority = DeliveryAuthority::new(&configured(), Arc::new(|_, _| Ok(())));
+    let source = query_flow(Transport::Udp).source.ip();
+    let budget = BufferBudget::new(1024);
+    for host in 1..=16 {
+        let resolver = std::net::Ipv4Addr::new(192, 0, 2, host).into();
+        let input = authority.dns_input(source, resolver, &budget).unwrap();
+        assert!(input.scope().current());
+        assert_eq!(authority.inputs.read().unwrap().dns_inputs.len(), 1);
+    }
+}
+
+#[test]
+fn split_dns_configured_home_requires_the_original_classification_context() {
+    use hickory_proto::{
+        op::{Message, Query},
+        rr::{Name, RecordType},
+    };
+    use mullvad_types::settings::local_network_access::split_dns::DnsLane;
+
+    let on = configured();
+    let source = query_flow(Transport::Udp).source;
+    let resolver = "192.0.2.53".parse().unwrap();
+    let buffers = BufferBudget::new(128 * 1024);
+    let prepared = Arc::new(AtomicUsize::new(0));
+    let count = prepared.clone();
+    let authority = DeliveryAuthority::new(
+        &on,
+        Arc::new(move |_, _| {
+            count.fetch_add(1, SeqCst);
+            Ok(())
+        }),
+    );
+    let mut replacement = on.clone();
+    // The physical resolver remains identical. Only the classification changes.
+    replacement.split_dns.suffixes = vec!["new.home.".into()];
+    let request = |name: &str| {
+        let mut request = Message::query();
+        request.add_query(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
+        request
+    };
+    for transport in [Transport::Udp, Transport::Tcp] {
+        authority.update(&on, Some(observation()));
+        let input = authority
+            .dns_input(source.ip(), resolver, &buffers)
+            .unwrap();
+        assert_eq!(
+            input.matcher().classify(&request("old.home.")).unwrap(),
+            DnsLane::Home
+        );
+        authority.update_policy(&replacement);
+        assert!(!input.scope().current());
+        assert!(
+            authority
+                .home_dns_authorize_configured(&input, source, transport, &buffers)
+                .is_err(),
+            "classification under a retired policy issued a configured Home grant for {transport:?}"
+        );
+        let input = authority
+            .dns_input(source.ip(), resolver, &buffers)
+            .unwrap();
+        assert_eq!(
+            input.matcher().classify(&request("old.home.")).unwrap(),
+            DnsLane::Ordinary
+        );
+        assert_eq!(
+            input.matcher().classify(&request("new.home.")).unwrap(),
+            DnsLane::Home
+        );
+        let query = authority
+            .home_dns_authorize_configured(&input, source, transport, &buffers)
+            .unwrap();
+        let (kind, protocol) = match transport {
+            Transport::Udp => (socket2::Type::DGRAM, socket2::Protocol::UDP),
+            Transport::Tcp => (socket2::Type::STREAM, socket2::Protocol::TCP),
+        };
+        let socket = socket2::Socket::new(socket2::Domain::IPV4, kind, Some(protocol)).unwrap();
+        authority.home_dns_prepare(&socket, &query).unwrap();
+    }
+    assert_eq!(prepared.load(SeqCst), 2);
+}
+
 #[test]
 fn split_dns_home_query_app_and_home_address_families_are_independent() {
     for home_v6 in [false, true] {
@@ -52,8 +204,14 @@ fn split_dns_home_query_app_and_home_address_families_are_independent() {
             }
             .parse()
             .unwrap();
+            let resolver = if client_v6 { "fd00::53" } else { "192.0.2.53" }
+                .parse()
+                .unwrap();
+            let input = authority
+                .dns_input(source.ip(), resolver, &buffers)
+                .unwrap();
             let query = authority
-                .home_dns_authorize_configured(source, Transport::Udp, &buffers)
+                .home_dns_authorize_configured(&input, source, Transport::Udp, &buffers)
                 .expect("Home's two legs must not require one IP packet family");
             assert_eq!(query.0.scope.source(), source.ip());
             assert_eq!(query.0.scope.destination(), home);
@@ -84,7 +242,7 @@ fn split_dns_home_query_app_and_home_address_families_are_independent() {
 
 #[tokio::test]
 async fn split_dns_home_query_hickory_runtime_retains_exact_resolver_and_revocation_fence() {
-    use crate::split_dns::home_io::HomeIoOwner;
+    use crate::split_dns::{home_io::HomeIoOwner, transport::Protocol};
     use hickory_net::runtime::RuntimeProvider;
     let prepared = Arc::new(AtomicUsize::new(0));
     let count = prepared.clone();
@@ -148,13 +306,8 @@ async fn split_dns_home_query_hickory_runtime_retains_exact_resolver_and_revocat
         hickory_proto::rr::RecordType::A,
     ));
     assert!(
-        owner
-            .exchange(
-                authority.clone(),
-                &grant,
-                std::time::Duration::from_secs(2),
-                request
-            )
+        runtime
+            .exchange(Protocol::Udp, std::time::Duration::from_secs(2), request)
             .await
             .is_err()
     );

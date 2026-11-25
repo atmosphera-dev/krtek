@@ -218,19 +218,7 @@ internal class AndroidLocalNetworkSource(private val context: Context) : LocalNe
             network: Network,
             capabilities: NetworkCapabilities,
         ): LocalNetworkEvent {
-            val physical =
-                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
-                    !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
-                    !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
-            val transport =
-                when {
-                    !physical -> 0
-                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ->
-                        LocalNetworkWatcher.WIFI
-                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) ->
-                        LocalNetworkWatcher.ETHERNET
-                    else -> 0
-                }
+            val transport = localTransport(capabilities)
             return LocalNetworkEvent.Update(network.networkHandle) {
                 // The watcher applies this callback only under its current
                 // demand/epoch lock. A queued callback after stop must not even
@@ -246,6 +234,18 @@ internal class AndroidLocalNetworkSource(private val context: Context) : LocalNe
                 it.copy(transport = transport, capabilitiesFresh = true, ssidHex = identity)
             }
         }
+
+        internal fun localTransport(capabilities: NetworkCapabilities): Int =
+            when {
+                !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) ||
+                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) ||
+                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> 0
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ->
+                    LocalNetworkWatcher.WIFI
+                capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) ->
+                    LocalNetworkWatcher.ETHERNET
+                else -> 0
+            }
 
         private fun linksEvent(network: Network, links: LinkProperties): LocalNetworkEvent {
             val index = interfaceIndex(links.interfaceName)

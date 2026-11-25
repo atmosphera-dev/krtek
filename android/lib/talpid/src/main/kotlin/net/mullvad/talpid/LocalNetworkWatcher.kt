@@ -143,6 +143,23 @@ internal class LocalNetworkWatcher(
         changes.trySend(Unit)
     }
 
+    /** A preference only: system DNS still requires its own complete Internet observation. */
+    val physicalNetworkHandle: Long?
+        get() =
+            synchronized(lock) {
+                if (!running || pending) null
+                else
+                    published
+                        ?.networks
+                        ?.singleOrNull {
+                            !it.blocked &&
+                                it.capabilitiesFresh &&
+                                it.linksFresh &&
+                                (it.transport == WIFI || it.transport == ETHERNET)
+                        }
+                        ?.networkHandle
+            }
+
     /** The decision and the framework protect/bind action share this one lock hold. */
     fun withCurrentNetwork(
         handle: Long,

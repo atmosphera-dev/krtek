@@ -372,6 +372,7 @@ async fn run<A: LocalAuthority>(actor: Actor<A>) -> io::Result<()> {
                 };
                 if result.is_ok() {
                     forwarder.set_dns_servers(&epoch.observation.dns_servers);
+                    forwarder.set_dns_partial(matches!(epoch.config, CaptureConfig::Partial(_)));
                     result = forwarder
                         .set_mtu(usize::from(
                             epoch.applied.as_ref().unwrap_or(&epoch.config).mtu(),
