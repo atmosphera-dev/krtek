@@ -1,0 +1,42 @@
+{
+  "accepted": [
+    { "input": "home", "canonical": "home." },
+    { "input": ".home", "canonical": "home." },
+    { "input": "HOME.", "canonical": "home." },
+    { "input": " .HoMe. ", "canonical": "home." },
+    { "input": "my-matrix-server.com", "canonical": "my-matrix-server.com." },
+    { "input": "b\u00fccher.example", "canonical": "xn--bcher-kva.example." },
+    { "input": "XN--BCHER-KVA.EXAMPLE.", "canonical": "xn--bcher-kva.example." },
+    { "input": "fa\u00df.example", "canonical": "xn--fa-hia.example." },
+    { "input": "XN--FA-HIA.EXAMPLE.", "canonical": "xn--fa-hia.example." },
+    { "input": "com", "canonical": "com." },
+    { "input": "10.in-addr.arpa", "canonical": "10.in-addr.arpa." }
+  ],
+  "rejected": [
+    "", ".", "..home", "home..", "a..home", "*", "*.home",
+    "https://home", "home/path", "home:53", "user@home", "127.0.0.1",
+    "127.0.0.1.", "[::1]", "::1", "a\\046home", "bad name.home",
+    "-bad.home", "bad-.home", "xn--.home", "xn--a.home", "a\u200db.home",
+    "ab--cd.home", "_tcp.home", "a\u0000b.home"
+  ],
+  "matching": [
+    {
+      "entries": ["home", ".HOME.", "nas.home"],
+      "canonical": ["home.", "nas.home."],
+      "home": ["home.", "NAS.HOME.", "deep.nas.home."],
+      "ordinary": ["myhome.", "home.example.", "nas.", "other.example.", "."]
+    },
+    {
+      "entries": ["my-matrix-server.com"],
+      "canonical": ["my-matrix-server.com."],
+      "home": ["my-matrix-server.com.", "chat.my-matrix-server.com.", "_matrix-fed._tcp.my-matrix-server.com."],
+      "ordinary": ["notmy-matrix-server.com.", "my-matrix-server.com.evil.", "delegated.ordinary.test."]
+    },
+    {
+      "entries": ["b\u00fccher.example", "xn--bcher-kva.example."],
+      "canonical": ["xn--bcher-kva.example."],
+      "home": ["xn--bcher-kva.example.", "nas.xn--bcher-kva.example."],
+      "ordinary": ["bucher.example.", "xn--bcher-kva.example.evil."]
+    }
+  ]
+}

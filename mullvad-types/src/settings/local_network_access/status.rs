@@ -195,6 +195,7 @@ mod tests {
         LocalNetworkAccess {
             enabled: true,
             skip_local_rules_for_excluded_apps: true,
+            split_dns: Default::default(),
             rules: vec![LocalBypassRule {
                 id: Uuid::nil(),
                 name: "synthetic rule".into(),
@@ -539,6 +540,7 @@ mod tests {
         };
         LocalNetworkSnapshot {
             sequence: 1,
+            authority_revision: 0,
             observer_running: true,
             local_ready: true,
             fine_ready: true,

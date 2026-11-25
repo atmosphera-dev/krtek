@@ -24,9 +24,12 @@
 pub mod authority;
 #[cfg(feature = "r06-diagnostics")]
 pub mod diagnostics;
+#[cfg(test)]
+mod dns_candidate_tests;
 mod forwarder;
 mod ip_endpoint;
 pub mod packet;
+pub mod packet_receiver;
 
 pub use authority::{Disposition, LocalAuthority, ReceiveScope, Refused};
 pub use forwarder::{Forwarder, MAX_SUPPORTED_MTU, MIN_SUPPORTED_MTU, Stats, validate_mtu};

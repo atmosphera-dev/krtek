@@ -3060,6 +3060,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "krtek-split-dns-fixture"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "futures",
+ "hickory-net",
+ "hickory-proto",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3463,6 +3475,8 @@ dependencies = [
  "dirs",
  "either",
  "futures",
+ "hickory-net",
+ "hickory-proto",
  "hickory-resolver",
  "insta",
  "ipnetwork",
@@ -3834,6 +3848,8 @@ dependencies = [
  "chrono",
  "clap",
  "either",
+ "hickory-proto",
+ "idna",
  "intersection-derive",
  "ipnetwork",
  "log",

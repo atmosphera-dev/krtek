@@ -11,12 +11,16 @@ import kotlinx.coroutines.launch
 import net.mullvad.talpid.model.LocalNetworkSnapshot
 import net.mullvad.talpid.model.LocalPhysicalNetwork
 
-/** One writer, one coalesced delivery worker. Native calls never run under [lock]. */
+/**
+ * One writer and coalesced status worker. Restrictive event witnesses reach the revocation-only
+ * native boundary under [lock], before coalescing; that boundary cannot prepare sockets or call the
+ * platform. Full publications run outside it.
+ */
 internal class LocalNetworkWatcher(
     private val source: LocalNetworkSource,
     private val scope: CoroutineScope,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
-    private val publish: (Long, LocalNetworkSnapshot) -> Unit = LocalNetworkBridge::published,
+    private val publish: LocalNetworkPublication = NativeLocalNetworkPublication,
 ) {
     private val lock = Any()
     private val changes = Channel<Unit>(Channel.CONFLATED)
@@ -28,6 +32,7 @@ internal class LocalNetworkWatcher(
     private var registration = 0L
     private var epoch = 0L
     private var sequence = 0L
+    private val revocations = LocalNetworkRevocations(source, publish)
     private var pending = false
     private var published: LocalNetworkSnapshot? = null
     private var worker: Job? = null
@@ -67,11 +72,18 @@ internal class LocalNetworkWatcher(
                 initial.clear()
                 published = null
                 pending = false
+                revocations.revalidate(
+                    registration,
+                    sequence,
+                    running,
+                    access,
+                    networks.values.toList(),
+                )
                 Triple(epoch, registration, inactiveSnapshot())
             }
         // Registration survives observation suspension. Revoke published physical
         // authority before stopping the source; old callbacks retain the old epoch.
-        if (revoked.second != 0L) publish(revoked.second, revoked.third)
+        if (revoked.second != 0L) publish.published(revoked.second, revoked.third)
         synchronized(lock) { if (epoch == revoked.first) stopSource() }
     }
 
@@ -127,6 +139,7 @@ internal class LocalNetworkWatcher(
 
     private fun changed() {
         pending = true
+        revocations.revalidate(registration, sequence, running, access, networks.values.toList())
         changes.trySend(Unit)
     }
 
@@ -166,6 +179,7 @@ internal class LocalNetworkWatcher(
         networks.clear()
         initial.clear()
         published = null
+        revocations.revalidate(registration, sequence, running, access, networks.values.toList())
         stopSource()
         Logger.w("Local network watcher unavailable")
     }
@@ -188,7 +202,7 @@ internal class LocalNetworkWatcher(
                 pending = false
                 if (registration == 0L) null else registration to snapshot
             }
-        delivery?.let { publish(it.first, it.second) }
+        delivery?.let { publish.published(it.first, it.second) }
     }
 
     private fun inactiveSnapshot() =
@@ -201,6 +215,7 @@ internal class LocalNetworkWatcher(
             false,
             false,
             arrayListOf(),
+            revocations.revision,
         )
 
     private fun observation(): LocalNetworkSnapshot? =
@@ -235,6 +250,7 @@ internal class LocalNetworkWatcher(
                             else it.copy(ssidHex = null)
                         }
                     ),
+                    revocations.revision,
                 )
             }
         } catch (_: RuntimeException) {
@@ -248,6 +264,7 @@ internal class LocalNetworkWatcher(
                 false,
                 false,
                 arrayListOf(),
+                revocations.revision,
             )
         }
 

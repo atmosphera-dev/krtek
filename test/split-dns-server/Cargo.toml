@@ -1,0 +1,19 @@
+[package]
+name = "krtek-split-dns-fixture"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Guest-only non-recursive split DNS test server"
+
+[dependencies]
+clap.workspace = true
+futures.workspace = true
+hickory-net.workspace = true
+hickory-proto.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true

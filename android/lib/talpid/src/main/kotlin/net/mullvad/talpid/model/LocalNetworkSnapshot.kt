@@ -12,6 +12,7 @@ data class LocalNetworkSnapshot(
     val locationEnabled: Boolean,
     val locationAllowed: Boolean,
     val networks: ArrayList<LocalPhysicalNetwork>,
+    val authorityRevision: Long = 0,
 ) {
     override fun toString(): String =
         "LocalNetworkSnapshot(sequence=$sequence running=$observerRunning networks=${networks.size})"

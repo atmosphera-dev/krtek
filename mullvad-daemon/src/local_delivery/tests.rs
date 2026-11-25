@@ -30,6 +30,9 @@ mod connected;
 #[path = "retry_tests.rs"]
 mod retry;
 
+#[path = "publication_tests.rs"]
+mod publication;
+
 #[test]
 fn runtime_regions_share_one_root_and_local_exhaustion_preserves_control() {
     let pools = DeliveryBuffers::new();
@@ -58,10 +61,11 @@ fn runtime_regions_share_one_root_and_local_exhaustion_preserves_control() {
     assert_eq!(root.used(), 0);
 }
 
-fn policy() -> LocalNetworkAccess {
+pub(crate) fn policy() -> LocalNetworkAccess {
     LocalNetworkAccess {
         enabled: true,
         skip_local_rules_for_excluded_apps: true,
+        split_dns: Default::default(),
         rules: vec![LocalBypassRule {
             id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
             name: "synthetic".into(),
@@ -72,7 +76,7 @@ fn policy() -> LocalNetworkAccess {
     }
 }
 
-fn observation() -> NetworkObservation {
+pub(crate) fn observation() -> NetworkObservation {
     NetworkObservation {
         sequence: 9,
         permissions: Some(PermissionState {
@@ -117,7 +121,7 @@ fn route(address: &str, prefix_length: i16) -> LocalPhysicalRoute {
     }
 }
 
-fn flow(transport: Transport, source_port: u16) -> Flow {
+pub(super) fn flow(transport: Transport, source_port: u16) -> Flow {
     Flow {
         source: SocketAddr::new("172.27.1.1".parse().unwrap(), source_port),
         destination: "10.0.2.2:18080".parse().unwrap(),
@@ -282,7 +286,7 @@ fn stock_lwip_receive_endpoint_index_prunes_dead_registrations_before_full() {
         ));
         let scope = authority.receive(source, destination, &budget).unwrap();
         assert_eq!(
-            authority.inputs.read().unwrap().receive[&(source, destination)]
+            authority.inputs.read().unwrap().receive[&(source, destination, ReceivePurpose::Local)]
                 .scope
                 .upgrade()
                 .unwrap()
@@ -853,6 +857,35 @@ fn authority_triages_without_preparing_and_refuses_wrong_sources_and_missing_obs
     authority.update(&configured, Some(observation()));
     assert_eq!(
         authority.disposition(request.destination.ip()),
+        Disposition::Drop
+    );
+}
+
+#[test]
+fn split_dns_invalid_draft_cannot_disable_or_authorize_unrelated_local_delivery() {
+    let authority = authority();
+    authority.update(&policy(), Some(observation()));
+    let grant = authority.authorize(flow(Transport::Udp, 40001)).unwrap();
+    let mut configured = policy();
+    configured.split_dns.enabled = true;
+    configured.split_dns.suffixes = vec!["*.home".into()];
+    assert!(configured.validate().is_err());
+    authority.update(&configured, Some(observation()));
+    assert_eq!(
+        authority.disposition("10.0.2.2".parse().unwrap()),
+        Disposition::Local
+    );
+    assert!(authority.authorize(flow(Transport::Udp, 40002)).is_ok());
+    assert!(authority.current(&grant));
+    assert_eq!(
+        authority.disposition("1.1.1.1".parse().unwrap()),
+        Disposition::Drop
+    );
+    configured.enabled = false;
+    authority.update(&configured, Some(observation()));
+    assert!(!authority.current(&grant));
+    assert_eq!(
+        authority.disposition("10.0.2.2".parse().unwrap()),
         Disposition::Drop
     );
 }

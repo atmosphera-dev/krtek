@@ -183,7 +183,7 @@ public final class LocalNetworkConsumerService extends Service {
       String transport = command.getString("transport");
       (transport != null && transport.startsWith("session-") ? sessionCommands : worker).execute(task);
       main.postDelayed(deadline,
-          ("lookup".equals(transport) || "exit-check".equals(transport) || "icmp-check".equals(transport))
+          ("lookup".equals(transport) || "split-dns-lookup".equals(transport) || "exit-check".equals(transport) || "icmp-check".equals(transport))
               ? 30000L : 12000L);
     } catch (RejectedExecutionException ignored) {
       completed.set(true);
@@ -200,6 +200,7 @@ public final class LocalNetworkConsumerService extends Service {
       return result;
     }
     if ("lookup".equals(transport)) return lookup(command);
+    if ("split-dns-lookup".equals(transport)) return splitDnsLookup(command);
     if ("gateway-echo".equals(transport)) {
       int family = command.getInt("family");
       int size = command.getInt("payload_size");
@@ -770,6 +771,30 @@ public final class LocalNetworkConsumerService extends Service {
       result.putString("lookup_outcome", "failed");
       result.putString("error_class", error.getClass().getName());
       result.putInt("address_count", 0);
+    }
+    result.putLong("elapsed_ms", SystemClock.elapsedRealtime() - start);
+    return result;
+  }
+
+  private Bundle splitDnsLookup(Bundle command) {
+    String hostname = command.getString("hostname");
+    if (command.size() != 3 || hostname == null || hostname.isEmpty()
+        || hostname.length() > 253 || InetAddresses.isNumericAddress(hostname)) {
+      return outcome("invalid");
+    }
+    long start = SystemClock.elapsedRealtime();
+    Bundle result = outcome("split-dns-lookup");
+    try {
+      // Ordinary UID, one normal platform lookup, no protect/bind/cache flush.
+      InetAddress[] addresses = InetAddress.getAllByName(hostname);
+      if (addresses.length == 0) throw new IllegalStateException("Empty platform lookup");
+      ArrayList<String> answers = new ArrayList<>();
+      for (InetAddress address : addresses) answers.add(address.getHostAddress());
+      result.putStringArrayList("addresses", answers);
+      result.putString("lookup_outcome", "resolved");
+    } catch (Exception error) {
+      result.putString("lookup_outcome", "failed");
+      result.putString("error_class", error.getClass().getName());
     }
     result.putLong("elapsed_ms", SystemClock.elapsedRealtime() - start);
     return result;

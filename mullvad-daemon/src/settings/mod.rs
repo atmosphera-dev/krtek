@@ -490,8 +490,7 @@ impl SettingsPersister {
             {
                 return Err(PolicyError::Conflict);
             }
-            policy.validate()?;
-            policy.deduplicate();
+            policy.normalize()?;
             settings.local_network_access = policy;
             Ok(())
         })
@@ -840,6 +839,7 @@ mod test {
         original.local_network_access = LocalNetworkAccess {
             enabled: false,
             skip_local_rules_for_excluded_apps: false,
+            split_dns: Default::default(),
             rules: vec![LocalBypassRule {
                 id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
                 name: "x".repeat(65),
@@ -933,6 +933,7 @@ mod test {
                     enabled: true,
                     rules: vec![],
                     skip_local_rules_for_excluded_apps: false,
+                    split_dns: Default::default(),
                 },
                 target,
                 phase,
@@ -994,6 +995,7 @@ mod test {
         stored.local_network_access = LocalNetworkAccess {
             enabled: false,
             skip_local_rules_for_excluded_apps: false,
+            split_dns: Default::default(),
             rules: vec![LocalBypassRule {
                 id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
                 name: "x".repeat(65),

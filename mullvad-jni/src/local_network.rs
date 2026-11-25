@@ -150,6 +150,20 @@ pub extern "system" fn Java_net_mullvad_talpid_LocalNetworkBridge_published(
     registration: jlong,
     snapshot: JObject<'_>,
 ) {
+    publish_observation(env, registration, snapshot, false);
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_net_mullvad_talpid_LocalNetworkBridge_revalidate(
+    env: JNIEnv<'_>,
+    _: JClass<'_>,
+    registration: jlong,
+    snapshot: JObject<'_>,
+) {
+    publish_observation(env, registration, snapshot, true);
+}
+
+fn publish_observation(env: JNIEnv<'_>, registration: jlong, snapshot: JObject<'_>, witness: bool) {
     let feed = ACTIVE.lock().unwrap().as_ref().and_then(Weak::upgrade);
     let Some(feed) =
         feed.filter(|feed| feed.registration() == registration && !feed.latest().closed)
@@ -163,6 +177,10 @@ pub extern "system" fn Java_net_mullvad_talpid_LocalNetworkBridge_published(
     }));
     match observed {
         Ok(snapshot) => {
+            if witness {
+                feed.revalidate(registration, snapshot);
+                return;
+            }
             let first = feed.latest().latest.is_none();
             let networks = snapshot.networks.len();
             let addresses: usize = snapshot
@@ -182,7 +200,11 @@ pub extern "system" fn Java_net_mullvad_talpid_LocalNetworkBridge_published(
             }
         }
         Err(_) => {
-            feed.close();
+            if witness {
+                feed.invalidate();
+            } else {
+                feed.close();
+            }
             let _ = env.exception_clear();
             log::warn!("Local network snapshot conversion unavailable");
         }

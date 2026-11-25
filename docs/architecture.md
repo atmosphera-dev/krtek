@@ -409,6 +409,20 @@ and prints Local only for a configured policy, or an explicit `status local`
 request. Disabled configured rules remain visible; JSON/debug output retains
 its existing valid-settings representation.
 
+Physical observation has two publication responsibilities. Under its event lock,
+the watcher hands a monotone, revocation-only witness to the same Rust authority
+before coalescing callbacks into a complete status sample. The shared eligibility
+evaluator retires affected receive scopes immediately; harmless refreshes retain
+eligible scopes. A witness cannot admit new work, replace status, prepare a socket
+or call the platform. Its revision fences late complete samples and stale
+callbacks. New work waits for a complete sample at the current fence. JNI witness
+conversion failure closes authority immediately; platform demand cleanup is
+deferred to the async owner outside the event lock. Committed settings publish
+their exact Local policy to that same authority before asynchronous listeners or
+payload-free settings events can reread a successor. OFF/ON and loss/return cannot
+revive retired Local or Home DNS work. Capture configuration and semantic status
+still reconcile asynchronously, without a second eligibility evaluator.
+
 Native WireGuard setup stays in its caller's future and retains upstream pinger
 construction and Drop timing. Managed setup instead cancels the exact request,
 interrupts pending receipt and PQ/DAITA network waits, and joins device/platform

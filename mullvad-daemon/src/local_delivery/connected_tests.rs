@@ -1,5 +1,7 @@
 //! Exercise the daemon's actual configuration, classifier and authority through
 //! the production capture actor, with real packet and physical socket consumers.
+#[path = "dns_capture_tests.rs"]
+mod dns_capture_tests;
 use super::*;
 use crate::local_network::ConnectContinuation;
 use crate::local_network::TunnelPhase;
@@ -293,6 +295,7 @@ fn physical_snapshot() -> LocalNetworkSnapshot {
     let observed = observation();
     LocalNetworkSnapshot {
         sequence: 9,
+        authority_revision: 0,
         observer_running: true,
         local_ready: true,
         fine_ready: true,
@@ -1969,10 +1972,12 @@ async fn continuation_leaves_off_status_for_the_daemon_notification_boundary() {
             enabled: true,
             rules: vec![],
             skip_local_rules_for_excluded_apps: true,
+            split_dns: Default::default(),
         },
         LocalNetworkAccess {
             enabled: true,
             skip_local_rules_for_excluded_apps: true,
+            split_dns: Default::default(),
             rules: policy()
                 .rules
                 .into_iter()

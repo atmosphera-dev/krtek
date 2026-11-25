@@ -366,11 +366,12 @@ async fn run<A: LocalAuthority>(actor: Actor<A>) -> io::Result<()> {
                                 updates_open = result.is_ok();
                                 forwarder.revalidate();
                             },
-                            _ = forwarder.wait() => {},
+                            _ = forwarder.wait() => { forwarder.process(); },
                         }
                     }
                 };
                 if result.is_ok() {
+                    forwarder.set_dns_servers(&epoch.observation.dns_servers);
                     result = forwarder
                         .set_mtu(usize::from(
                             epoch.applied.as_ref().unwrap_or(&epoch.config).mtu(),
@@ -414,7 +415,10 @@ async fn run<A: LocalAuthority>(actor: Actor<A>) -> io::Result<()> {
                 &capture,
                 &mut forwarder,
                 (&mut revalidate, &mut stop),
-                Some((&epoch.config, &epoch.observation)),
+                Some((
+                    epoch.applied.as_ref().unwrap_or(&epoch.config),
+                    &epoch.observation,
+                )),
                 buffers.as_mut().expect("reserved before readiness"),
                 &mut commands,
                 &mut cleanup,
@@ -657,7 +661,7 @@ async fn run<A: LocalAuthority>(actor: Actor<A>) -> io::Result<()> {
             }
         }
     }
-    forwarder.close_all().await;
+    let joined = forwarder.close_all().await;
     if terminal == FrontendState::Failed {
         state.send_replace(terminal);
     }
@@ -665,9 +669,12 @@ async fn run<A: LocalAuthority>(actor: Actor<A>) -> io::Result<()> {
     for request in requests.into_iter().flatten() {
         request.wait_release().await;
     }
-    let mut result = Ok(());
+    let mut result = joined;
     if let Some(task) = cleanup {
-        result = task.await.map_err(io::Error::other).and_then(|r| r);
+        let released = task.await.map_err(io::Error::other).and_then(|r| r);
+        if released.is_err() {
+            result = released;
+        }
     }
     if let Some(old) = retained.as_mut().and_then(|old| old.old.take()) {
         let released = finish_epoch(platform.clone(), releases.clone(), old).await;

@@ -255,6 +255,7 @@ impl<A: NativeApi> NativeCore<A> {
             handle,
             closed: false,
             registered: None,
+            require_retained: false,
         })
     }
 
@@ -313,6 +314,7 @@ pub(crate) struct NativeEngine<A: NativeApi> {
     handle: ffi::Handle,
     closed: bool,
     registered: Option<ReceiveScope>,
+    require_retained: bool,
 }
 
 impl<A: NativeApi> NativeEngine<A> {
@@ -325,6 +327,16 @@ impl<A: NativeApi> NativeEngine<A> {
             return Err(IpError::Internal);
         }
         self.registered = Some(scope.clone());
+        self.require_retained = false;
+        Ok(())
+    }
+
+    /// A packet-custody continuation cannot start a new native datagram after
+    /// expiry/eviction. Check this after the ingress timer tick under the same
+    /// native lock, not with a racy caller-side scope_refs observation.
+    pub(crate) fn register_retained(&mut self, scope: &ReceiveScope) -> Result<(), IpError> {
+        self.register(scope)?;
+        self.require_retained = true;
         Ok(())
     }
 }
@@ -495,6 +507,11 @@ impl<A: NativeApi> LocalIpEngine for NativeEngine<A> {
         }
         state.reap();
         if registered.id() != scope.0 || !registered.current() {
+            return Err(IpError::Stale);
+        }
+        if std::mem::take(&mut self.require_retained)
+            && state.api.scope_refs(self.handle, scope.0) == 0
+        {
             return Err(IpError::Stale);
         }
         if !state
@@ -739,6 +756,9 @@ impl Engine {
     }
     pub(crate) fn register(&mut self, scope: &ReceiveScope) -> Result<(), IpError> {
         self.0.register(scope)
+    }
+    pub(crate) fn register_retained(&mut self, scope: &ReceiveScope) -> Result<(), IpError> {
+        self.0.register_retained(scope)
     }
 }
 

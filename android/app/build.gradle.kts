@@ -174,6 +174,7 @@ android {
         // Workaround to include all instrumented tests in app module. Without this we'd have to
         // create an APK for each submodule and pass each on for testing with the orchestrator.
         getByName("androidTest") {
+            assets.directories.add("$repoRootPath/test/fixtures")
             // Same ordinary-UID DNS implementation as the independent stock comparison consumer.
             java.directories += rootProject.file("test/publicdns/src/shared/java").path
 

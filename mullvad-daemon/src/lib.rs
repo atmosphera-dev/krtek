@@ -26,6 +26,8 @@ pub mod rpc_uniqueness_check;
 pub mod runtime;
 pub mod settings;
 pub mod shutdown;
+#[cfg(any(target_os = "android", test))]
+mod split_dns;
 mod target_state;
 mod tunnel;
 pub mod version;
@@ -844,6 +846,10 @@ impl Daemon {
                 ),
             ),
         );
+
+        // Publish policy revocation before any asynchronous/generic settings
+        // listener can coalesce changes into a read of the final policy.
+        local_network.observe_settings(&mut settings);
 
         #[cfg(target_os = "android")]
         let connectivity_listener = ConnectivityListener::new(config.android_context.clone())

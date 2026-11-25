@@ -52,7 +52,7 @@ const REPLY_STORAGE_BYTES: usize = (2 * OUTPUT_PACKETS + 2) * (DEFAULT_LOCAL_MTU
 const _: () = assert!(REPLY_STORAGE_BYTES >= 2 * (MAX_SUPPORTED_MTU + BUFFER_OVERHEAD));
 // UDP cannot consume the existing two maximum TCP producer peaks. TCP can still
 // use the whole shared arena when UDP is idle; the startup/root size is unchanged.
-const UDP_REPLY_HEADROOM: usize = 2 * (MAX_SUPPORTED_MTU + BUFFER_OVERHEAD);
+pub(crate) const UDP_REPLY_HEADROOM: usize = 2 * (MAX_SUPPORTED_MTU + BUFFER_OVERHEAD);
 const _: () = assert!(REPLY_STORAGE_BYTES >= BATCH_RESERVATION + UDP_REPLY_HEADROOM);
 
 pub fn validate_mtu(mtu: usize) -> Result<(), Refused> {
@@ -334,6 +334,11 @@ pub struct Forwarder<A: LocalAuthority> {
 }
 
 impl<A: LocalAuthority> Forwarder<A> {
+    /// Sibling capture consumers share this arena and its TCP output headroom.
+    pub fn reply_buffers(&self) -> Arc<dyn RelayBufferAllocator> {
+        self.replies.clone()
+    }
+
     pub fn new(authority: Arc<A>, buffers: Arc<dyn RelayBufferAllocator>) -> Result<Self, Refused> {
         Self::with_mtu(authority, buffers, DEFAULT_LOCAL_MTU)
     }
@@ -1754,4 +1759,4 @@ impl<A: LocalAuthority> Forwarder<A> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

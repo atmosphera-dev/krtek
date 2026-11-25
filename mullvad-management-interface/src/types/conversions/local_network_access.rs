@@ -1,7 +1,7 @@
 use crate::types::{FromProtobufTypeError, proto};
 use mullvad_types::settings::local_network_access::{
     LocalBypassRule, LocalNetworkAccess, MAX_CIDRS_PER_RULE, MAX_RULE_NAME_CHARS, MAX_RULES,
-    MAX_SSIDS_PER_RULE, SsidIdentity,
+    MAX_SSIDS_PER_RULE, SsidIdentity, split_dns::SplitDnsPolicy,
 };
 
 impl From<&LocalNetworkAccess> for proto::LocalNetworkAccess {
@@ -9,6 +9,8 @@ impl From<&LocalNetworkAccess> for proto::LocalNetworkAccess {
         Self {
             enabled: policy.enabled,
             skip_local_rules_for_excluded_apps: Some(policy.skip_local_rules_for_excluded_apps),
+            split_dns: (policy.split_dns != SplitDnsPolicy::default())
+                .then(|| (&policy.split_dns).into()),
             rules: policy
                 .rules
                 .iter()
@@ -39,7 +41,9 @@ impl TryFrom<proto::LocalNetworkAccess> for LocalNetworkAccess {
 
     fn try_from(policy: proto::LocalNetworkAccess) -> Result<Self, Self::Error> {
         let mut policy = local_policy_for_update(policy)?;
-        policy.deduplicate();
+        policy
+            .normalize()
+            .map_err(|error| FromProtobufTypeError::invalid_argument(error.to_string()))?;
         Ok(policy)
     }
 }
@@ -65,6 +69,11 @@ fn local_policy_for_update(
         skip_local_rules_for_excluded_apps: policy
             .skip_local_rules_for_excluded_apps
             .unwrap_or(true),
+        split_dns: policy
+            .split_dns
+            .map(read_split_dns)
+            .transpose()?
+            .unwrap_or_default(),
         rules: policy
             .rules
             .into_iter()
@@ -85,11 +94,42 @@ pub(super) fn read_local_policy(
         skip_local_rules_for_excluded_apps: policy
             .skip_local_rules_for_excluded_apps
             .unwrap_or(true),
+        split_dns: policy
+            .split_dns
+            .map(read_split_dns)
+            .transpose()?
+            .unwrap_or_default(),
         rules: policy
             .rules
             .into_iter()
             .map(read_local_rule)
             .collect::<Result<_, _>>()?,
+    })
+}
+
+impl From<&SplitDnsPolicy> for proto::SplitDnsPolicy {
+    fn from(policy: &SplitDnsPolicy) -> Self {
+        Self {
+            enabled: policy.enabled,
+            suffixes: policy.suffixes.clone(),
+            home_resolver: policy.home_resolver.map(|ip| ip.to_string()),
+            local_rule_id: policy.local_rule_id.map(|id| id.to_string()),
+        }
+    }
+}
+
+fn read_split_dns(policy: proto::SplitDnsPolicy) -> Result<SplitDnsPolicy, FromProtobufTypeError> {
+    Ok(SplitDnsPolicy {
+        enabled: policy.enabled,
+        suffixes: policy.suffixes,
+        home_resolver: policy
+            .home_resolver
+            .map(|text| super::arg_from_str(&text, "invalid Home resolver address"))
+            .transpose()?,
+        local_rule_id: policy
+            .local_rule_id
+            .map(|text| super::arg_from_str(&text, "invalid Home Local rule identifier"))
+            .transpose()?,
     })
 }
 
@@ -142,6 +182,7 @@ mod tests {
         LocalNetworkAccess {
             enabled: true,
             skip_local_rules_for_excluded_apps: false,
+            split_dns: Default::default(),
             rules: vec![LocalBypassRule {
                 id: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
                 name: "test rule".into(),
@@ -359,6 +400,104 @@ mod tests {
             mullvad_types::settings::SettingsKey::try_from(wire_key).unwrap(),
             key
         );
+    }
+
+    #[test]
+    fn split_dns_wire_absence_and_present_empty_mean_disabled_without_changing_local_fields() {
+        let original = policy();
+        for split_dns in [None, Some(proto::SplitDnsPolicy::default())] {
+            let mut wire = proto::LocalNetworkAccess::from(&original);
+            wire.split_dns = split_dns;
+            let decoded =
+                proto::LocalNetworkAccess::decode(wire.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(read_local_policy(decoded.clone()).unwrap(), original);
+            assert_eq!(
+                local_policy_for_compare_set(decoded.clone()).unwrap(),
+                original
+            );
+            assert_eq!(LocalNetworkAccess::try_from(decoded).unwrap(), original);
+        }
+        let tagged = proto::LocalNetworkAccess {
+            split_dns: Some(proto::SplitDnsPolicy {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert_eq!(tagged, [0x22, 2, 8, 1]); // Nested split DNS is field 4.
+    }
+
+    #[test]
+    fn split_dns_wire_read_and_expected_are_lossless_but_replacements_normalize() {
+        let mut stored = policy();
+        stored.split_dns = SplitDnsPolicy {
+            enabled: true,
+            suffixes: vec![".HOME.".into(), "home".into(), "nas.home".into()],
+            home_resolver: Some("192.168.240.10".parse().unwrap()),
+            local_rule_id: Some(stored.rules[0].id),
+        };
+        let wire = proto::LocalNetworkAccess::from(&stored);
+        let decoded = proto::LocalNetworkAccess::decode(wire.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, wire);
+        assert_eq!(read_local_policy(decoded.clone()).unwrap(), stored);
+        assert_eq!(
+            local_policy_for_compare_set(decoded.clone()).unwrap(),
+            stored
+        );
+        let accepted = LocalNetworkAccess::try_from(decoded).unwrap();
+        assert_eq!(accepted.split_dns.suffixes, ["home.", "nas.home."]);
+        assert_eq!(accepted.rules, stored.rules);
+        assert!(!accepted.skip_local_rules_for_excluded_apps);
+        assert_eq!(
+            accepted.split_dns.home_resolver,
+            stored.split_dns.home_resolver
+        );
+        assert_eq!(
+            accepted.split_dns.local_rule_id,
+            stored.split_dns.local_rule_id
+        );
+
+        stored.split_dns.suffixes = vec!["*.secret.home".into(), "*.secret.home".into()];
+        let wire = proto::LocalNetworkAccess::from(&stored);
+        assert_eq!(read_local_policy(wire.clone()).unwrap(), stored);
+        assert_eq!(local_policy_for_compare_set(wire.clone()).unwrap(), stored);
+        let error = LocalNetworkAccess::try_from(wire).unwrap_err();
+        assert!(!format!("{error} {error:?}").contains("secret"));
+        assert_eq!(stored.announced_routes(), policy().announced_routes());
+    }
+
+    #[test]
+    fn split_dns_unrepresentable_wire_isolated_from_other_settings_and_never_defaulted() {
+        for (resolver, rule_id) in [
+            (Some("secret.invalid"), None),
+            (None, Some("secret-invalid-id")),
+            (Some(""), None),
+            (None, Some("")),
+        ] {
+            let base = mullvad_types::settings::Settings::default();
+            let mut local = proto::LocalNetworkAccess::from(&policy());
+            local.split_dns = Some(proto::SplitDnsPolicy {
+                home_resolver: resolver.map(str::to_owned),
+                local_rule_id: rule_id.map(str::to_owned),
+                ..Default::default()
+            });
+            let mut wire = proto::Settings::from(&base);
+            wire.local_network_access = Some(local.clone());
+            let read = crate::types::SettingsRead::try_from(wire).unwrap();
+            assert!(read.local_network_access.policy.is_none());
+            assert_eq!(read.local_network_access.raw(), Some(&local));
+            assert_eq!(read.tunnel_options, base.tunnel_options);
+            assert_eq!(read.api_access_methods, base.api_access_methods);
+            assert!(!format!("{read:?}").contains("secret"));
+            assert!(read.into_representable_settings().is_err());
+            for error in [
+                read_local_policy(local.clone()).unwrap_err(),
+                LocalNetworkAccess::try_from(local).unwrap_err(),
+            ] {
+                assert!(!format!("{error} {error:?}").contains("secret"));
+            }
+        }
     }
 
     #[test]

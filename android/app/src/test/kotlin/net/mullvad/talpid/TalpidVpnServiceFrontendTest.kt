@@ -23,9 +23,6 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
-import kotlin.test.assertEquals
-import kotlin.test.assertFalse
-import kotlin.test.assertTrue
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -37,6 +34,10 @@ import net.mullvad.mullvadvpn.lib.model.Prepared
 import net.mullvad.talpid.model.CreateTunResult
 import net.mullvad.talpid.model.LocalNetworkSnapshot
 import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertInstanceOf
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 
@@ -113,13 +114,15 @@ class TalpidVpnServiceFrontendTest {
             val result = service.openSecuredFrontend(generation, config)
             assertTrue(result.isOpen)
             if (ipv6) {
-                assertTrue(result is CreateTunResult.InvalidIpv6Config)
-                assertEquals(config.addresses, result.addresses)
-                assertEquals(7, result.tunFd)
+                val invalid =
+                    assertInstanceOf(CreateTunResult.InvalidIpv6Config::class.java, result)
+                assertEquals(config.addresses, invalid.addresses)
+                assertEquals(7, invalid.tunFd)
             } else {
-                assertTrue(result is CreateTunResult.InvalidDnsServers)
-                assertEquals(config.dnsServers, result.addresses)
-                assertEquals(7, result.tunFd)
+                val invalid =
+                    assertInstanceOf(CreateTunResult.InvalidDnsServers::class.java, result)
+                assertEquals(config.dnsServers, invalid.addresses)
+                assertEquals(7, invalid.tunFd)
             }
             val applied =
                 result.javaClass.getMethod("getAppliedConfig").invoke(result)
@@ -270,8 +273,8 @@ class TalpidVpnServiceFrontendTest {
             service
                 .handoverSecuredFrontend(750, 751, base.copy(dnsServers = arrayListOf(bad)))
                 .result
-        assertTrue(rejected is CreateTunResult.InvalidDnsServers)
-        assertEquals(arrayListOf(bad), rejected.addresses)
+        val invalid = assertInstanceOf(CreateTunResult.InvalidDnsServers::class.java, rejected)
+        assertEquals(arrayListOf(bad), invalid.addresses)
         service.finishLocalFrontend(750)
         every { anyConstructed<VpnService.Builder>().addDnsServer(bad) } returns
             mockk(relaxed = true)
@@ -712,10 +715,13 @@ class TalpidVpnServiceFrontendTest {
                     assertTrue(Thread.holdsLock(fixture.lock), "bind escaped the watcher gate")
                     assertEquals(1L, completed.count)
                 }
+            val beforeLoss = fixture.witnesses.last().authorityRevision
             try {
                 assertEquals(0, service.prepareLocalSocket(7, 9, fixture.sequence, false))
                 assertTrue(completed.await(1, TimeUnit.SECONDS))
                 update?.join(1000)
+                assertTrue(fixture.witnesses.last().authorityRevision > beforeLoss)
+                assertTrue(fixture.witnesses.last().networks.none { it.networkHandle == 9L })
                 assertEquals(1, service.prepareLocalSocket(7, 9, fixture.sequence, false))
                 verify(exactly = 1) { service.protect(7) }
                 verify(exactly = 1) { network.bindSocket(descriptor) }
@@ -741,9 +747,11 @@ class TalpidVpnServiceFrontendTest {
     ) {
         private val sourceType = Class.forName("net.mullvad.talpid.LocalNetworkSource")
         private val watcherType = Class.forName("net.mullvad.talpid.LocalNetworkWatcher")
+        private val publicationType = Class.forName("net.mullvad.talpid.LocalNetworkPublication")
         private var callback: (Any) -> Unit = {}
         var sequence = 0L
         var starts = 0
+        val witnesses = mutableListOf<LocalNetworkSnapshot>()
         private val access =
             Class.forName("net.mullvad.talpid.LocalIdentityAccess")
                 .getDeclaredConstructor(*Array(5) { Boolean::class.javaPrimitiveType })
@@ -765,16 +773,32 @@ class TalpidVpnServiceFrontendTest {
                     else -> error("Unexpected source call ${method.name}")
                 }
             }
-        private val publish: (Long, LocalNetworkSnapshot) -> Unit = { _, record ->
-            sequence = record.sequence
-        }
+        private val publish =
+            Proxy.newProxyInstance(publicationType.classLoader, arrayOf(publicationType)) {
+                _,
+                method,
+                args ->
+                val record = args[1] as LocalNetworkSnapshot
+                when (method.name) {
+                    "published" -> {
+                        assertFalse(Thread.holdsLock(lock), "status escaped its async boundary")
+                        sequence = record.sequence
+                    }
+                    "revalidate" -> {
+                        assertTrue(Thread.holdsLock(lock), "revocation escaped the watcher gate")
+                        witnesses += record
+                    }
+                    else -> error("Unexpected publication call ${method.name}")
+                }
+                Unit
+            }
         val watcher: Any =
             watcherType
                 .getDeclaredConstructor(
                     sourceType,
                     CoroutineScope::class.java,
                     CoroutineDispatcher::class.java,
-                    Function2::class.java,
+                    publicationType,
                 )
                 .newInstance(source, scope, dispatcher, publish)
         val lock: Any =

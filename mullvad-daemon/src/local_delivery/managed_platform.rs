@@ -11,6 +11,7 @@ pub struct PlatformOwner {
     authority: Arc<DeliveryAuthority>,
     receiver: watch::Receiver<FrontendState>,
     open: bool,
+    home: Arc<dyn crate::split_dns::home_path::HomeDnsPath>,
 }
 impl FrontendFactory for PlatformFactory {
     type Owner = PlatformOwner;
@@ -27,10 +28,17 @@ impl FrontendFactory for PlatformFactory {
         let updates = authority.subscribe();
         let classifier = authority.clone();
         let receiver_authority = authority.clone();
+        let home = crate::split_dns::local_home_path(authority.clone(), buffers.clone());
+        let dns = crate::split_dns::capture::CaptureDns::new(
+            authority.clone(),
+            buffers.clone(),
+            home.clone(),
+        );
         let forwarder = LocalReceiver::new(move |mtu| {
             log::debug!("local-receiver-start capture_mtu={mtu}");
             Forwarder::with_mtu(receiver_authority.clone(), buffers.clone(), mtu)
-        });
+        })
+        .with_dns(dns);
         let owner = FrontendOwner::start(
             self.0.clone(),
             config.into_frontend(classifier),
@@ -44,6 +52,7 @@ impl FrontendFactory for PlatformFactory {
             authority,
             receiver,
             open: true,
+            home,
         })
     }
 }
@@ -59,7 +68,9 @@ impl DeliveryOwner for PlatformOwner {
         self.owner.ready().await
     }
     async fn stop(&mut self) -> io::Result<()> {
-        self.owner.stop().await
+        self.owner.stop().await?;
+        // Keep and retry the SAME joined Home close after a failed actor join.
+        self.home.close().await
     }
     fn retry_release(&mut self) -> io::Result<()> {
         self.owner.retry_release()

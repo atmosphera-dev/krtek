@@ -571,11 +571,20 @@ message LocalBypassRule {
   repeated bytes ssid_ids = 5;
 }
 
+message SplitDnsPolicy {
+  bool enabled = 1;
+  repeated string suffixes = 2;
+  optional string home_resolver = 3;
+  optional string local_rule_id = 4;
+}
+
 message LocalNetworkAccess {
   bool enabled = 1;
   repeated LocalBypassRule rules = 2;
   // Absent in older clients/settings means true. Explicit false is retained.
   optional bool skip_local_rules_for_excluded_apps = 3;
+  // Absent in old settings/clients means disabled, with no configured authority.
+  SplitDnsPolicy split_dns = 4;
 }
 
 message LocalNetworkPolicyUpdate {

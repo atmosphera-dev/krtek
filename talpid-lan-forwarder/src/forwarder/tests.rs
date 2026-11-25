@@ -92,7 +92,7 @@ fn stock_pseudo(flow: Flow, length: usize) -> Vec<u8> {
     bytes
 }
 
-fn stock_udp_wire(flow: Flow, payload: &[u8], mtu: usize) -> Vec<Vec<u8>> {
+pub(crate) fn stock_udp_wire(flow: Flow, payload: &[u8], mtu: usize) -> Vec<Vec<u8>> {
     let mut udp = Vec::from(flow.source.port().to_be_bytes());
     udp.extend(flow.destination.port().to_be_bytes());
     udp.extend(((payload.len() + 8) as u16).to_be_bytes());

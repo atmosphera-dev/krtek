@@ -49,6 +49,7 @@ members = [
   "talpid-types",
   "talpid-windows",
   "talpid-wireguard",
+  "test/split-dns-server",
   "tunnel-obfuscation",
   "windows-installer"
 ]
@@ -80,9 +81,11 @@ either = "1.15.0"
 futures = "0.3.15"
 gotatun = { version = "0.9.0", default-features = false, features = ["aws-lc-rs"] }
 hex = { version = "0.4" }
+hickory-net = { version = "0.26.1", default-features = false, features = ["tokio"] }
 hickory-proto = "0.26.1"
 hickory-resolver = { version = "0.26.1", default-features = false, features = ["tokio"] }
 hickory-server = { version = "0.26.1", features = ["resolver"] }
+idna = "1.1.0"
 hyper-util = { version = "0.1.8", features = [
   "client",
   "tokio",

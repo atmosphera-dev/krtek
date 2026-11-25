@@ -144,7 +144,7 @@ class LocalCidr private constructor(private val address: ByteArray, val prefix: 
                 (bytes[index].toInt() and (OCTET_MASK shl (BITS_PER_BYTE - bits))).toByte()
             }
 
-        private fun formatAddress(bytes: ByteArray): String =
+        internal fun formatAddress(bytes: ByteArray): String =
             if (bytes.size == IPV4_BYTES)
                 bytes.joinToString(".") { (it.toInt() and OCTET_MASK).toString() }
             else formatIpv6(bytes)

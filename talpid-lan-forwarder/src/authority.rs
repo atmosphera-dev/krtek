@@ -61,6 +61,18 @@ impl ReceiveScope {
         if source.is_ipv4() != destination.is_ipv4() {
             return Err(Refused::Denied);
         }
+        Self::new_context_notifying(source, destination, buffers, retired)
+    }
+
+    /// Non-IP lifetime context for a consumer with distinct app and upstream
+    /// legs (e.g. DNS). This never admits a packet or grants socket authority.
+    /// Native IP consumers keep using `new`/`new_notifying`'s single-family check.
+    pub fn new_context_notifying(
+        source: IpAddr,
+        destination: IpAddr,
+        buffers: &dyn RelayBufferAllocator,
+        retired: Option<ReceiveRetirement>,
+    ) -> Result<Self, Refused> {
         // Includes the fixed scope, allocator/Arc overhead and the consumer's
         // fixed identity/weak-registration node. Never stores a cloned rule list.
         let charge = buffers.try_reserve(1024).map_err(|_| Refused::Full)?;
